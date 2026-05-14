@@ -2038,8 +2038,8 @@ dependencies = [
 name = "masm-decompiler"
 version = "0.8.1"
 dependencies = [
- "log",
  "miden-assembly-syntax",
+ "tracing",
 ]
 
 [[package]]
@@ -2049,6 +2049,8 @@ dependencies = [
  "clap",
  "masm-analysis",
  "miden-debug-types",
+ "tracing-log",
+ "tracing-subscriber",
  "yansi",
 ]
 
