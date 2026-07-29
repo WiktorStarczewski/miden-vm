@@ -4,7 +4,7 @@ use alloc::{
 };
 use core::fmt;
 
-use miden_core::Felt;
+use crate::Felt;
 
 // WRITER IMPLEMENTATIONS
 // ================================================================================================
@@ -137,9 +137,8 @@ pub fn format_value<T: ToString>(value: Option<T>) -> String {
 mod tests {
     use alloc::{string::String, vec};
 
-    use miden_core::Felt;
-
     use super::{format_value, write_interval, write_stack};
+    use crate::Felt;
 
     #[test]
     fn write_stack_full_uses_tree_style() {

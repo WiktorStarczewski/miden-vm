@@ -7,15 +7,13 @@
 
 use alloc::{vec, vec::Vec};
 
-use miden_core::events::EventName;
+use miden_core::{
+    advice::{AdviceMutation, AdviceStack, MAX_ADVICE_STACK_SIZE},
+    events::{EventContext, EventError, EventName},
+};
 use miden_crypto::aead::{
     DataType, EncryptionError,
     aead_poseidon2::{AuthTag, EncryptedData, Nonce, SecretKey},
-};
-use miden_processor::{
-    ProcessorState,
-    advice::{AdviceMutation, AdviceStack, MAX_ADVICE_STACK_SIZE},
-    event::EventError,
 };
 
 use crate::handlers::read_memory_region;
@@ -54,7 +52,7 @@ pub const AEAD_DECRYPT_EVENT_NAME: EventName = EventName::new("miden::core::cryp
 /// 1. The MASM procedure re-verifies the tag when decrypting
 /// 2. The deterministic encryption creates a bijection between plaintext and ciphertext
 /// 3. A malicious prover cannot provide incorrect plaintext without causing tag mismatch
-pub fn handle_aead_decrypt(process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+pub fn handle_aead_decrypt(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
     // Stack: [event_id, key:Word(4), nonce:Word(4), src_ptr, dst_ptr, num_blocks, ...]
     // where:
     //   src_ptr = ciphertext + encrypted_padding + tag location (input)
@@ -164,7 +162,7 @@ enum AeadDecryptError {
 
 #[cfg(test)]
 mod tests {
-    use miden_processor::advice::MAX_ADVICE_STACK_SIZE;
+    use miden_core::advice::MAX_ADVICE_STACK_SIZE;
 
     use crate::handlers::aead_decrypt::{AEAD_DECRYPT_EVENT_NAME, AeadDecryptError, compute_sizes};
 

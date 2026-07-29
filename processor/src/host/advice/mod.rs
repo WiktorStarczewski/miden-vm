@@ -2,7 +2,7 @@ use alloc::{collections::BTreeSet, vec::Vec};
 
 use miden_core::{
     Felt, WORD_SIZE, Word,
-    advice::{AdviceInputs, AdviceMap, AdviceStack},
+    advice::{AdviceInputs, AdviceMap, AdviceMutation, AdviceStack, MAX_ADVICE_STACK_SIZE},
     crypto::{
         hash::Poseidon2,
         merkle::{InnerNodeInfo, MerkleError, MerklePath, MerkleStore, NodeIndex},
@@ -14,13 +14,7 @@ use miden_core::{crypto::hash::Blake3_256, serde::Serializable};
 mod errors;
 pub use errors::AdviceError;
 
-use crate::{ExecutionOptions, host::AdviceMutation, processor::AdviceProviderInterface};
-
-// CONSTANTS
-// ================================================================================================
-
-/// Maximum number of elements allowed on the advice stack. Set to 2^17.
-pub const MAX_ADVICE_STACK_SIZE: usize = 1 << 17;
+use crate::{ExecutionOptions, processor::AdviceProviderInterface};
 
 trait MerkleStoreBudget {
     fn contains_internal_node(&self, root: Word) -> bool;

@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::{
     Felt, Word,
-    crypto::merkle::MerkleStore,
+    crypto::merkle::{InnerNodeInfo, MerkleStore},
     serde::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
 };
 
@@ -11,6 +11,31 @@ pub use map::AdviceMap;
 
 mod stack;
 pub use stack::AdviceStack;
+
+/// Maximum number of elements allowed on the advice stack. Set to 2^17.
+pub const MAX_ADVICE_STACK_SIZE: usize = 1 << 17;
+
+/// A declarative change to advice data requested by an event handler.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AdviceMutation {
+    ExtendStack { stack: AdviceStack },
+    ExtendMap { other: AdviceMap },
+    ExtendMerkleStore { infos: Vec<InnerNodeInfo> },
+}
+
+impl AdviceMutation {
+    pub fn extend_advice_stack(stack: AdviceStack) -> Self {
+        Self::ExtendStack { stack }
+    }
+
+    pub fn extend_map(other: AdviceMap) -> Self {
+        Self::ExtendMap { other }
+    }
+
+    pub fn extend_merkle_store(infos: impl IntoIterator<Item = InnerNodeInfo>) -> Self {
+        Self::ExtendMerkleStore { infos: Vec::from_iter(infos) }
+    }
+}
 
 // ADVICE INPUTS
 // ================================================================================================

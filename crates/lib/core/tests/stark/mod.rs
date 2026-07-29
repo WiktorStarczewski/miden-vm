@@ -510,7 +510,7 @@ fn reduced_inputs_and_outer_logup_boundary(#[case] num_kernel_proc_digests: usiz
     let test = build_test!(source, &initial_stack, &advice_stack);
     let (output, _host) = test.execute_for_output().expect("execution failed");
 
-    use miden_processor::ContextId;
+    use miden_core::ContextId;
     let ctx = ContextId::root();
     let read_elem = |addr: u32| -> u64 {
         output

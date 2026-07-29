@@ -10,7 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Felt, utils::hash_string_to_word};
 
+pub mod debug;
+mod handlers;
 mod sys_events;
+
+pub use handlers::{
+    AdviceProviderView, EventContext, EventContextProvider, EventError, EventHandler,
+    ExecutionOptionsView, NoopEventHandler,
+};
 pub use sys_events::SystemEvent;
 
 // EVENT ID

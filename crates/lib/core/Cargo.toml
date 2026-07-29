@@ -31,7 +31,6 @@ arbitrary = ["std", "miden-assembly/testing", "miden-utils-testing/arbitrary"]
 std = [
     "miden-assembly/std",
     "miden-precompiles/std",
-    "miden-processor/std",
     "miden-utils-sync/std",
 ]
 testing = ["arbitrary"]
@@ -43,7 +42,6 @@ miden-mast-package.workspace = true
 miden-core.workspace = true
 miden-crypto.workspace = true
 miden-precompiles.workspace = true
-miden-processor.workspace = true
 miden-utils-sync.workspace = true
 miden-air = { workspace = true, optional = true }
 miden-ace-codegen = { workspace = true, optional = true }

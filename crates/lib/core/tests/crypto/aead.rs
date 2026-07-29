@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
 use miden_air::Felt;
+use miden_core::{
+    advice::{AdviceMutation, AdviceStack},
+    events::{EventContext, EventError, EventHandler},
+};
 use miden_core_lib::handlers::aead_decrypt::AEAD_DECRYPT_EVENT_NAME;
 use miden_crypto::aead::{
     DataType,
     aead_poseidon2::{AuthTag, EncryptedData, Nonce, SecretKey},
-};
-use miden_processor::{
-    ProcessorState,
-    advice::{AdviceMutation, AdviceStack},
-    event::{EventError, EventHandler},
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -183,7 +182,7 @@ fn test_decrypt_rejects_tampered_final_tag() {
     let mut test = build_test!(source.as_str(), &[]);
     let valid_plaintext = plaintext;
     let malicious_handler: Arc<dyn EventHandler> =
-        Arc::new(move |_process: &ProcessorState| -> Result<Vec<AdviceMutation>, EventError> {
+        Arc::new(move |_process: &EventContext<'_>| -> Result<Vec<AdviceMutation>, EventError> {
             Ok(vec![advice_stack_mutation(valid_plaintext.clone())])
         });
 
@@ -442,7 +441,7 @@ fn test_decrypt_rejects_adversarial_plaintext_for_unrelated_ciphertext() {
     let mut test = build_test!(source.as_str(), &[]);
     let adversarial_plaintext = plaintext;
     let malicious_handler: Arc<dyn EventHandler> =
-        Arc::new(move |_process: &ProcessorState| -> Result<Vec<AdviceMutation>, EventError> {
+        Arc::new(move |_process: &EventContext<'_>| -> Result<Vec<AdviceMutation>, EventError> {
             Ok(vec![advice_stack_mutation(adversarial_plaintext.clone())])
         });
 

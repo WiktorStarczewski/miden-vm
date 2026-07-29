@@ -2163,6 +2163,7 @@ dependencies = [
  "miden-test-serde-macros",
  "miden-test-utils",
  "miden-utils-core-derive",
+ "miden-utils-diagnostics",
  "miden-utils-indexing",
  "miden-utils-sync",
  "proptest",

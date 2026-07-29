@@ -1,10 +1,10 @@
 use alloc::{vec, vec::Vec};
 
-use miden_core::{Felt, Word, events::EventName, field::PrimeCharacteristicRing};
-use miden_processor::{
-    MemoryError, ProcessorState,
+use miden_core::{
+    Felt, MemoryError, Word,
     advice::{AdviceMutation, AdviceStack},
-    event::EventError,
+    events::{EventContext, EventError, EventName},
+    field::PrimeCharacteristicRing,
 };
 
 /// Event name for the lowerbound_array operation.
@@ -36,7 +36,7 @@ enum KeySize {
 /// # Errors
 /// Returns an error if the provided word array is not sorted in non-decreasing order.
 pub fn handle_lowerbound_array(
-    process: &ProcessorState,
+    process: &EventContext<'_>,
 ) -> Result<Vec<AdviceMutation>, EventError> {
     push_lowerbound_result(process, 4, KeySize::Full)
 }
@@ -59,7 +59,7 @@ pub fn handle_lowerbound_array(
 /// # Errors
 /// Returns an error if the keys are not sorted in non-decreasing order.
 pub fn handle_lowerbound_key_value(
-    process: &ProcessorState,
+    process: &EventContext<'_>,
 ) -> Result<Vec<AdviceMutation>, EventError> {
     let use_full_key = process.get_stack_item(7);
 
@@ -82,7 +82,7 @@ const START_ADDR_OFFSET: usize = 5;
 const END_ADDR_OFFSET: usize = 6;
 
 fn push_lowerbound_result(
-    process: &ProcessorState,
+    process: &EventContext<'_>,
     stride: u32,
     key_size: KeySize,
 ) -> Result<Vec<AdviceMutation>, EventError> {

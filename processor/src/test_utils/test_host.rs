@@ -6,8 +6,10 @@ use miden_debug_types::{
 };
 
 use crate::{
-    BaseHost, LoadedMastForest, MastForestStore, MemMastForestStore, ProcessorState, SyncHost,
-    Word, advice::AdviceMutation, event::EventError, mast::MastForest,
+    BaseHost, LoadedMastForest, MastForestStore, MemMastForestStore, MemoryAddress, SyncHost, Word,
+    advice::AdviceMutation,
+    event::{EventContext, EventError},
+    mast::MastForest,
 };
 
 /// A snapshot of the processor state for consistency checking between processors.
@@ -17,13 +19,13 @@ pub struct ProcessorStateSnapshot {
     ctx: u32,
     stack_state: Vec<Felt>,
     stack_words: [Word; 4],
-    mem_state: Vec<(crate::MemoryAddress, Felt)>,
+    mem_state: Vec<(MemoryAddress, Felt)>,
 }
 
-impl From<&ProcessorState<'_>> for ProcessorStateSnapshot {
-    fn from(state: &ProcessorState) -> Self {
+impl From<&EventContext<'_>> for ProcessorStateSnapshot {
+    fn from(state: &EventContext<'_>) -> Self {
         ProcessorStateSnapshot {
-            clk: state.clock().into(),
+            clk: state.clock(),
             ctx: state.ctx().into(),
             stack_state: state.get_stack_state(),
             stack_words: [
@@ -44,14 +46,14 @@ impl ProcessorStateSnapshot {
     /// event ID at the top of the stack. The checkpoint snapshot skips that synthetic stack item to
     /// match the state after the trailing `drop`, and to preserve the old trace-decorator test
     /// shape.
-    fn from_emit_checkpoint(state: &ProcessorState) -> Self {
+    fn from_emit_checkpoint(state: &EventContext<'_>) -> Self {
         let mut stack_state = state.get_stack_state();
         if !stack_state.is_empty() {
             stack_state.remove(0);
         }
 
         ProcessorStateSnapshot {
-            clk: state.clock().into(),
+            clk: state.clock(),
             ctx: state.ctx().into(),
             stack_state,
             stack_words: [
@@ -139,13 +141,13 @@ where
         self.store.get(node_digest)
     }
 
-    fn on_event(&mut self, process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
-        let event_id: u32 = process.get_stack_item(0).as_canonical_u64().try_into().unwrap();
+    fn on_event(&mut self, context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+        let event_id: u32 = context.get_stack_item(0).as_canonical_u64().try_into().unwrap();
         self.event_handler.push(event_id);
         self.snapshots
             .entry(event_id)
             .or_default()
-            .push(ProcessorStateSnapshot::from_emit_checkpoint(process));
+            .push(ProcessorStateSnapshot::from_emit_checkpoint(context));
         Ok(Vec::new())
     }
 }

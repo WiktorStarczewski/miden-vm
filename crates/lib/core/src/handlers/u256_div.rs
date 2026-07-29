@@ -5,11 +5,10 @@
 
 use alloc::{vec, vec::Vec};
 
-use miden_core::{Felt, Word};
-use miden_processor::{
-    ProcessorState,
+use miden_core::{
+    Felt, Word,
     advice::{AdviceMutation, AdviceStack},
-    event::{EventError, EventName},
+    events::{EventContext, EventError, EventName},
 };
 
 /// Event name for the u256_div operation.
@@ -38,7 +37,7 @@ pub const U256_DIV_EVENT_NAME: EventName = EventName::new("miden::core::math::u2
 ///
 /// # Errors
 /// Returns an error if the divisor is ZERO or any limb is not a valid u32.
-pub fn handle_u256_div(process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+pub fn handle_u256_div(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
     let divisor = read_u256_from_stack(process, 1, "divisor")?;
 
     if divisor == (0, 0) {
@@ -68,7 +67,7 @@ pub fn handle_u256_div(process: &ProcessorState) -> Result<Vec<AdviceMutation>, 
 ///
 /// Returned as a `(lo, hi)` pair of u128s.
 fn read_u256_from_stack(
-    process: &ProcessorState,
+    process: &EventContext<'_>,
     start: usize,
     name: &'static str,
 ) -> Result<(u128, u128), EventError> {

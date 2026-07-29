@@ -151,7 +151,7 @@ impl<'a, P, H: BaseHost, S, T, F> ExecutionState<'a, P, H, S, T, F> {
 ///         InternalBreakReason::Emit { op_idx, continuation, source_node_id } => {
 ///             // Handle Emit operation (e.g., call `SyncHost::on_event`)
 ///             self.op_emit(...);
-///    
+///
 ///             // As per `InternalBreakReason::Emit` documentation, we call `finish_emit_op_execution`
 ///             // to complete the execution of the Emit operation.
 ///             finish_emit_op_execution(...);
@@ -159,7 +159,7 @@ impl<'a, P, H: BaseHost, S, T, F> ExecutionState<'a, P, H, S, T, F> {
 ///         InternalBreakReason::LoadMastForestFromDyn { callee_hash } => {
 ///             // load MAST forest containing the callee procedure
 ///             let (procedure_id, new_forest) = self.load_mast_forest(...);
-///    
+///
 ///             // As per `InternalBreakReason::LoadMastForestFromDyn` documentation, we call
 ///             // `finish_load_mast_forest_from_dyn_start` to complete the execution of the operation.
 ///             finish_load_mast_forest_from_dyn_start(...);
@@ -167,7 +167,7 @@ impl<'a, P, H: BaseHost, S, T, F> ExecutionState<'a, P, H, S, T, F> {
 ///         InternalBreakReason::LoadMastForestFromExternal { external_node_id, procedure_hash } => {
 ///             // load MAST forest containing the callee procedure
 ///             let (procedure_id, new_forest) = self.load_mast_forest(...);
-///    
+///
 ///             // As per `InternalBreakReason::LoadMastForestFromExternal` documentation, we call
 ///             // `finish_load_mast_forest_from_external_start` to complete the execution of the operation.
 ///             finish_load_mast_forest_from_external_start(...);
@@ -718,5 +718,5 @@ where
 /// specifically the `SYSCALL` operation doesn't apply as it always goes back to the root
 /// context.
 fn get_next_ctx_id(processor: &impl Processor) -> ContextId {
-    (processor.system().clock() + 1).into()
+    (processor.system().clock() + 1).as_u32().into()
 }

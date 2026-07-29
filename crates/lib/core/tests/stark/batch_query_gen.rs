@@ -4,8 +4,7 @@
 //! implementation that calls `sample_bits` in a loop. Both programs start from the same
 //! sponge state and parameters, and we compare the resulting query words stored in memory.
 
-use miden_core::Felt;
-use miden_processor::ContextId;
+use miden_core::{ContextId, Felt};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rstest::rstest;

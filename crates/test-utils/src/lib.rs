@@ -31,19 +31,18 @@ pub use miden_core::{
 };
 use miden_core::{
     chiplets::hasher::apply_permutation,
-    events::{EventName, SystemEvent},
+    events::{EventHandler, EventName, SystemEvent},
 };
 use miden_mast_package::{Package, debug_info::PackageDebugInfo};
 #[cfg(not(target_family = "wasm"))]
 use miden_processor::trace::build_trace;
 pub use miden_processor::{
-    ContextId, ExecutionError, ProcessorState,
+    ContextId, ExecutionError,
     advice::{AdviceInputs, AdviceProvider, AdviceStack},
     trace::ExecutionTrace,
 };
 use miden_processor::{
     DefaultHost, ExecutionOptions, ExecutionOutput, FastProcessor, Program, TraceBuildInputs,
-    event::EventHandler,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use miden_prover::prove_sync;
@@ -838,7 +837,10 @@ mod tests {
         },
     };
 
-    use miden_processor::{advice::AdviceMutation, event::EventError};
+    use miden_core::{
+        advice::AdviceMutation,
+        events::{EventContext, EventError},
+    };
 
     use super::*;
 
@@ -890,10 +892,11 @@ mod tests {
 
         let invocations = Arc::new(AtomicUsize::new(0));
         let handler_invocations = invocations.clone();
-        let handler = move |_process: &ProcessorState| -> Result<Vec<AdviceMutation>, EventError> {
-            handler_invocations.fetch_add(1, Ordering::SeqCst);
-            Ok(Vec::new())
-        };
+        let handler =
+            move |_context: &EventContext<'_>| -> Result<Vec<AdviceMutation>, EventError> {
+                handler_invocations.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            };
 
         let source = alloc::format!(
             r#"

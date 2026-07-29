@@ -5,15 +5,11 @@ use core::mem::size_of;
 
 use miden_core::{
     WORD_SIZE,
-    events::EventName,
+    advice::{AdviceMutation, AdviceStack},
+    events::{EventContext, EventError, EventName},
     utils::{bytes_to_packed_u32_elements, packed_u32_elements_to_bytes},
 };
 use miden_crypto::hash::keccak::Keccak256;
-use miden_processor::{
-    ProcessorState,
-    advice::{AdviceMutation, AdviceStack},
-    event::EventError,
-};
 
 use crate::handlers::read_memory_region;
 
@@ -28,12 +24,12 @@ const KECCAK256_DIGEST_FELTS: usize = 8;
 /// Reads the requested u32-packed memory preimage, computes Keccak-256, and pushes the digest limbs
 /// onto the advice stack for the MASM wrapper to bind with deferred assertions.
 pub fn handle_keccak256_digest(
-    process: &ProcessorState<'_>,
+    process: &EventContext<'_>,
 ) -> Result<Vec<AdviceMutation>, EventError> {
     let ptr = process.get_stack_item(1).as_canonical_u64();
     let len_bytes = process.get_stack_item(2).as_canonical_u64();
 
-    let max = process.execution_options().max_hash_len_bytes();
+    let max = process.max_hash_len_bytes();
     if len_bytes > max as u64 {
         return Err(Keccak256DigestEventError::InputTooLong { len_bytes, max }.into());
     }
@@ -58,7 +54,7 @@ pub fn handle_keccak256_digest(
 }
 
 fn read_memory_packed_u32(
-    process: &ProcessorState<'_>,
+    process: &EventContext<'_>,
     start: u64,
     len_bytes: usize,
 ) -> Result<Vec<u8>, Keccak256DigestEventError> {

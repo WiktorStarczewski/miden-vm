@@ -12,7 +12,7 @@ use miden_mast_package::{
 use miden_utils_diagnostics::{Diagnostic, miette};
 
 use crate::{
-    BaseHost, ContextId, Felt, Word,
+    BaseHost, Felt, MemoryError, Word,
     advice::AdviceError,
     event::{EventError, EventId, EventName},
     fast::SystemEventError,
@@ -208,41 +208,6 @@ impl From<ExecutionError> for IoError {
     fn from(err: ExecutionError) -> Self {
         IoError::Execution(Box::new(err))
     }
-}
-
-// MEMORY ERROR
-// ================================================================================================
-
-/// Lightweight error type for memory operations.
-///
-/// This enum captures error conditions without expensive context information (no source location,
-/// no file references). When a `MemoryError` propagates up to become an `ExecutionError`, the
-/// context is resolved lazily via `MapExecErr::map_exec_err`.
-#[derive(Debug, thiserror::Error, Diagnostic)]
-pub enum MemoryError {
-    #[error("memory address cannot exceed 2^32 but was {addr}")]
-    AddressOutOfBounds { addr: u64 },
-    #[error(
-        "memory address {addr} in context {ctx} was read and written, or written twice, in the same clock cycle {clk}"
-    )]
-    IllegalMemoryAccess { ctx: ContextId, addr: u32, clk: Felt },
-    #[error(
-        "memory range start address cannot exceed end address, but was ({start_addr}, {end_addr})"
-    )]
-    InvalidMemoryRange { start_addr: u64, end_addr: u64 },
-    #[error(
-        "word access at memory address {addr} in context {ctx} is unaligned: word accesses require addresses that are multiples of 4"
-    )]
-    UnalignedWordAccess { addr: u32, ctx: ContextId },
-    #[error("failed to read from memory: {0}")]
-    MemoryReadFailed(String),
-    #[error(
-        "writing to memory address {addr} in context {ctx} would exceed the maximum number of memory elements {max}"
-    )]
-    #[diagnostic(help(
-        "increase the limit via `ExecutionOptions::with_max_memory_elements`, or reduce the number of distinct memory addresses the program writes to"
-    ))]
-    MemoryElementLimitExceeded { ctx: ContextId, addr: u32, max: usize },
 }
 
 // CRYPTO ERROR

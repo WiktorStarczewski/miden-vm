@@ -10,6 +10,7 @@ extern crate std;
 
 pub mod debug_info;
 mod dependency;
+mod host_library;
 mod package;
 
 pub use miden_assembly_syntax::{
@@ -22,6 +23,7 @@ pub use miden_core::{Word, mast::MastForest, program::Program};
 pub use self::package::arbitrary;
 pub use self::{
     dependency::Dependency,
+    host_library::HostLibrary,
     package::{
         ConstantExport, InvalidSectionIdError, InvalidTargetTypeError, ManifestValidationError,
         Package, PackageDebugInfoError, PackageExport, PackageId, PackageManifest, PackageModule,

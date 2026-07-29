@@ -1,5 +1,4 @@
-use miden_core::Felt;
-use miden_processor::ProcessorState;
+use miden_core::{Felt, events::EventContext};
 
 pub mod aead_decrypt;
 use alloc::vec::Vec;
@@ -34,7 +33,7 @@ fn u64_to_u32_elements(value: u64) -> (Felt, Felt) {
 /// - Returns `None` if any validation fails or if any memory location is uninitialized
 ///
 /// # Arguments
-/// * `process` - Process state to read memory from
+/// * `context` - Event context to read memory from
 /// * `start_ptr` - Starting address (u64 from stack), must be word-aligned
 /// * `len` - Number of elements to read (u64)
 ///
@@ -43,11 +42,11 @@ fn u64_to_u32_elements(value: u64) -> (Felt, Felt) {
 ///
 /// # Example
 /// ```ignore
-/// let elements = read_memory_region(process, src_ptr, num_elements)
+/// let elements = read_memory_region(context, src_ptr, num_elements)
 ///     .ok_or(MyError::MemoryReadFailed)?;
 /// ```
 pub(crate) fn read_memory_region(
-    process: &ProcessorState,
+    context: &EventContext<'_>,
     start_ptr: u64,
     len: u64,
 ) -> Option<Vec<Felt>> {
@@ -64,6 +63,6 @@ pub(crate) fn read_memory_region(
     let end_addr = start_addr.checked_add(len_u32)?;
 
     // Read all elements in the range from the current execution context
-    let ctx = process.ctx();
-    (start_addr..end_addr).map(|addr| process.get_mem_value(ctx, addr)).collect()
+    let ctx = context.ctx();
+    (start_addr..end_addr).map(|addr| context.get_mem_value(ctx, addr)).collect()
 }

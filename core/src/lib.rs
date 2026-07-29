@@ -9,6 +9,7 @@ extern crate std;
 // EXPORTS
 // ================================================================================================
 
+pub use execution::{ContextId, MemoryAddress, MemoryError};
 pub use miden_crypto::{EMPTY_WORD, Felt, ONE, Word, ZERO};
 
 /// The number of field elements in a Miden word.
@@ -18,6 +19,7 @@ pub mod advice;
 pub mod chiplets;
 pub mod deferred;
 pub mod events;
+pub mod execution;
 pub mod mast;
 pub mod operations;
 pub mod program;

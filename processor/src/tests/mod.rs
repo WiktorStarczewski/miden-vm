@@ -14,10 +14,10 @@ use miden_utils_testing::crypto::{init_merkle_leaves, init_merkle_store};
 
 /// Tests in this file make sure that diagnostics presented to the user are as expected.
 use crate::{
-    BaseHost, DefaultHost, FastProcessor, KernelDescriptor, LoadedMastForest, ONE, ProcessorState,
-    Program, StackInputs, SyncHost, Word, ZERO,
+    BaseHost, DefaultHost, FastProcessor, KernelDescriptor, LoadedMastForest, ONE, Program,
+    StackInputs, SyncHost, Word, ZERO,
     advice::{AdviceInputs, AdviceMap, AdviceMutation},
-    event::{EventError, EventHandler, EventName},
+    event::{EventContext, EventError, EventHandler, EventName},
     operation::Operation,
 };
 
@@ -41,7 +41,7 @@ struct DummyHostEventError;
 struct AlwaysFailEventHandler;
 
 impl EventHandler for AlwaysFailEventHandler {
-    fn on_event(&self, _process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&self, _context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         Err(DummyHostEventError.into())
     }
 }
@@ -49,7 +49,7 @@ impl EventHandler for AlwaysFailEventHandler {
 struct DuplicateMapMutationHandler;
 
 impl EventHandler for DuplicateMapMutationHandler {
-    fn on_event(&self, _process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&self, _context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         Ok(vec![AdviceMutation::extend_map(AdviceMap::from_iter([(
             Word::default(),
             vec![ONE],
@@ -112,7 +112,7 @@ impl SyncHost for MalformedMastForestHost {
         Some(LoadedMastForest::new(self.mast_forest.clone()))
     }
 
-    fn on_event(&mut self, _process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&mut self, _context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         Ok(Vec::new())
     }
 }

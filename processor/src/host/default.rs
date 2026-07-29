@@ -2,16 +2,15 @@ use alloc::{sync::Arc, vec::Vec};
 
 use miden_core::{
     Word,
-    events::{EventId, EventName},
-    mast::MastForest,
+    events::{EventContext, EventId, EventName},
 };
 use miden_debug_types::{DefaultSourceManager, Location, SourceFile, SourceManager, SourceSpan};
-use miden_mast_package::{PackageDebugInfoError, debug_info::PackageDebugInfo};
+pub use miden_mast_package::HostLibrary;
 
 use super::handlers::{EventError, EventHandler, EventHandlerRegistry};
 use crate::{
-    BaseHost, ExecutionError, LoadedMastForest, MastForestStore, MemMastForestStore,
-    ProcessorState, SyncHost, advice::AdviceMutation,
+    BaseHost, ExecutionError, LoadedMastForest, MastForestStore, MemMastForestStore, SyncHost,
+    advice::AdviceMutation,
 };
 
 // DEFAULT HOST IMPLEMENTATION
@@ -76,7 +75,7 @@ where
     /// Registers a single [`EventHandler`] into this host.
     ///
     /// The handler can be either a closure or a free function with signature
-    /// `fn(&mut ProcessorState) -> Result<(), EventHandler>`
+    /// `fn(&EventContext) -> Result<Vec<AdviceMutation>, EventError>`
     pub fn register_handler(
         &mut self,
         event: EventName,
@@ -127,12 +126,9 @@ where
         self.store.get(node_digest)
     }
 
-    fn on_event(
-        &mut self,
-        process: &ProcessorState<'_>,
-    ) -> Result<Vec<AdviceMutation>, EventError> {
-        let event_id = EventId::from_felt(process.get_stack_item(0));
-        match self.event_handlers.handle_event(event_id, process) {
+    fn on_event(&mut self, context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+        let event_id = EventId::from_felt(context.get_stack_item(0));
+        match self.event_handlers.handle_event(event_id, context) {
             Ok(Some(mutations)) => Ok(mutations),
             Ok(None) => {
                 #[derive(Debug, thiserror::Error)]
@@ -169,69 +165,7 @@ impl SyncHost for NoopHost {
     }
 
     #[inline(always)]
-    fn on_event(
-        &mut self,
-        _process: &ProcessorState<'_>,
-    ) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&mut self, _context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         Ok(Vec::new())
-    }
-}
-
-// HOST LIBRARY
-// ================================================================================================
-
-/// A rich library representing a [`MastForest`] which also exports
-/// a list of handlers for events it may call.
-pub struct HostLibrary {
-    /// A `MastForest` with procedures exposed by this library.
-    pub mast_forest: Arc<MastForest>,
-    /// Package-owned debug info that belongs to `mast_forest`.
-    pub package_debug_info: Result<Option<PackageDebugInfo>, PackageDebugInfoError>,
-    /// List of handlers along with their event names to call them with `emit`.
-    pub handlers: Vec<(EventName, Arc<dyn EventHandler>)>,
-}
-
-impl Default for HostLibrary {
-    fn default() -> Self {
-        Self {
-            mast_forest: Arc::new(MastForest::new()),
-            package_debug_info: Ok(None),
-            handlers: Vec::new(),
-        }
-    }
-}
-
-impl From<Arc<miden_mast_package::Package>> for HostLibrary {
-    fn from(package: Arc<miden_mast_package::Package>) -> Self {
-        let package_debug_info = match package.debug_info() {
-            Ok(debug_info) => Ok(debug_info),
-            Err(PackageDebugInfoError::UntrustedSections) => Ok(None),
-            Err(err) => Err(err),
-        };
-        Self {
-            mast_forest: package.mast_forest().clone(),
-            package_debug_info,
-            handlers: vec![],
-        }
-    }
-}
-
-impl From<Arc<MastForest>> for HostLibrary {
-    fn from(mast_forest: Arc<MastForest>) -> Self {
-        Self {
-            mast_forest,
-            package_debug_info: Ok(None),
-            handlers: vec![],
-        }
-    }
-}
-
-impl From<&Arc<MastForest>> for HostLibrary {
-    fn from(mast_forest: &Arc<MastForest>) -> Self {
-        Self {
-            mast_forest: mast_forest.clone(),
-            package_debug_info: Ok(None),
-            handlers: vec![],
-        }
     }
 }

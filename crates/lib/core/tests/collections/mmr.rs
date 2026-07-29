@@ -833,7 +833,7 @@ fn debug_mmr_peaks_vs_vm_memory() {
     rust_mem.extend(digests_to_ints(rust_peaks));
 
     // Read back the same region from VM memory: first num_leaves word + one word per peak.
-    use miden_processor::ContextId;
+    use miden_core::ContextId;
     let mut vm_mem = Vec::new();
     let words_to_read = 1 + rust_peaks.len();
     for word_idx in 0..words_to_read {

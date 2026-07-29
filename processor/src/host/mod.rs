@@ -3,50 +3,20 @@ use core::future::Future;
 
 use miden_core::{
     Word,
-    advice::{AdviceMap, AdviceStack},
-    crypto::merkle::InnerNodeInfo,
-    events::{EventId, EventName},
+    advice::AdviceMutation,
+    events::{EventContext, EventError, EventId, EventName},
 };
 use miden_debug_types::{Location, SourceFile, SourceSpan};
 
-use crate::ProcessorState;
-
 pub(super) mod advice;
-
-pub mod debug;
 
 pub mod default;
 
 pub mod handlers;
-use handlers::EventError;
 
 mod mast_forest_store;
 pub use mast_forest_store::{LoadedMastForest, MastForestStore, MemMastForestStore};
 
-// ADVICE MAP MUTATIONS
-// ================================================================================================
-
-/// Any possible way an event can modify the advice provider.
-#[derive(Debug, PartialEq, Eq)]
-pub enum AdviceMutation {
-    ExtendStack { stack: AdviceStack },
-    ExtendMap { other: AdviceMap },
-    ExtendMerkleStore { infos: Vec<InnerNodeInfo> },
-}
-
-impl AdviceMutation {
-    pub fn extend_advice_stack(stack: AdviceStack) -> Self {
-        Self::ExtendStack { stack }
-    }
-
-    pub fn extend_map(other: AdviceMap) -> Self {
-        Self::ExtendMap { other }
-    }
-
-    pub fn extend_merkle_store(infos: impl IntoIterator<Item = InnerNodeInfo>) -> Self {
-        Self::ExtendMerkleStore { infos: Vec::from_iter(infos) }
-    }
-}
 // HOST TRAIT
 // ================================================================================================
 
@@ -108,8 +78,7 @@ pub trait SyncHost: BaseHost {
     /// - Return errors without event names or IDs - the caller will enrich them via
     ///   [`BaseHost::resolve_event()`]
     /// - System events (IDs 0-255) are handled by the VM before calling this method
-    fn on_event(&mut self, process: &ProcessorState<'_>)
-    -> Result<Vec<AdviceMutation>, EventError>;
+    fn on_event(&mut self, context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError>;
 }
 
 /// Defines an async interface by which the VM can interact with the host during execution.
@@ -139,7 +108,7 @@ pub trait Host: BaseHost {
     /// - System events (IDs 0-255) are handled by the VM before calling this method
     fn on_event(
         &mut self,
-        process: &ProcessorState<'_>,
+        context: &EventContext<'_>,
     ) -> impl FutureMaybeSend<Result<Vec<AdviceMutation>, EventError>>;
 }
 
@@ -157,9 +126,9 @@ where
 
     fn on_event(
         &mut self,
-        process: &ProcessorState<'_>,
+        context: &EventContext<'_>,
     ) -> impl FutureMaybeSend<Result<Vec<AdviceMutation>, EventError>> {
-        let result = SyncHost::on_event(self, process);
+        let result = SyncHost::on_event(self, context);
         async move { result }
     }
 }

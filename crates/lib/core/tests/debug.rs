@@ -10,7 +10,11 @@ use std::{
 };
 
 use miden_assembly::{Assembler, Linkage};
-use miden_core::{Felt, Word};
+use miden_core::{
+    Felt, MemoryError, Word,
+    advice::{AdviceInputs, AdviceStack},
+    events::{EventHandler, EventName},
+};
 use miden_core_lib::{
     CoreLibrary,
     handlers::debug::{
@@ -19,12 +23,9 @@ use miden_core_lib::{
         PRINT_STACK_EVENT_NAME, advice_debug_handlers, debug_handlers, noop_debug_handlers,
     },
 };
+use miden_mast_package::HostLibrary;
 use miden_processor::{
-    DefaultHost, ExecutionError, ExecutionOptions, ExecutionOutput, HostLibrary, MemoryError,
-    StackInputs,
-    advice::{AdviceInputs, AdviceStack},
-    event::{EventHandler, EventName},
-    execute_sync,
+    DefaultHost, ExecutionError, ExecutionOptions, ExecutionOutput, StackInputs, execute_sync,
 };
 
 // HARNESS

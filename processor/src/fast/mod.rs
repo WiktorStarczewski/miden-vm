@@ -3,8 +3,10 @@ use core::{cmp::min, ops::ControlFlow};
 
 use miden_air::{Felt, trace::RowIndex};
 use miden_core::{
-    EMPTY_WORD, WORD_SIZE, Word, ZERO,
-    deferred::DeferredState,
+    ContextId, EMPTY_WORD, MemoryError, WORD_SIZE, Word, ZERO,
+    advice::AdviceMap,
+    deferred::{DeferredState, Digest, Node, PrecompileError},
+    events::{EventContext, EventContextProvider, EventError},
     mast::{ExecutableMastForest, MastForest},
     program::{MIN_STACK_DEPTH, Program, StackInputs, StackOutputs},
     utils::range,
@@ -12,8 +14,8 @@ use miden_core::{
 use miden_mast_package::Package;
 
 use crate::{
-    AdviceInputs, AdviceProvider, ContextId, ExecutionError, ExecutionOptions, ProcessorState,
-    advice::AdviceError,
+    ExecutionError, ExecutionOptions, MemoryAddress,
+    advice::{AdviceError, AdviceInputs, AdviceProvider},
     continuation_stack::{Continuation, ContinuationStack},
     errors::MapExecErrNoCtx,
     tracer::{OperationHelperRegisters, Tracer},
@@ -487,10 +489,10 @@ impl FastProcessor {
         &self.options
     }
 
-    /// Returns a narrowed interface for reading and updating the processor state.
+    /// Returns the event context exposed to host callbacks.
     #[inline(always)]
-    pub fn state(&self) -> ProcessorState<'_> {
-        ProcessorState { processor: self }
+    pub fn state(&self) -> EventContext<'_> {
+        EventContext::new(self)
     }
 
     // MUTATORS
@@ -661,8 +663,90 @@ impl FastProcessor {
     }
 }
 
+impl EventContextProvider for FastProcessor {
+    #[inline(always)]
+    fn get_stack_item(&self, position: usize) -> Felt {
+        self.stack_get_safe(position)
+    }
+
+    #[inline(always)]
+    fn get_stack_word(&self, start: usize) -> Word {
+        self.stack_get_word_safe(start)
+    }
+
+    #[inline(always)]
+    fn get_stack_state(&self) -> Vec<Felt> {
+        self.stack().iter().rev().copied().collect()
+    }
+
+    #[inline(always)]
+    fn clock(&self) -> u32 {
+        self.clk.as_u32()
+    }
+
+    #[inline(always)]
+    fn context_id(&self) -> ContextId {
+        self.ctx
+    }
+
+    #[inline(always)]
+    fn get_mem_value(&self, context: ContextId, address: u32) -> Option<Felt> {
+        self.memory.read_element_impl(context, address)
+    }
+
+    #[inline(always)]
+    fn get_mem_word(&self, context: ContextId, address: u32) -> Result<Option<Word>, MemoryError> {
+        self.memory.read_word_impl(context, address)
+    }
+
+    #[inline(always)]
+    fn get_mem_state(&self, context: ContextId) -> Vec<(MemoryAddress, Felt)> {
+        self.memory.get_memory_state(context)
+    }
+
+    #[inline(always)]
+    fn advice_stack(&self) -> Vec<Felt> {
+        self.advice.stack()
+    }
+
+    #[inline(always)]
+    fn advice_map(&self) -> &AdviceMap {
+        self.advice.map()
+    }
+
+    #[inline(always)]
+    fn get_advice_map_entry(&self, key: &Word) -> Option<&[Felt]> {
+        self.advice.get_mapped_values(key)
+    }
+
+    #[inline(always)]
+    fn get_advice_tree_node(
+        &self,
+        root: Word,
+        depth: Felt,
+        index: Felt,
+    ) -> Result<Word, EventError> {
+        self.advice
+            .get_tree_node(root, depth, index)
+            .map_err(|err| Box::new(err) as EventError)
+    }
+
+    #[inline(always)]
+    fn max_hash_len_bytes(&self) -> usize {
+        self.options.max_hash_len_bytes()
+    }
+
+    #[inline(always)]
+    fn require_canonical_deferred_node(
+        &self,
+        digest: Digest,
+    ) -> Result<(Digest, &Node), PrecompileError> {
+        self.deferred_state.require_canonical_node(digest)
+    }
+}
+
 // EXECUTION OUTPUT
-// ===============================================================================================
+// ================================================================================================
 
 /// The output of a program execution, containing the state of the stack, advice provider, memory,
 /// and final deferred state at the end of execution.

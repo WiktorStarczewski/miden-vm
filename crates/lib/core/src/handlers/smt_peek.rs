@@ -8,13 +8,9 @@ use alloc::{format, string::String, vec, vec::Vec};
 
 use miden_core::{
     Felt, WORD_SIZE, Word,
-    crypto::merkle::{EmptySubtreeRoots, SMT_DEPTH, Smt},
-    events::EventName,
-};
-use miden_processor::{
-    ProcessorState,
     advice::{AdviceMutation, AdviceStack},
-    event::EventError,
+    crypto::merkle::{EmptySubtreeRoots, SMT_DEPTH, Smt},
+    events::{EventContext, EventError, EventName},
 };
 
 /// Event name for the smt_peek operation.
@@ -50,7 +46,7 @@ pub const SMT_PEEK_EVENT_NAME: EventName =
 ///
 /// # Panics
 /// Will panic as unimplemented if the target depth is `64`.
-pub fn handle_smt_peek(process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+pub fn handle_smt_peek(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
     let empty_leaf = EmptySubtreeRoots::entry(SMT_DEPTH, SMT_DEPTH);
     // fetch the arguments from the operand stack
     // Stack at emit: [event_id, KEY, ROOT, ...] where KEY and ROOT are structural words.
@@ -61,8 +57,7 @@ pub fn handle_smt_peek(process: &ProcessorState) -> Result<Vec<AdviceMutation>, 
     // or a root of an empty subtree at the returned depth
     // K[3] is used as the leaf index (most significant in BE ordering)
     let node = process
-        .advice_provider()
-        .get_tree_node(root, Felt::new_unchecked(SMT_DEPTH as u64), key[3])
+        .get_advice_tree_node(root, Felt::new_unchecked(SMT_DEPTH as u64), key[3])
         .map_err(|err| SmtPeekError::AdviceProviderError {
             message: format!("Failed to get tree node: {err}"),
         })?;
@@ -95,12 +90,11 @@ pub fn handle_smt_peek(process: &ProcessorState) -> Result<Vec<AdviceMutation>, 
 
 /// Retrieves the preimage of an SMT leaf node from the advice provider.
 fn get_smt_leaf_preimage(
-    process: &ProcessorState,
+    process: &EventContext<'_>,
     node: Word,
 ) -> Result<Vec<(Word, Word)>, SmtPeekError> {
     let kv_pairs = process
-        .advice_provider()
-        .get_mapped_values(&node)
+        .get_advice_map_entry(&node)
         .ok_or(SmtPeekError::SmtNodeNotFound { node })?;
 
     if kv_pairs.len() % (WORD_SIZE * 2) != 0 {

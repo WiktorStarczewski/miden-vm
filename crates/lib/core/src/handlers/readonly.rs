@@ -7,10 +7,9 @@
 
 use alloc::{sync::Arc, vec, vec::Vec};
 
-use miden_processor::{
-    ProcessorState,
+use miden_core::{
     advice::AdviceMutation,
-    event::{EventError, EventHandler, EventName},
+    events::{EventContext, EventError, EventHandler, EventName},
 };
 
 // EVENT NAMES
@@ -37,7 +36,7 @@ pub const READONLY_MIDEN_DEBUG_PRINTLN: EventName =
 struct ReadonlyNoopHandler;
 
 impl EventHandler for ReadonlyNoopHandler {
-    fn on_event(&self, _process: &ProcessorState) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&self, _process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         Ok(vec![])
     }
 }
