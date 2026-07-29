@@ -55,9 +55,10 @@ pub use host::{
     SyncHost,
     default::{DefaultHost, HostLibrary},
 };
+#[deprecated(note = "use miden_core::events::debug")]
+pub use miden_core::events::debug::{StdoutWriter, format_value, write_interval, write_stack};
 pub use miden_core::{
     ContextId, EMPTY_WORD, Felt, MemoryAddress, MemoryError, ONE, WORD_SIZE, Word, ZERO, crypto,
-    events::debug::{StdoutWriter, format_value, write_interval, write_stack},
     field, mast,
     program::{
         InputError, KernelDescriptor, MIN_STACK_DEPTH, Program, ProgramInfo, StackInputs,
@@ -77,14 +78,19 @@ pub mod advice {
 
 pub mod event {
     pub use miden_core::events::{
-        AdviceProviderView, EventContext, EventContextProvider, EventError, EventHandler, EventId,
-        EventName, ExecutionOptionsView, NoopEventHandler, SystemEvent, debug,
+        AdviceProviderView, EventContext, EventContextProvider, EventId, EventName,
+        ExecutionOptionsView, SystemEvent, debug,
     };
+    #[deprecated(
+        note = "import EventError, EventHandler, and NoopEventHandler from miden_core::events"
+    )]
+    pub use miden_core::events::{EventError, EventHandler, NoopEventHandler};
 
     pub use crate::host::handlers::EventHandlerRegistry;
 }
 
 /// Compatibility alias for the event context exposed to host callbacks.
+#[deprecated(note = "use miden_core::events::EventContext")]
 pub type ProcessorState<'a> = miden_core::events::EventContext<'a>;
 
 pub mod operation {

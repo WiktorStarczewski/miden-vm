@@ -162,11 +162,13 @@ impl<'a> EventContext<'a> {
     }
 
     /// Returns a compatibility view of the advice provider.
+    #[deprecated(note = "use EventContext advice accessors directly")]
     pub fn advice_provider(&self) -> AdviceProviderView<'a> {
         AdviceProviderView { provider: self.provider }
     }
 
     /// Returns a compatibility view of execution options used by event handlers.
+    #[deprecated(note = "use EventContext::max_hash_len_bytes")]
     pub fn execution_options(&self) -> ExecutionOptionsView<'a> {
         ExecutionOptionsView { provider: self.provider }
     }

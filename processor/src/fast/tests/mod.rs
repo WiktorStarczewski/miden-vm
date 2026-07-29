@@ -8,7 +8,7 @@ use miden_assembly::{
 };
 use miden_core::{
     ONE, Word,
-    events::SystemEvent,
+    events::{EventContext, EventError, SystemEvent},
     mast::{
         BasicBlockNodeBuilder, CallNodeBuilder, ExternalNodeBuilder, JoinNodeBuilder, MastNodeExt,
         MastNodeId, SplitNodeBuilder,
@@ -34,7 +34,6 @@ use super::*;
 use crate::{
     AdviceInputs, BaseHost, DefaultHost, LoadedMastForest, SyncHost,
     advice::AdviceMutation,
-    event::{EventContext, EventError},
     operation::OperationError,
     processor::{StackInterface, SystemInterface},
 };

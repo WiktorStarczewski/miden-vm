@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use miden_assembly::Assembler;
+use miden_core::events::{EventContext, EventError, EventName};
 use miden_debug_types::{Location, SourceFile, SourceSpan};
 use miden_processor::{
     BaseHost, DefaultHost, ExecutionOptions, FastProcessor, Felt, FutureMaybeSend, Host,
     LoadedMastForest, StackInputs, Word,
     advice::{AdviceInputs, AdviceMutation},
-    event::{EventContext, EventError, EventName},
 };
 
 struct YieldingAsyncHost {

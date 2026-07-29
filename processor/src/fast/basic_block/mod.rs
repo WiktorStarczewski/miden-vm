@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
-use miden_core::events::{EventId, SystemEvent};
+use miden_core::events::{EventError, EventId, SystemEvent};
 use miden_mast_package::debug_info::{DebugSourceNodeId, PackageDebugInfo};
 
 use crate::{
@@ -12,7 +12,6 @@ use crate::{
         advice_error_with_package_source_context, event_error_with_context,
         event_error_with_package_source_context,
     },
-    event::EventError,
     fast::{BreakReason, FastProcessor},
 };
 

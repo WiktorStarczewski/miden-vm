@@ -7,6 +7,7 @@ use miden_assembly::{
 };
 use miden_core::{
     crypto::merkle::{MerkleStore, MerkleTree},
+    events::{EventContext, EventError, EventHandler, EventName},
     mast::{BasicBlockNodeBuilder, MastForest, error_code_from_msg},
 };
 use miden_debug_types::{Location, SourceFile, SourceManager, SourceSpan};
@@ -17,7 +18,6 @@ use crate::{
     BaseHost, DefaultHost, FastProcessor, KernelDescriptor, LoadedMastForest, ONE, Program,
     StackInputs, SyncHost, Word, ZERO,
     advice::{AdviceInputs, AdviceMap, AdviceMutation},
-    event::{EventContext, EventError, EventHandler, EventName},
     operation::Operation,
 };
 

@@ -5,10 +5,9 @@ use alloc::{
 };
 use core::{fmt, fmt::Debug};
 
-pub use miden_core::events::{EventError, EventHandler};
 use miden_core::{
     advice::AdviceMutation,
-    events::{EventContext, EventId, EventName, SystemEvent},
+    events::{EventContext, EventError, EventHandler, EventId, EventName, SystemEvent},
 };
 
 use crate::ExecutionError;

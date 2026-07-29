@@ -24,7 +24,7 @@ const OP_BATCH_FLAGS_RANGE: core::ops::Range<usize> = 19..19 + NUM_OP_BATCH_FLAG
 const OP_BITS_EXTRA_COLS_RANGE: core::ops::Range<usize> = 22..24;
 use miden_core::{
     EMPTY_WORD, Felt, ONE, WORD_SIZE, Word, ZERO,
-    events::EventName,
+    events::{EventName, NoopEventHandler},
     mast::{
         BasicBlockNodeBuilder, CallNodeBuilder, DynNodeBuilder, JoinNodeBuilder, LoopNodeBuilder,
         MastForest, MastNodeExt, OP_BATCH_SIZE, SplitNodeBuilder,
@@ -36,7 +36,6 @@ use miden_utils_testing::rand::rand_value;
 
 use crate::{
     AdviceInputs, DefaultHost, ExecutionOptions, FastProcessor,
-    event::NoopEventHandler,
     trace::{ExecutionTrace, build_trace},
 };
 

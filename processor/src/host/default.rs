@@ -2,12 +2,12 @@ use alloc::{sync::Arc, vec::Vec};
 
 use miden_core::{
     Word,
-    events::{EventContext, EventId, EventName},
+    events::{EventContext, EventError, EventHandler, EventId, EventName},
 };
 use miden_debug_types::{DefaultSourceManager, Location, SourceFile, SourceManager, SourceSpan};
 pub use miden_mast_package::HostLibrary;
 
-use super::handlers::{EventError, EventHandler, EventHandlerRegistry};
+use super::handlers::EventHandlerRegistry;
 use crate::{
     BaseHost, ExecutionError, LoadedMastForest, MastForestStore, MemMastForestStore, SyncHost,
     advice::AdviceMutation,

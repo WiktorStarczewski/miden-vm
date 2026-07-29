@@ -3,7 +3,11 @@
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
-use miden_core::{deferred::PrecompileError, program::MIN_STACK_DEPTH};
+use miden_core::{
+    deferred::PrecompileError,
+    events::{EventError, EventId, EventName},
+    program::MIN_STACK_DEPTH,
+};
 use miden_debug_types::{Location, SourceFile, SourceSpan};
 use miden_mast_package::{
     PackageDebugInfoError,
@@ -12,11 +16,7 @@ use miden_mast_package::{
 use miden_utils_diagnostics::{Diagnostic, miette};
 
 use crate::{
-    BaseHost, Felt, MemoryError, Word,
-    advice::AdviceError,
-    event::{EventError, EventId, EventName},
-    fast::SystemEventError,
-    utils::to_hex,
+    BaseHost, Felt, MemoryError, Word, advice::AdviceError, fast::SystemEventError, utils::to_hex,
 };
 
 // EXECUTION ERROR

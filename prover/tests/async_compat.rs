@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use miden_assembly::Assembler;
+use miden_core::events::{EventContext, EventError, EventName};
 use miden_debug_types::{Location, SourceFile, SourceSpan};
 use miden_processor::{
-    BaseHost, DefaultHost, ExecutionOptions, Felt, FutureMaybeSend, Host, LoadedMastForest,
-    ProcessorState, Word,
+    BaseHost, DefaultHost, ExecutionOptions, Felt, FutureMaybeSend, Host, LoadedMastForest, Word,
     advice::AdviceMutation,
-    event::{EventError, EventName},
 };
 use miden_prover::{AdviceInputs, ProvingOptions, StackInputs, prove, prove_sync};
 
@@ -39,7 +38,7 @@ impl Host for YieldingAsyncHost {
 
     fn on_event(
         &mut self,
-        _process: &ProcessorState<'_>,
+        _context: &EventContext<'_>,
     ) -> impl FutureMaybeSend<Result<Vec<AdviceMutation>, EventError>> {
         self.event_calls += 1;
         async {

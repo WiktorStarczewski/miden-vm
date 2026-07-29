@@ -1,15 +1,16 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
-use miden_core::Felt;
+use miden_core::{
+    Felt,
+    events::{EventContext, EventError},
+};
 use miden_debug_types::{
     DefaultSourceManager, Location, SourceFile, SourceManager, SourceManagerSync, SourceSpan,
 };
 
 use crate::{
     BaseHost, LoadedMastForest, MastForestStore, MemMastForestStore, MemoryAddress, SyncHost, Word,
-    advice::AdviceMutation,
-    event::{EventContext, EventError},
-    mast::MastForest,
+    advice::AdviceMutation, mast::MastForest,
 };
 
 /// A snapshot of the processor state for consistency checking between processors.
