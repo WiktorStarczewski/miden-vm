@@ -74,7 +74,7 @@ pub trait SyncHost: BaseHost {
     /// may have been pushed onto the stack prior to the emit operation.
     ///
     /// ## Implementation notes
-    /// - Extract the event ID via `EventId::from_felt(process.get_stack_item(0))`
+    /// - Extract the event ID via `context.event_id()`
     /// - Return errors without event names or IDs - the caller will enrich them via
     ///   [`BaseHost::resolve_event()`]
     /// - System events (IDs 0-255) are handled by the VM before calling this method
@@ -102,7 +102,7 @@ pub trait Host: BaseHost {
     /// may have been pushed onto the stack prior to the emit operation.
     ///
     /// ## Implementation notes
-    /// - Extract the event ID via `EventId::from_felt(process.get_stack_item(0))`
+    /// - Extract the event ID via `context.event_id()`
     /// - Return errors without event names or IDs - the caller will enrich them via
     ///   [`BaseHost::resolve_event()`]
     /// - System events (IDs 0-255) are handled by the VM before calling this method

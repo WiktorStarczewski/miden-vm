@@ -25,7 +25,7 @@ use miden_core::{
     Felt, MemoryError, Word,
     advice::AdviceMutation,
     events::{
-        EventContext, EventError, EventHandler, EventId, EventName,
+        EventContext, EventError, EventHandler, EventName,
         debug::{StdoutWriter, write_interval, write_stack},
     },
 };
@@ -141,21 +141,21 @@ impl<W: fmt::Write + Send + Sync> DebugPrinter<W> {
 }
 
 impl<W: fmt::Write + Send + Sync + 'static> EventHandler for DebugPrinter<W> {
-    fn on_event(&self, process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&self, context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         // The event id sits at the top of the stack (position 0); the procedure's arguments, if
         // any, are immediately below it.
-        let id = EventId::from_felt(process.get_stack_item(0));
+        let id = context.event_id();
         let mut writer = self.writer.write();
         let w: &mut W = &mut writer;
 
         if id == PRINT_STACK_EVENT_NAME.to_event_id() {
             // Skip position 0 (the event id) so only the user's operand stack is shown. Print the
             // entire stack (no cap).
-            let stack = process.get_stack_state();
+            let stack = context.stack_snapshot();
             let operand_stack = stack.get(1..).unwrap_or(&[]);
-            write_stack(w, operand_stack, None, "Stack", process.clock())?;
+            write_stack(w, operand_stack, None, "Stack", context.clock())?;
         } else if id == PRINT_MEM_EVENT_NAME.to_event_id() {
-            let bounds = read_mem_print_range(process, 1, 2)?;
+            let bounds = read_mem_print_range(context, 1, 2)?;
             // Guard against an accidentally huge explicit range.
             if let Some((first, last)) = bounds {
                 let len = u64::from(last - first) + 1;
@@ -166,19 +166,19 @@ impl<W: fmt::Write + Send + Sync + 'static> EventHandler for DebugPrinter<W> {
                     .into());
                 }
             }
-            write_mem_range(w, process, bounds)?;
+            write_mem_range(w, context, bounds)?;
         } else if id == PRINT_MEM_ALL_EVENT_NAME.to_event_id() {
-            write_mem_all(w, process)?;
+            write_mem_all(w, context)?;
         } else if id == PRINT_ADV_STACK_EVENT_NAME.to_event_id() {
-            let start = stack_item_as_usize(process, 1);
-            let end = stack_item_as_usize(process, 2);
-            let adv_stack = process.advice_stack();
+            let start = stack_item_as_usize(context, 1);
+            let end = stack_item_as_usize(context, 2);
+            let adv_stack = context.advice_stack_snapshot();
             let slice = slice_range(&adv_stack, start, end);
-            write_stack(w, slice, None, "Advice stack", process.clock())?;
+            write_stack(w, slice, None, "Advice stack", context.clock())?;
         } else if id == PRINT_ADV_MAP_EVENT_NAME.to_event_id() {
-            write_adv_map(w, process)?;
+            write_adv_map(w, context)?;
         } else if id == PRINT_ADV_MAP_ITEM_EVENT_NAME.to_event_id() {
-            write_adv_map_entry(w, process)?;
+            write_adv_map_entry(w, context)?;
         }
         // Unknown ids are ignored: the handler is only registered for the events above.
 
@@ -189,7 +189,7 @@ impl<W: fmt::Write + Send + Sync + 'static> EventHandler for DebugPrinter<W> {
 struct NoopDebugHandler;
 
 impl EventHandler for NoopDebugHandler {
-    fn on_event(&self, _process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&self, _context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         Ok(Vec::new())
     }
 }
@@ -198,8 +198,8 @@ impl EventHandler for NoopDebugHandler {
 // ================================================================================================
 
 /// Reads the element at `pos` on the operand stack as a `usize` (saturating).
-fn stack_item_as_usize(process: &EventContext<'_>, pos: usize) -> usize {
-    usize::try_from(process.get_stack_item(pos).as_canonical_u64()).unwrap_or(usize::MAX)
+fn stack_item_as_usize(context: &EventContext<'_>, pos: usize) -> usize {
+    usize::try_from(context.stack_item(pos).as_canonical_u64()).unwrap_or(usize::MAX)
 }
 
 /// Returns `slice[start..end]`, clamped to the bounds of `slice` and to `start <= end`.
@@ -217,30 +217,27 @@ fn slice_range(slice: &[Felt], start: usize, end: usize) -> &[Felt] {
 /// `2^32` (one past the last address) so the cell at `u32::MAX` stays reachable; it folds into an
 /// inclusive end of `u32::MAX`.
 fn read_mem_print_range(
-    process: &EventContext<'_>,
+    context: &EventContext<'_>,
     start_idx: usize,
     end_idx: usize,
 ) -> Result<Option<(u32, u32)>, MemoryError> {
-    let start_addr = process.get_stack_item(start_idx).as_canonical_u64();
-    let end_addr = process.get_stack_item(end_idx).as_canonical_u64();
+    let end_addr = context.stack_item(end_idx).as_canonical_u64();
 
-    if start_addr > u32::MAX as u64 {
-        return Err(MemoryError::AddressOutOfBounds { addr: start_addr });
-    }
-    // The exclusive end may be one past the last valid address (`2^32`).
-    if end_addr > u32::MAX as u64 + 1 {
-        return Err(MemoryError::AddressOutOfBounds { addr: end_addr });
-    }
-    if start_addr > end_addr {
-        return Err(MemoryError::InvalidMemoryRange { start_addr, end_addr });
+    // The generic range accessor accepts only `u32` bounds, but the debug procedure also supports
+    // the exclusive end `2^32` so that callers can print the cell at `u32::MAX`.
+    if end_addr == u32::MAX as u64 + 1 {
+        let start_addr = context.stack_item(start_idx).as_canonical_u64();
+        if start_addr > u32::MAX as u64 {
+            return Err(MemoryError::AddressOutOfBounds { addr: start_addr });
+        }
+        return Ok(Some((start_addr as u32, u32::MAX)));
     }
 
-    if start_addr == end_addr {
+    let range = context.memory_range_from_stack(start_idx, end_idx)?;
+    if range.is_empty() {
         Ok(None)
     } else {
-        // Subtract in `u64` before the cast, since `end_addr` may be `2^32`; the result is in
-        // `[0, u32::MAX]`.
-        Ok(Some((start_addr as u32, (end_addr - 1) as u32)))
+        Ok(Some((range.start, range.end - 1)))
     }
 }
 
@@ -251,20 +248,17 @@ fn read_mem_print_range(
 /// `u32`. The caller is responsible for capping the range length (see [`MAX_PRINT_MEM_RANGE`]).
 fn write_mem_range<W: fmt::Write>(
     w: &mut W,
-    process: &EventContext<'_>,
+    context: &EventContext<'_>,
     bounds: Option<(u32, u32)>,
 ) -> fmt::Result {
-    let (ctx, clk) = (process.ctx(), process.clock());
+    let clk = context.clock();
     let Some((start, end)) = bounds else {
-        return writeln!(w, "Memory state before step {clk} for context {ctx}: range is empty.");
+        return writeln!(w, "Memory state before step {clk}: range is empty.");
     };
-    writeln!(
-        w,
-        "Memory state before step {clk} for context {ctx} in the range [{start}, {end}]:",
-    )?;
+    writeln!(w, "Memory state before step {clk} in the range [{start}, {end}]:")?;
     let items: Vec<_> = (start..=end)
         .map(|addr| {
-            let value = process.get_mem_value(ctx, addr).map(|v| v.to_string());
+            let value = context.memory_value(addr).map(|v| v.to_string());
             (format!("{addr:#010x}"), value)
         })
         .collect();
@@ -272,11 +266,11 @@ fn write_mem_range<W: fmt::Write>(
 }
 
 /// Prints all initialized memory cells of the current context.
-fn write_mem_all<W: fmt::Write>(w: &mut W, process: &EventContext<'_>) -> fmt::Result {
-    let (ctx, clk) = (process.ctx(), process.clock());
-    writeln!(w, "Memory state before step {clk} for context {ctx}:")?;
-    let items: Vec<_> = process
-        .get_mem_state(ctx)
+fn write_mem_all<W: fmt::Write>(w: &mut W, context: &EventContext<'_>) -> fmt::Result {
+    let clk = context.clock();
+    writeln!(w, "Memory state before step {clk}:")?;
+    let items: Vec<_> = context
+        .memory_snapshot()
         .into_iter()
         .map(|(addr, value)| (format!("{addr:#010x}"), Some(value.to_string())))
         .collect();
@@ -284,9 +278,9 @@ fn write_mem_all<W: fmt::Write>(w: &mut W, process: &EventContext<'_>) -> fmt::R
 }
 
 /// Prints the full advice map.
-fn write_adv_map<W: fmt::Write>(w: &mut W, process: &EventContext<'_>) -> fmt::Result {
-    let clk = process.clock();
-    let map = process.advice_map();
+fn write_adv_map<W: fmt::Write>(w: &mut W, context: &EventContext<'_>) -> fmt::Result {
+    let clk = context.clock();
+    let map = context.advice_map();
     if map.is_empty() {
         return writeln!(w, "Advice map before step {clk}: empty.");
     }
@@ -300,11 +294,11 @@ fn write_adv_map<W: fmt::Write>(w: &mut W, process: &EventContext<'_>) -> fmt::R
 }
 
 /// Looks up the WORD key (at stack positions 1..5) in the advice map and prints its values.
-fn write_adv_map_entry<W: fmt::Write>(w: &mut W, process: &EventContext<'_>) -> fmt::Result {
-    let key = process.get_stack_word(1);
+fn write_adv_map_entry<W: fmt::Write>(w: &mut W, context: &EventContext<'_>) -> fmt::Result {
+    let key = context.stack_word(1);
     let key_str = format_word(&key);
-    let clk = process.clock();
-    match process.get_advice_map_entry(&key) {
+    let clk = context.clock();
+    match context.advice_map_entry(&key) {
         Some(values) => {
             writeln!(w, "Advice map entry for key {key_str} before step {clk}:")?;
             let items: Vec<_> = values

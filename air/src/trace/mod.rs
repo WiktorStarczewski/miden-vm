@@ -6,12 +6,9 @@ pub use rows::{RowIndex, RowIndexError};
 
 mod main_trace;
 pub use main_trace::{MainTrace, MainTraceRow};
-
 // CONSTANTS
 // ================================================================================================
-
-/// The minimum length of the execution trace. This is the minimum required to support range checks.
-pub const MIN_TRACE_LEN: usize = 64;
+pub use miden_core::execution::MIN_TRACE_LEN;
 
 // MAIN TRACE LAYOUT
 // ------------------------------------------------------------------------------------------------

@@ -492,7 +492,7 @@ impl FastProcessor {
     /// Returns the event context exposed to host callbacks.
     #[inline(always)]
     pub fn state(&self) -> EventContext<'_> {
-        EventContext::new(self)
+        EventContext::new(self, self.ctx)
     }
 
     // MUTATORS
@@ -665,17 +665,17 @@ impl FastProcessor {
 
 impl EventContextProvider for FastProcessor {
     #[inline(always)]
-    fn get_stack_item(&self, position: usize) -> Felt {
+    fn stack_item(&self, position: usize) -> Felt {
         self.stack_get_safe(position)
     }
 
     #[inline(always)]
-    fn get_stack_word(&self, start: usize) -> Word {
+    fn stack_word(&self, start: usize) -> Word {
         self.stack_get_word_safe(start)
     }
 
     #[inline(always)]
-    fn get_stack_state(&self) -> Vec<Felt> {
+    fn stack_snapshot(&self) -> Vec<Felt> {
         self.stack().iter().rev().copied().collect()
     }
 
@@ -685,27 +685,22 @@ impl EventContextProvider for FastProcessor {
     }
 
     #[inline(always)]
-    fn context_id(&self) -> ContextId {
-        self.ctx
+    fn memory_value(&self, address: u32) -> Option<Felt> {
+        self.memory.read_element_impl(self.ctx, address)
     }
 
     #[inline(always)]
-    fn get_mem_value(&self, context: ContextId, address: u32) -> Option<Felt> {
-        self.memory.read_element_impl(context, address)
+    fn memory_word(&self, address: u32) -> Result<Option<Word>, MemoryError> {
+        self.memory.read_word_impl(self.ctx, address)
     }
 
     #[inline(always)]
-    fn get_mem_word(&self, context: ContextId, address: u32) -> Result<Option<Word>, MemoryError> {
-        self.memory.read_word_impl(context, address)
+    fn memory_snapshot(&self) -> Vec<(MemoryAddress, Felt)> {
+        self.memory.get_memory_state(self.ctx)
     }
 
     #[inline(always)]
-    fn get_mem_state(&self, context: ContextId) -> Vec<(MemoryAddress, Felt)> {
-        self.memory.get_memory_state(context)
-    }
-
-    #[inline(always)]
-    fn advice_stack(&self) -> Vec<Felt> {
+    fn advice_stack_snapshot(&self) -> Vec<Felt> {
         self.advice.stack()
     }
 
@@ -715,25 +710,20 @@ impl EventContextProvider for FastProcessor {
     }
 
     #[inline(always)]
-    fn get_advice_map_entry(&self, key: &Word) -> Option<&[Felt]> {
+    fn advice_map_entry(&self, key: &Word) -> Option<&[Felt]> {
         self.advice.get_mapped_values(key)
     }
 
     #[inline(always)]
-    fn get_advice_tree_node(
-        &self,
-        root: Word,
-        depth: Felt,
-        index: Felt,
-    ) -> Result<Word, EventError> {
+    fn advice_tree_node(&self, root: Word, depth: Felt, index: Felt) -> Result<Word, EventError> {
         self.advice
             .get_tree_node(root, depth, index)
             .map_err(|err| Box::new(err) as EventError)
     }
 
     #[inline(always)]
-    fn max_hash_len_bytes(&self) -> usize {
-        self.options.max_hash_len_bytes()
+    fn execution_options(&self) -> &ExecutionOptions {
+        &self.options
     }
 
     #[inline(always)]

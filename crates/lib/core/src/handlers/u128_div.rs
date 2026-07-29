@@ -35,14 +35,14 @@ pub const U128_DIV_EVENT_NAME: EventName = EventName::new("miden::core::math::u1
 ///
 /// # Errors
 /// Returns an error if the divisor is ZERO or any limb is not a valid u32.
-pub fn handle_u128_div(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
-    let divisor = read_u128_from_stack(process, 1, "divisor")?;
+pub fn handle_u128_div(context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+    let divisor = read_u128_from_stack(context, 1, "divisor")?;
 
     if divisor == 0 {
         return Err(U128DivError::DivideByZero.into());
     }
 
-    let dividend = read_u128_from_stack(process, 5, "dividend")?;
+    let dividend = read_u128_from_stack(context, 5, "dividend")?;
 
     let quotient = dividend / divisor;
     let remainder = dividend - quotient * divisor;
@@ -61,13 +61,13 @@ pub fn handle_u128_div(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>
 
 /// Reads a u128 value from 4 consecutive stack positions starting at `start`.
 fn read_u128_from_stack(
-    process: &EventContext<'_>,
+    context: &EventContext<'_>,
     start: usize,
     name: &'static str,
 ) -> Result<u128, EventError> {
     let mut value: u128 = 0;
     for i in (0..4).rev() {
-        let limb = process.get_stack_item(start + i).as_canonical_u64();
+        let limb = context.stack_item(start + i).as_canonical_u64();
         if limb > u32::MAX as u64 {
             return Err(U128DivError::NotU32Value {
                 value: limb,

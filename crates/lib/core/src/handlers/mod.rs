@@ -63,6 +63,5 @@ pub(crate) fn read_memory_region(
     let end_addr = start_addr.checked_add(len_u32)?;
 
     // Read all elements in the range from the current execution context
-    let ctx = context.ctx();
-    (start_addr..end_addr).map(|addr| context.get_mem_value(ctx, addr)).collect()
+    (start_addr..end_addr).map(|addr| context.memory_value(addr)).collect()
 }

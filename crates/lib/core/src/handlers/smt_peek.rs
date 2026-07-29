@@ -46,18 +46,18 @@ pub const SMT_PEEK_EVENT_NAME: EventName =
 ///
 /// # Panics
 /// Will panic as unimplemented if the target depth is `64`.
-pub fn handle_smt_peek(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+pub fn handle_smt_peek(context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
     let empty_leaf = EmptySubtreeRoots::entry(SMT_DEPTH, SMT_DEPTH);
     // fetch the arguments from the operand stack
     // Stack at emit: [event_id, KEY, ROOT, ...] where KEY and ROOT are structural words.
-    let key = process.get_stack_word(1);
-    let root = process.get_stack_word(5);
+    let key = context.stack_word(1);
+    let root = context.stack_word(5);
 
     // get the node from the SMT for the specified key; this node can be either a leaf node,
     // or a root of an empty subtree at the returned depth
     // K[3] is used as the leaf index (most significant in BE ordering)
-    let node = process
-        .get_advice_tree_node(root, Felt::new_unchecked(SMT_DEPTH as u64), key[3])
+    let node = context
+        .advice_tree_node(root, Felt::new_unchecked(SMT_DEPTH as u64), key[3])
         .map_err(|err| SmtPeekError::AdviceProviderError {
             message: format!("Failed to get tree node: {err}"),
         })?;
@@ -68,7 +68,7 @@ pub fn handle_smt_peek(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>
         let mutation = advice_stack_word_mutation(Smt::EMPTY_VALUE);
         Ok(vec![mutation])
     } else {
-        let leaf_preimage = get_smt_leaf_preimage(process, node)?;
+        let leaf_preimage = get_smt_leaf_preimage(context, node)?;
 
         for (key_in_leaf, value_in_leaf) in leaf_preimage {
             if key == key_in_leaf {
@@ -90,12 +90,10 @@ pub fn handle_smt_peek(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>
 
 /// Retrieves the preimage of an SMT leaf node from the advice provider.
 fn get_smt_leaf_preimage(
-    process: &EventContext<'_>,
+    context: &EventContext<'_>,
     node: Word,
 ) -> Result<Vec<(Word, Word)>, SmtPeekError> {
-    let kv_pairs = process
-        .get_advice_map_entry(&node)
-        .ok_or(SmtPeekError::SmtNodeNotFound { node })?;
+    let kv_pairs = context.advice_map_entry(&node).ok_or(SmtPeekError::SmtNodeNotFound { node })?;
 
     if kv_pairs.len() % (WORD_SIZE * 2) != 0 {
         return Err(SmtPeekError::InvalidSmtNodePreimage { node, preimage_len: kv_pairs.len() });

@@ -38,11 +38,12 @@ impl Host for YieldingAsyncHost {
 
     fn on_event(
         &mut self,
-        _context: &EventContext<'_>,
+        context: &EventContext<'_>,
     ) -> impl FutureMaybeSend<Result<Vec<AdviceMutation>, EventError>> {
         self.event_calls += 1;
-        async {
+        async move {
             tokio::task::yield_now().await;
+            let _event_id = context.event_id();
             Ok(Vec::new())
         }
     }

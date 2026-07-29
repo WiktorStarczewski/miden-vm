@@ -39,9 +39,9 @@ pub const FALCON_DIV_EVENT_NAME: EventName =
 /// # Errors
 /// - Returns an error if the divisor is ZERO.
 /// - Returns an error if either a0 or a1 is not a u32.
-pub fn handle_falcon_div(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
-    let dividend_hi = process.get_stack_item(1).as_canonical_u64();
-    let dividend_lo = process.get_stack_item(2).as_canonical_u64();
+pub fn handle_falcon_div(context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+    let dividend_hi = context.stack_item(1).as_canonical_u64();
+    let dividend_lo = context.stack_item(2).as_canonical_u64();
 
     if dividend_lo > u32::MAX.into() {
         return Err(FalconDivError::InputNotU32 {

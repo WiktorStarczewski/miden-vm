@@ -17,7 +17,6 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessorStateSnapshot {
     clk: u32,
-    ctx: u32,
     stack_state: Vec<Felt>,
     stack_words: [Word; 4],
     mem_state: Vec<(MemoryAddress, Felt)>,
@@ -27,15 +26,14 @@ impl From<&EventContext<'_>> for ProcessorStateSnapshot {
     fn from(state: &EventContext<'_>) -> Self {
         ProcessorStateSnapshot {
             clk: state.clock(),
-            ctx: state.ctx().into(),
-            stack_state: state.get_stack_state(),
+            stack_state: state.stack_snapshot(),
             stack_words: [
-                state.get_stack_word(0),
-                state.get_stack_word(4),
-                state.get_stack_word(8),
-                state.get_stack_word(12),
+                state.stack_word(0),
+                state.stack_word(4),
+                state.stack_word(8),
+                state.stack_word(12),
             ],
-            mem_state: state.get_mem_state(state.ctx()),
+            mem_state: state.memory_snapshot(),
         }
     }
 }
@@ -48,22 +46,21 @@ impl ProcessorStateSnapshot {
     /// match the state after the trailing `drop`, and to preserve the old trace-decorator test
     /// shape.
     fn from_emit_checkpoint(state: &EventContext<'_>) -> Self {
-        let mut stack_state = state.get_stack_state();
+        let mut stack_state = state.stack_snapshot();
         if !stack_state.is_empty() {
             stack_state.remove(0);
         }
 
         ProcessorStateSnapshot {
             clk: state.clock(),
-            ctx: state.ctx().into(),
             stack_state,
             stack_words: [
-                state.get_stack_word(1),
-                state.get_stack_word(5),
-                state.get_stack_word(9),
-                state.get_stack_word(13),
+                state.stack_word(1),
+                state.stack_word(5),
+                state.stack_word(9),
+                state.stack_word(13),
             ],
-            mem_state: state.get_mem_state(state.ctx()),
+            mem_state: state.memory_snapshot(),
         }
     }
 }
@@ -143,7 +140,7 @@ where
     }
 
     fn on_event(&mut self, context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
-        let event_id: u32 = context.get_stack_item(0).as_canonical_u64().try_into().unwrap();
+        let event_id: u32 = context.event_id().as_u64().try_into().unwrap();
         self.event_handler.push(event_id);
         self.snapshots
             .entry(event_id)

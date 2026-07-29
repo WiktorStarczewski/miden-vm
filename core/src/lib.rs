@@ -9,7 +9,9 @@ extern crate std;
 // EXPORTS
 // ================================================================================================
 
-pub use execution::{ContextId, MemoryAddress, MemoryError};
+pub use execution::{
+    ContextId, ExecutionOptions, ExecutionOptionsError, MemoryAddress, MemoryError,
+};
 pub use miden_crypto::{EMPTY_WORD, Felt, ONE, Word, ZERO};
 
 /// The number of field elements in a Miden word.

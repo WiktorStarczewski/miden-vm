@@ -1,5 +1,5 @@
-use miden_air::trace::MIN_TRACE_LEN;
-use miden_core::{
+use super::MIN_TRACE_LEN;
+use crate::{
     deferred::DEFAULT_MAX_DEFERRED_ELEMENTS as DEFAULT_DEFERRED_STATE_ELEMENTS,
     program::MIN_STACK_DEPTH,
 };

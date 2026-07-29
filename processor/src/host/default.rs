@@ -127,7 +127,7 @@ where
     }
 
     fn on_event(&mut self, context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
-        let event_id = EventId::from_felt(context.get_stack_item(0));
+        let event_id = context.event_id();
         match self.event_handlers.handle_event(event_id, context) {
             Ok(Some(mutations)) => Ok(mutations),
             Ok(None) => {

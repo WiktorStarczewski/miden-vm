@@ -36,7 +36,7 @@ pub const READONLY_MIDEN_DEBUG_PRINTLN: EventName =
 struct ReadonlyNoopHandler;
 
 impl EventHandler for ReadonlyNoopHandler {
-    fn on_event(&self, _process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+    fn on_event(&self, _context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
         Ok(vec![])
     }
 }

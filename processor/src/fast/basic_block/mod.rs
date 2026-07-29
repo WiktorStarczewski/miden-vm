@@ -107,8 +107,8 @@ impl FastProcessor {
             );
         }
 
-        let processor_state = self.state();
-        let mutations = host.on_event(&processor_state);
+        let context = self.state();
+        let mutations = host.on_event(&context);
         self.apply_host_event_mutations(
             host,
             op_idx,
@@ -139,8 +139,8 @@ impl FastProcessor {
             );
         }
 
-        let processor_state = self.state();
-        let mutations = host.on_event(&processor_state).await;
+        let context = self.state();
+        let mutations = host.on_event(&context).await;
         self.apply_host_event_mutations(
             host,
             op_idx,

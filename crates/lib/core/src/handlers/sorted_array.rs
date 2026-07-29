@@ -1,7 +1,7 @@
 use alloc::{vec, vec::Vec};
 
 use miden_core::{
-    Felt, MemoryError, Word,
+    Felt, Word,
     advice::{AdviceMutation, AdviceStack},
     events::{EventContext, EventError, EventName},
     field::PrimeCharacteristicRing,
@@ -36,9 +36,9 @@ enum KeySize {
 /// # Errors
 /// Returns an error if the provided word array is not sorted in non-decreasing order.
 pub fn handle_lowerbound_array(
-    process: &EventContext<'_>,
+    context: &EventContext<'_>,
 ) -> Result<Vec<AdviceMutation>, EventError> {
-    push_lowerbound_result(process, 4, KeySize::Full)
+    push_lowerbound_result(context, 4, KeySize::Full)
 }
 
 /// Pushes onto the advice stack the first pointer in [start_ptr, end_ptr) such that
@@ -59,9 +59,9 @@ pub fn handle_lowerbound_array(
 /// # Errors
 /// Returns an error if the keys are not sorted in non-decreasing order.
 pub fn handle_lowerbound_key_value(
-    process: &EventContext<'_>,
+    context: &EventContext<'_>,
 ) -> Result<Vec<AdviceMutation>, EventError> {
-    let use_full_key = process.get_stack_item(7);
+    let use_full_key = context.stack_item(7);
 
     let key_size = match use_full_key.as_canonical_u64() {
         0 => KeySize::Half,
@@ -73,7 +73,7 @@ pub fn handle_lowerbound_key_value(
         },
     };
 
-    push_lowerbound_result(process, 8, key_size)
+    push_lowerbound_result(context, 8, key_size)
 }
 
 /// Offsets for the push_lowerbound_result inputs from the top of the stack
@@ -82,7 +82,7 @@ const START_ADDR_OFFSET: usize = 5;
 const END_ADDR_OFFSET: usize = 6;
 
 fn push_lowerbound_result(
-    process: &EventContext<'_>,
+    context: &EventContext<'_>,
     stride: u32,
     key_size: KeySize,
 ) -> Result<Vec<AdviceMutation>, EventError> {
@@ -90,17 +90,12 @@ fn push_lowerbound_result(
     assert!(stride == 4 || stride == 8);
 
     // Read inputs from the stack; keys are provided in structural / little-endian order.
-    let key = word_to_search_key(process.get_stack_word(KEY_OFFSET), key_size);
-    let addr_range = process.get_mem_addr_range(START_ADDR_OFFSET, END_ADDR_OFFSET)?;
+    let key = word_to_search_key(context.stack_word(KEY_OFFSET), key_size);
+    let addr_range = context.memory_range_from_stack(START_ADDR_OFFSET, END_ADDR_OFFSET)?;
 
-    // Validate the start_addr is word-aligned (multiple of 4)
-    if addr_range.start % 4 != 0 {
-        return Err(MemoryError::UnalignedWordAccess {
-            addr: addr_range.start,
-            ctx: process.ctx(),
-        }
-        .into());
-    }
+    // Validate word alignment through the active-context memory API so it supplies the correct
+    // context in the resulting MemoryError.
+    let first_word = context.memory_word(addr_range.start)?;
 
     // Validate the end_addr is properly aligned (i.e. the entire array has size divisible by
     // stride)
@@ -125,19 +120,17 @@ fn push_lowerbound_result(
     }
 
     // Helper function to get a word from memory and normalize it to the requested key size.
-    let get_word = {
-        |addr: u32| {
-            process
-                .get_mem_word(process.ctx(), addr)
-                .map(|word| word_to_search_key(word.unwrap_or_default(), key_size))
-        }
+    let get_word = |addr: u32| {
+        context
+            .memory_word(addr)
+            .map(|word| word_to_search_key(word.unwrap_or_default(), key_size))
     };
 
     let mut was_key_found = false;
     let mut result = None;
 
     // Test the first element
-    let mut previous_word = get_word(addr_range.start)?;
+    let mut previous_word = word_to_search_key(first_word.unwrap_or_default(), key_size);
     if previous_word >= key {
         was_key_found = previous_word == key;
         result = Some(addr_range.start);

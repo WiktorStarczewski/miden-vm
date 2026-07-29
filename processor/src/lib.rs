@@ -16,7 +16,7 @@ use miden_mast_package::debug_info::DebugSourceNodeId;
 mod continuation_stack;
 mod errors;
 mod execution;
-mod execution_options;
+
 mod fast;
 mod host;
 mod processor;
@@ -48,7 +48,6 @@ pub use errors::{
     advice_error_with_package_source_context, event_error_with_package_source_context,
     procedure_not_found_with_package_source_context,
 };
-pub use execution_options::{ExecutionOptions, ExecutionOptionsError};
 pub use fast::{BreakReason, ExecutionOutput, FastProcessor, ResumeContext};
 pub use host::{
     BaseHost, FutureMaybeSend, Host, LoadedMastForest, MastForestStore, MemMastForestStore,
@@ -58,8 +57,8 @@ pub use host::{
 #[deprecated(note = "use miden_core::events::debug")]
 pub use miden_core::events::debug::{StdoutWriter, format_value, write_interval, write_stack};
 pub use miden_core::{
-    ContextId, EMPTY_WORD, Felt, MemoryAddress, MemoryError, ONE, WORD_SIZE, Word, ZERO, crypto,
-    field, mast,
+    ContextId, EMPTY_WORD, ExecutionOptions, ExecutionOptionsError, Felt, MemoryAddress,
+    MemoryError, ONE, WORD_SIZE, Word, ZERO, crypto, field, mast,
     program::{
         InputError, KernelDescriptor, MIN_STACK_DEPTH, Program, ProgramInfo, StackInputs,
         StackOutputs,
@@ -78,8 +77,7 @@ pub mod advice {
 
 pub mod event {
     pub use miden_core::events::{
-        AdviceProviderView, EventContext, EventContextProvider, EventId, EventName,
-        ExecutionOptionsView, SystemEvent, debug,
+        EventContext, EventContextProvider, EventId, EventName, SystemEvent, debug,
     };
     #[deprecated(
         note = "import EventError, EventHandler, and NoopEventHandler from miden_core::events"

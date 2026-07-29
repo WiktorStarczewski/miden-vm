@@ -34,11 +34,11 @@ pub const U64_DIV_EVENT_NAME: EventName = EventName::new("miden::core::math::u64
 ///
 /// # Errors
 /// Returns an error if the divisor is ZERO.
-pub fn handle_u64_div(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
+pub fn handle_u64_div(context: &EventContext<'_>) -> Result<Vec<AdviceMutation>, EventError> {
     // Read divisor from positions 1 (lo) and 2 (hi) - b is on top of stack
     let divisor = {
-        let divisor_lo = process.get_stack_item(1).as_canonical_u64();
-        let divisor_hi = process.get_stack_item(2).as_canonical_u64();
+        let divisor_lo = context.stack_item(1).as_canonical_u64();
+        let divisor_hi = context.stack_item(2).as_canonical_u64();
 
         // Ensure the divisor is a pair of u32 values
         if divisor_lo > u32::MAX.into() {
@@ -67,8 +67,8 @@ pub fn handle_u64_div(process: &EventContext<'_>) -> Result<Vec<AdviceMutation>,
 
     // Read dividend from positions 3 (lo) and 4 (hi) - a is below b
     let dividend = {
-        let dividend_lo = process.get_stack_item(3).as_canonical_u64();
-        let dividend_hi = process.get_stack_item(4).as_canonical_u64();
+        let dividend_lo = context.stack_item(3).as_canonical_u64();
+        let dividend_hi = context.stack_item(4).as_canonical_u64();
 
         // Ensure the dividend is a pair of u32 values
         if dividend_lo > u32::MAX.into() {

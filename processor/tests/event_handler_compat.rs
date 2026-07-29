@@ -27,7 +27,6 @@ fn existing_handler_body(process: &ProcessorState<'_>) -> Result<Vec<AdviceMutat
     let _memory = process.get_mem_value(context, 0);
     let _advice_stack = process.advice_provider().stack();
     let _mapped_values = process.advice_provider().get_mapped_values(&key);
-    let _max_hash_len = process.execution_options().max_hash_len_bytes();
 
     Ok(Vec::new())
 }

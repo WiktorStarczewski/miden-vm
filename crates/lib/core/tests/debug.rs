@@ -149,7 +149,11 @@ fn print_mem_outputs_range() {
     end
     ";
     let out = run_and_capture(source, AdviceInputs::default());
-    assert!(out.contains("Memory state"), "missing header; got:\n{out}");
+    assert!(
+        out.contains("Memory state before step ") && out.contains(" in the range [100, 101]:"),
+        "missing active-context memory header; got:\n{out}"
+    );
+    assert!(!out.contains("for context"), "context id should not be printed; got:\n{out}");
     assert!(out.contains("42") && out.contains("43"), "missing memory values; got:\n{out}");
 }
 
@@ -237,7 +241,8 @@ fn print_mem_all_outputs_memory() {
     end
     ";
     let out = run_and_capture(source, AdviceInputs::default());
-    assert!(out.contains("Memory state"), "missing header; got:\n{out}");
+    assert!(out.contains("Memory state before step "), "missing header; got:\n{out}");
+    assert!(!out.contains("for context"), "context id should not be printed; got:\n{out}");
     assert!(out.contains(": 7"), "missing stored value; got:\n{out}");
 }
 

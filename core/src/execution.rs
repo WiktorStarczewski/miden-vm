@@ -5,6 +5,12 @@ use miden_utils_diagnostics::{Diagnostic, miette};
 
 use crate::Felt;
 
+mod options;
+pub use options::{ExecutionOptions, ExecutionOptionsError};
+
+/// The minimum length of an execution trace required to support range checks.
+pub const MIN_TRACE_LEN: usize = 64;
+
 /// Identifies an execution context.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ContextId(u32);
