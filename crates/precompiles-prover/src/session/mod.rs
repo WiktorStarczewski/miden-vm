@@ -77,11 +77,12 @@ use crate::{
 };
 
 mod fixed;
-mod preprocessed_cache;
+pub(crate) mod preprocessed_cache;
 mod prove;
 pub(crate) use fixed::{fixed_ecgroup_msgs, fixed_uintval_msgs};
 pub mod statements;
 pub mod strategies;
+pub(crate) use prove::MAX_STARK_PROOF_BYTES;
 pub use prove::{ChipletAir, ChipletMultiAir, VerifyError, verify_deferred, verify_stark};
 
 /// Number of chiplets in the stack (= the width of [`SessionTraces::mains`]).

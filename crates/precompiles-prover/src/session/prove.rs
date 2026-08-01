@@ -32,7 +32,7 @@ use serde_wincode::SerdeCompat;
 
 use super::preprocessed_cache;
 
-const MAX_STARK_PROOF_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_STARK_PROOF_BYTES: usize = 64 * 1024 * 1024;
 
 use crate::{
     ProveError,
