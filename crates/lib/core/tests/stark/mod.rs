@@ -25,6 +25,7 @@ mod pvm_aux_trace;
 mod pvm_deep_queries;
 mod pvm_ood_frames;
 mod pvm_public_inputs;
+mod pvm_settlement;
 mod pvm_verifier;
 mod pvm_wrapper;
 
@@ -358,6 +359,7 @@ fn request_consumer_source() -> String {
     format!(
         "
         use miden::core::sys
+        use miden::core::stark::utils
         use miden::core::sys::vm
         use miden::core::sys::vm::claim
 
@@ -387,7 +389,7 @@ fn request_consumer_source() -> String {
             #    threshold (>= 96 conjectured bits).
             swapw
             # => [num_queries, query_pow_bits, deep_pow_bits, folding_pow_bits, D]
-            exec.vm::compute_conjectured_security_level
+            exec.utils::conjectured_security_level
             # => [conjectured_level, deep_pow_bits, folding_pow_bits, D]
             u32lt.96 assertz.err=\"proof security level is below the accepted target\"
             drop drop
@@ -477,6 +479,7 @@ fn stark_verifier_e2f4_request_multi_proof() {
     let source = format!(
         "
         use miden::core::sys
+        use miden::core::stark::utils
         use miden::core::sys::vm
         use miden::core::sys::vm::claim
 
@@ -493,7 +496,7 @@ fn stark_verifier_e2f4_request_multi_proof() {
             procref.vm::verify_vm_proof exec.sys::build_proof_request_key
             adv.push_mapval dropw                        # => [CLAIM_COMMITMENT]
             exec.vm::verify_vm_proof                     # => [D, nq, q_pow, deep_pow, fold_pow]
-            swapw exec.vm::compute_conjectured_security_level # => [level, deep_pow, fold_pow, D]
+            swapw exec.utils::conjectured_security_level # => [level, deep_pow, fold_pow, D]
             u32lt.96 assertz.err=\"proof security level is below the accepted target\"
             drop drop                                    # => [D]
         end
