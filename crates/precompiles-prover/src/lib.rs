@@ -12,7 +12,10 @@ extern crate std;
 use alloc::string::{String, ToString};
 
 use miden_core::deferred::{DeferredState, TRUE_DIGEST};
-pub use miden_core::proof::{DeferredProof, HashFunction, StarkProof};
+pub use miden_core::{
+    deferred::DeferredClaim,
+    proof::{DeferredProof, HashFunction, StarkProof},
+};
 pub use session::{VerifyError, verify_deferred};
 
 #[cfg(any(test, feature = "std"))]

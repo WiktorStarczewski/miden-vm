@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     crypto::hash::{Blake3_256, Poseidon2, Rpo256, Rpx256},
-    deferred::{DeferredRoot, DeferredStateWire},
+    deferred::{DeferredClaim, DeferredStateWire},
     serde::{
         BudgetedReader, ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable,
         SliceReader,
@@ -252,8 +252,8 @@ impl ExecutionProof {
 
 /// Proof material for the precompile claims associated with an execution proof.
 ///
-/// Verification returns the deferred root used to check the VM STARK proof. `Wire` is the partial
-/// form; `Empty` and `Stark` are final forms.
+/// Final verification authenticates the deferred claim, then verifies the VM STARK proof against
+/// its root. `Wire` is the partial form; `Empty` and `Stark` are final forms.
 ///
 /// Variants are public so callers can construct and inspect deferred proof material directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,14 +264,11 @@ pub enum DeferredProof {
     Empty,
     /// Canonical deferred-state wire for a partial proof.
     Wire(DeferredStateWire),
-    /// A precompile VM STARK proof for this execution's exact deferred root.
+    /// A precompile VM STARK proof for this execution's deferred claim.
     ///
-    /// After `proof` verifies against `public_root`, that root is used to verify the VM STARK
-    /// proof.
-    Stark {
-        proof: StarkProof,
-        public_root: DeferredRoot,
-    },
+    /// After `proof` authenticates the claim, its root becomes the deferred public input of the VM
+    /// STARK proof.
+    Stark { proof: StarkProof, claim: DeferredClaim },
 }
 
 impl DeferredProof {
@@ -290,8 +287,8 @@ impl DeferredProof {
     }
 
     /// Creates a deferred proof backed by a precompile VM STARK proof.
-    pub const fn stark(proof: StarkProof, public_root: DeferredRoot) -> Self {
-        Self::Stark { proof, public_root }
+    pub const fn stark(proof: StarkProof, claim: DeferredClaim) -> Self {
+        Self::Stark { proof, claim }
     }
 
     /// Returns `true` if this deferred proof is [`DeferredProof::Empty`].
@@ -315,10 +312,10 @@ impl DeferredProof {
         }
     }
 
-    /// Returns the nested proof and public root if this proof is [`DeferredProof::Stark`].
-    pub const fn as_stark(&self) -> Option<(&StarkProof, DeferredRoot)> {
+    /// Returns the nested proof and claim if this proof is [`DeferredProof::Stark`].
+    pub const fn as_stark(&self) -> Option<(&StarkProof, DeferredClaim)> {
         match self {
-            Self::Stark { proof, public_root } => Some((proof, *public_root)),
+            Self::Stark { proof, claim } => Some((proof, *claim)),
             _ => None,
         }
     }
@@ -338,10 +335,10 @@ impl Serializable for DeferredProof {
                 target.write_u8(Self::WIRE_TAG);
                 wire.write_into(target);
             },
-            Self::Stark { proof, public_root } => {
+            Self::Stark { proof, claim } => {
                 target.write_u8(Self::STARK_TAG);
                 proof.write_into(target);
-                public_root.write_into(target);
+                claim.write_into(target);
             },
         }
     }
@@ -355,8 +352,8 @@ impl Deserializable for DeferredProof {
             Self::WIRE_TAG => Ok(Self::Wire(DeferredStateWire::read_from(source)?)),
             Self::STARK_TAG => {
                 let proof = StarkProof::read_from(source)?;
-                let public_root = <DeferredRoot as Deserializable>::read_from(source)?;
-                Ok(Self::Stark { proof, public_root })
+                let claim = DeferredClaim::read_from(source)?;
+                Ok(Self::Stark { proof, claim })
             },
             other => Err(DeserializationError::InvalidValue(format!(
                 "invalid deferred proof discriminant: {other}"
@@ -432,7 +429,7 @@ mod tests {
     use super::*;
     use crate::{
         Felt,
-        deferred::{DeferredRoot, TRUE_INDEX, Tag, WireEntry},
+        deferred::{DeferredClaim, DeferredRoot, TRUE_INDEX, Tag, WireEntry},
         serde::{BudgetedReader, ByteWriter, DeserializationError, SliceReader},
     };
 
@@ -524,7 +521,7 @@ mod tests {
 
     #[test]
     fn execution_proof_round_trips_stark_deferred_proof() {
-        let public_root: DeferredRoot = [
+        let deferred_root: DeferredRoot = [
             Felt::new_unchecked(9),
             Felt::new_unchecked(8),
             Felt::new_unchecked(7),
@@ -532,7 +529,17 @@ mod tests {
         ]
         .into();
         let deferred_stark_proof = StarkProof::new(alloc::vec![4, 5, 6], HashFunction::Poseidon2);
-        let deferred = DeferredProof::stark(deferred_stark_proof.clone(), public_root);
+        let claim = DeferredClaim::new(deferred_root);
+        let deferred = DeferredProof::stark(deferred_stark_proof.clone(), claim);
+        let mut expected_encoding = Vec::new();
+        expected_encoding.write_u8(DeferredProof::STARK_TAG);
+        deferred_stark_proof.write_into(&mut expected_encoding);
+        deferred_root.write_into(&mut expected_encoding);
+        assert_eq!(
+            deferred.to_bytes(),
+            expected_encoding,
+            "DeferredClaim must preserve the deferred root's wire encoding"
+        );
         let proof = ExecutionProof::new(
             StarkProof::new(alloc::vec![1, 2, 3], HashFunction::Blake3_256),
             deferred,
@@ -541,7 +548,7 @@ mod tests {
         let decoded = ExecutionProof::from_bytes(&proof.to_bytes()).unwrap();
 
         assert_eq!(decoded, proof);
-        assert_eq!(decoded.deferred_proof().as_stark(), Some((&deferred_stark_proof, public_root)));
+        assert_eq!(decoded.deferred_proof().as_stark(), Some((&deferred_stark_proof, claim)));
         assert!(decoded.is_final());
     }
 

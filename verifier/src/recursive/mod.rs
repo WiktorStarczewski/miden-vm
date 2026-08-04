@@ -179,13 +179,13 @@ struct MidenTraceHeights {
 }
 
 /// Resolves the deferred root the outer VM statement binds, from the proof's deferred material:
-/// the canonical TRUE digest when no precompile claims were produced, the nested proof's public
+/// the canonical TRUE digest when no precompile claims were produced, the nested proof's deferred
 /// root when STARK-backed, and the hydrated wire's root for partial proofs (standard precompile
 /// registry, default deferred-element budget).
 fn resolve_deferred_root(deferred: &DeferredProof) -> Result<Word, RecursiveVerifierInputsError> {
     match deferred {
         DeferredProof::Empty => Ok(TRUE_DIGEST),
-        DeferredProof::Stark { public_root, .. } => Ok(*public_root),
+        DeferredProof::Stark { claim, .. } => Ok(claim.root()),
         DeferredProof::Wire(wire) => Ok(DeferredState::from_wire(
             Arc::new(miden_precompiles::registry()),
             wire,

@@ -424,16 +424,20 @@ fn keccak_deferred_state_proof_verifies_and_rejects_trailing_bytes() {
     assert_eq!(traces.public_root(), synthetic.root);
 
     let proof = traces.prove();
-    let Some((stark, public_root)) = proof.as_stark() else {
+    let Some((stark, claim)) = proof.as_stark() else {
         panic!("precompile session should produce a deferred STARK proof");
     };
-    assert_eq!(P2Digest::from(public_root), synthetic.root);
-    verify_deferred(&proof).expect("Keccak deferred-state proof should verify");
+    assert_eq!(P2Digest::from(claim.root()), synthetic.root);
+    assert_eq!(
+        verify_deferred(&proof).expect("Keccak deferred-state proof should verify"),
+        claim,
+        "verification must return the authenticated claim"
+    );
 
     // The proof encoding is exact: an otherwise-valid proof with a trailing byte is rejected.
     let mut proof_bytes = stark.bytes().to_vec();
     proof_bytes.push(0);
-    let trailing = DeferredProof::stark(StarkProof::new(proof_bytes, stark.hash_fn()), public_root);
+    let trailing = DeferredProof::stark(StarkProof::new(proof_bytes, stark.hash_fn()), claim);
     let err = verify_deferred(&trailing).expect_err("trailing proof bytes must be rejected");
     assert!(matches!(
         err,
@@ -447,11 +451,11 @@ fn prove_deferred_state_proves_non_empty_root() {
 
     let proof = prove_deferred_state(&synthetic.state, HashFunction::Blake3_256)
         .expect("Keccak deferred state should prove");
-    let Some((_, public_root)) = proof.as_stark() else {
+    let Some((_, claim)) = proof.as_stark() else {
         panic!("non-empty deferred state should produce a STARK-backed proof");
     };
 
-    assert_eq!(P2Digest::from(public_root), synthetic.root);
+    assert_eq!(P2Digest::from(claim.root()), synthetic.root);
     verify_deferred(&proof).expect("Keccak deferred-state proof should verify");
 }
 
@@ -477,10 +481,10 @@ fn prove_deferred_state_round_trips_for_every_hash_function() {
         for pass in 0..2 {
             let proof = prove_deferred_state(&synthetic.state, hash_fn)
                 .unwrap_or_else(|e| panic!("{hash_fn:?} pass {pass} should prove: {e}"));
-            let Some((_, public_root)) = proof.as_stark() else {
+            let Some((_, claim)) = proof.as_stark() else {
                 panic!("{hash_fn:?} pass {pass}: non-empty deferred state should be STARK-backed");
             };
-            assert_eq!(P2Digest::from(public_root), synthetic.root, "{hash_fn:?} pass {pass}");
+            assert_eq!(P2Digest::from(claim.root()), synthetic.root, "{hash_fn:?} pass {pass}");
             verify_deferred(&proof)
                 .unwrap_or_else(|e| panic!("{hash_fn:?} pass {pass} should verify: {e}"));
         }

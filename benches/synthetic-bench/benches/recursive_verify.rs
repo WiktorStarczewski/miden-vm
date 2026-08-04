@@ -54,7 +54,7 @@ use miden_processor::{
     DefaultHost, ExecutionOptions, FastProcessor, advice::AdviceInputs, trace::TraceLenSummary,
 };
 use miden_prover::prove_sync;
-use miden_verifier::recursive::RecursiveVerifierInputs;
+use miden_verifier::recursive::PvmRecursiveVerifierInputs;
 use miden_vm::{
     Assembler, ExecutionProof, ExecutionTrace, HashFunction, Program, ProgramInfo, ProvingOptions,
     StackInputs, StackOutputs, TraceBuildInputs, trace::build_trace,
@@ -574,7 +574,7 @@ fn recursive_proof_advice(fixture: &TxProofFixture, verifier_root: Word) -> Recu
         fixture.stack_outputs,
     );
     let (advice_inputs, claim_commitment) =
-        RecursiveVerifierInputs::for_request(verifier_root, &fixture.proof, &claim)
+        PvmRecursiveVerifierInputs::for_request(verifier_root, &fixture.proof, &claim)
             .expect("recursive request package")
             .into_parts();
 

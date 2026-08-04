@@ -12,7 +12,7 @@ use alloc::{vec, vec::Vec};
 
 use miden_core::{
     Felt,
-    deferred::DeferredRoot,
+    deferred::DeferredClaim,
     field::{Field, PrimeCharacteristicRing, QuadFelt},
     proof::{DeferredProof, HashFunction, StarkProof},
     utils::RowMajorMatrix,
@@ -305,14 +305,13 @@ impl SessionTraces {
         }
     }
 
-    /// Prove the precompile session and wrap the serialized STARK proof in the core
-    /// deferred-proof envelope together with the exact deferred root it proves. Consumes
-    /// the bundle so the main traces move into the prover statement rather than being
-    /// cloned.
+    /// Prove the precompile session and wrap the serialized STARK proof and its deferred claim in
+    /// the core proof envelope. Consumes the bundle so the main traces move into the prover
+    /// statement rather than being cloned.
     pub fn prove_deferred(self, hash_fn: HashFunction) -> Result<DeferredProof, ProveError> {
-        let public_root: DeferredRoot = self.public_root().as_array().into();
+        let deferred_root = self.public_root().as_array().into();
         let proof = self.prove_stark(hash_fn)?;
-        Ok(DeferredProof::stark(proof, public_root))
+        Ok(DeferredProof::stark(proof, DeferredClaim::new(deferred_root)))
     }
 
     fn prove_stark_with_config<SC>(
@@ -345,16 +344,15 @@ impl SessionTraces {
     }
 }
 
-/// Verify a STARK-backed deferred proof produced by this crate and return the verified deferred
-/// root.
+/// Verify a STARK-backed deferred proof produced by this crate and return the verified claim.
 ///
-/// The proof must be a [`DeferredProof::Stark`] variant. Its `public_root` is used as the
-/// precompile STARK public input; only after that proof verifies is the root returned to callers.
-pub fn verify_deferred(proof: &DeferredProof) -> Result<DeferredRoot, VerifyError> {
+/// The proof must be a [`DeferredProof::Stark`] variant. The claim's deferred root is used as the
+/// precompile STARK public input; only after that proof verifies is the claim returned to callers.
+pub fn verify_deferred(proof: &DeferredProof) -> Result<DeferredClaim, VerifyError> {
     match proof {
-        DeferredProof::Stark { proof, public_root } => {
-            verify_stark(proof, P2Digest::from(*public_root))?;
-            Ok(*public_root)
+        DeferredProof::Stark { proof, claim } => {
+            verify_stark(proof, P2Digest::from(claim.root()))?;
+            Ok(*claim)
         },
         DeferredProof::Empty | DeferredProof::Wire(_) => Err(VerifyError::InvalidDeferredProof),
     }

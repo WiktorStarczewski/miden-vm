@@ -140,8 +140,9 @@ or dangling wire by requiring `state.to_wire() == wire`, then evaluates the impl
 
 - `Empty` is final and resolves to `TRUE_DIGEST`.
 - `Wire` is partial/delegable material backed by canonical `DeferredStateWire`.
-- `Stark` is final: verification checks the precompile STARK proof against its embedded public root,
-  then returns that root.
+- `Stark` is final: it carries a `DeferredClaim`, verification checks the precompile STARK proof
+  against that claim's deferred root, then returns the authenticated claim. A deferred claim's
+  commitment is the root itself.
 
 The public final verifier accepts only final deferred proof forms. It rejects `Wire`; wire-backed
 partial proofs are handled by the explicit `Verifier::verify_partial` path. Partial verification

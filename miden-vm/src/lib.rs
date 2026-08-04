@@ -10,6 +10,7 @@ pub use miden_assembly::{
     diagnostics,
 };
 pub use miden_core::{
+    deferred::DeferredClaim,
     program::ExecutionClaim,
     proof::{DeferredProof, ExecutionProof, HashFunction, StarkProof},
 };

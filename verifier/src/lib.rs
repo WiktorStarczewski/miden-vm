@@ -28,7 +28,7 @@ const MAX_STARK_PROOF_BYTES: usize = 64 * 1024 * 1024;
 mod exports {
     pub use miden_core::{
         Word,
-        deferred::{DeferredState, IntegrityError},
+        deferred::{DeferredClaim, DeferredState, IntegrityError},
         program::{ExecutionClaim, KernelDescriptor, ProgramInfo, StackInputs, StackOutputs},
         proof::{DeferredProof, ExecutionProof, HashFunction, StarkProof},
     };
@@ -86,8 +86,8 @@ impl Verifier {
     /// Returns an error if:
     /// - The provided proof does not prove a correct execution of the claim.
     /// - The proof carries wire-backed deferred proof material, which is a partial/delegable form.
-    /// - The proof's STARK-backed precompile VM proof, if present, does not verify against its
-    ///   public root.
+    /// - The proof's STARK-backed precompile VM proof, if present, does not verify its deferred
+    ///   claim.
     pub fn verify(
         &self,
         proof: &ExecutionProof,
@@ -166,7 +166,7 @@ impl Unsettled {
 /// Returns an error if:
 /// - The provided proof does not prove a correct execution of the claim.
 /// - The proof carries wire-backed deferred proof material, which is a partial/delegable form.
-/// - The proof's STARK-backed deferred proof, if present, does not verify against its public root.
+/// - The proof's STARK-backed deferred proof, if present, does not verify its deferred claim.
 pub fn verify(proof: &ExecutionProof, claim: &ExecutionClaim) -> Result<u32, VerificationError> {
     Verifier::default().verify(proof, claim)
 }
@@ -181,8 +181,8 @@ fn resolve_final_deferred_root(
         DeferredProof::Empty => Ok((TRUE_DIGEST, None)),
         DeferredProof::Wire(_) => Err(VerificationError::UnsupportedDeferredProof),
         DeferredProof::Stark { proof, .. } => {
-            let root = miden_precompiles_prover::verify_deferred(deferred_proof)?;
-            Ok((root, Some(stark_security_level(proof))))
+            let claim = miden_precompiles_prover::verify_deferred(deferred_proof)?;
+            Ok((claim.root(), Some(stark_security_level(proof))))
         },
     }
 }
@@ -358,7 +358,7 @@ mod tests {
 
         let stark = DeferredProof::stark(
             StarkProof::new(Vec::from([0_u8]), HashFunction::Poseidon2),
-            TRUE_DIGEST,
+            DeferredClaim::new(TRUE_DIGEST),
         );
         let err = resolve_final_deferred_root(&stark).unwrap_err();
         assert!(
@@ -381,7 +381,7 @@ mod tests {
             DeferredProof::Empty,
             DeferredProof::stark(
                 StarkProof::new(Vec::from([0_u8]), HashFunction::Poseidon2),
-                TRUE_DIGEST,
+                DeferredClaim::new(TRUE_DIGEST),
             ),
         ] {
             let err =

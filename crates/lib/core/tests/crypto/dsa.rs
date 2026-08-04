@@ -60,10 +60,10 @@ fn core_ecdsa_k256_keccak_verify_glv_claim_proves_and_verifies() {
 
     let proof = prove_deferred_state(&output.deferred_state, HashFunction::Blake3_256)
         .expect("the GLV-decomposed deferred claims must be provable");
-    let verified_root =
+    let verified_claim =
         verify_deferred(&proof).expect("the GLV-decomposed deferred proof must verify");
     assert_eq!(
-        verified_root,
+        verified_claim.root(),
         output.deferred_state.root(),
         "verified root must match the root the main VM committed",
     );
@@ -126,9 +126,9 @@ fn core_ecdsa_k256_keccak_verify_accepts_glv_base_repeating_public_keys() {
 
         let proof = prove_deferred_state(&output.deferred_state, HashFunction::Blake3_256)
             .unwrap_or_else(|_| panic!("{name}: the fallback's deferred claims must be provable"));
-        let verified_root = verify_deferred(&proof)
+        let verified_claim = verify_deferred(&proof)
             .unwrap_or_else(|_| panic!("{name}: the fallback's deferred proof must verify"));
-        assert_eq!(verified_root, output.deferred_state.root(), "{name}");
+        assert_eq!(verified_claim.root(), output.deferred_state.root(), "{name}");
     }
 }
 
