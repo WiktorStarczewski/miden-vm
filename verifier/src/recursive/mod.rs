@@ -404,13 +404,14 @@ fn build_merkle_data(
     // One factory serves the evaluated circuit and its registry authentication: the
     // verifier reads one registry leaf, and seeding the complete registry would not
     // scale to the precompile relation's `10!` orders.
-    let entry = recursive_registry_entry(proof_order).map_err(|_| {
+    let (circuit, path) = recursive_registry_entry(proof_order).map_err(|_| {
         RecursiveVerifierInputsError::InvalidProofShape("failed to build recursive ACE circuit")
     })?;
-    let (circuit, leaf, path) = entry.into_parts();
-    store.add_merkle_path(u64::from(proof_order.tag()), leaf, path).map_err(|_| {
-        RecursiveVerifierInputsError::InvalidProofShape("ACE registry path could not be stored")
-    })?;
+    store
+        .add_merkle_path(u64::from(proof_order.tag()), circuit.commitment, path)
+        .map_err(|_| {
+            RecursiveVerifierInputsError::InvalidProofShape("ACE registry path could not be stored")
+        })?;
     advice_map.push((circuit.commitment, circuit.instructions));
 
     Ok((store, advice_map))
