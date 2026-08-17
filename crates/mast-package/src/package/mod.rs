@@ -1,6 +1,7 @@
 #[cfg(any(test, feature = "arbitrary"))]
 pub mod arbitrary;
 mod error;
+mod event_handlers;
 mod id;
 mod manifest;
 mod section;
@@ -37,6 +38,10 @@ use miden_core::{
 
 pub use self::{
     error::{PackageDebugInfoError, PackageStripError},
+    event_handlers::{
+        EventHandlerManifestEntry, EventHandlerSection, EventHandlerSectionError, MAX_HANDLERS,
+        MAX_MODULE_BYTES, MAX_NAME_BYTES,
+    },
     id::PackageId,
     manifest::{
         ConstantExport, ManifestValidationError, PackageExport, PackageManifest, PackageModule,
@@ -253,9 +258,9 @@ impl Package {
     ///
     /// This is distinct from [`Self::digest`], which is only the digest of the underlying MAST
     /// artifact. The content digest currently binds the MAST digest, package name, semantic
-    /// version, package kind, manifest, and any semantic package sections. Package descriptions
-    /// and opaque custom sections are intentionally excluded for now; kernel-section binding is
-    /// added separately.
+    /// version, package kind, manifest, and any semantic package sections (account component
+    /// metadata and event handlers). Package descriptions and opaque custom sections are
+    /// intentionally excluded for now; kernel-section binding is added separately.
     pub fn content_digest(&self) -> Word {
         let mut bytes = Vec::new();
         self.write_content_digest_preimage(&mut bytes, None);
@@ -267,7 +272,7 @@ impl Package {
         target: &mut W,
         kernel_digest: Option<&Word>,
     ) {
-        target.write_bytes(b"miden.package.content.v2");
+        target.write_bytes(b"miden.package.content.v3");
         self.digest().write_into(target);
         self.name.write_into(target);
         self.version.to_string().write_into(target);
@@ -281,10 +286,15 @@ impl Package {
     }
 
     fn write_content_digest_sections<W: ByteWriter>(&self, target: &mut W) {
+        // Event-handler code decides the advice a program receives, so the section is semantic
+        // content: two packages that differ only in handler code must not share an identity.
         let semantic_sections = self
             .sections
             .iter()
-            .filter(|section| section.id == SectionId::ACCOUNT_COMPONENT_METADATA)
+            .filter(|section| {
+                section.id == SectionId::ACCOUNT_COMPONENT_METADATA
+                    || section.id == SectionId::EVENT_HANDLERS
+            })
             .collect::<Vec<_>>();
         target.write_usize(semantic_sections.len());
         for section in semantic_sections {
@@ -1179,6 +1189,72 @@ impl Package {
         self.try_into_program().unwrap_or_else(|err| panic!("{err}"))
     }
 
+    /// Decodes the [`EventHandlerSection`] of this package, if present.
+    ///
+    /// Returns `Ok(None)` when the package has no `event_handlers` section.
+    ///
+    /// # Errors
+    /// Returns an error when the package contains more than one `event_handlers` section, or
+    /// when the section payload fails to decode (including size-cap violations).
+    pub fn event_handlers(&self) -> Result<Option<EventHandlerSection>, EventHandlerSectionError> {
+        let mut sections =
+            self.sections.iter().filter(|section| section.id == SectionId::EVENT_HANDLERS);
+        let Some(section) = sections.next() else {
+            return Ok(None);
+        };
+        if sections.next().is_some() {
+            return Err(EventHandlerSectionError::DuplicateSection);
+        }
+        let decoded = EventHandlerSection::read_from_bytes(section.data.as_ref())?;
+        Ok(Some(decoded))
+    }
+
+    /// Attaches an [`EventHandlerSection`] to this package.
+    ///
+    /// The section is semantic package content: it becomes part of
+    /// [`Self::content_digest`], and the manifest order inside the section is canonical.
+    ///
+    /// # Errors
+    /// Returns an error when the package already has an `event_handlers` section, or when a
+    /// field of the section goes over its size cap.
+    pub fn with_event_handlers(
+        mut self,
+        section: &EventHandlerSection,
+    ) -> Result<Self, EventHandlerSectionError> {
+        if self.sections.iter().any(|existing| existing.id == SectionId::EVENT_HANDLERS) {
+            return Err(EventHandlerSectionError::AlreadyPresent);
+        }
+        if section.module.len() > MAX_MODULE_BYTES {
+            return Err(EventHandlerSectionError::OverSizeCap {
+                field: "module",
+                actual: section.module.len(),
+                max: MAX_MODULE_BYTES,
+            });
+        }
+        if section.handlers.len() > MAX_HANDLERS {
+            return Err(EventHandlerSectionError::OverSizeCap {
+                field: "handler count",
+                actual: section.handlers.len(),
+                max: MAX_HANDLERS,
+            });
+        }
+        for entry in &section.handlers {
+            for (field, name) in
+                [("event name", entry.event.as_str()), ("export name", entry.export.as_str())]
+            {
+                if name.len() > MAX_NAME_BYTES {
+                    return Err(EventHandlerSectionError::OverSizeCap {
+                        field,
+                        actual: name.len(),
+                        max: MAX_NAME_BYTES,
+                    });
+                }
+            }
+        }
+        self.sections.push(Section::new(SectionId::EVENT_HANDLERS, section.to_bytes()));
+        Ok(self)
+    }
+
     /// Extract the embedded kernel package from this package.
     ///
     /// Returns `Ok(None)` if the kernel custom section is not present.
@@ -1628,6 +1704,87 @@ mod tests {
         assert_eq!(interface_digest, with_advice.interface_digest().unwrap());
         assert_ne!(content_digest, with_advice.content_digest());
         assert_ne!(mast_commitment, with_advice.mast_forest().commitment());
+    }
+
+    fn sample_event_handlers() -> EventHandlerSection {
+        EventHandlerSection {
+            abi_version: 1,
+            // The 8-byte header of an empty Wasm module.
+            module: vec![0, 97, 115, 109, 1, 0, 0, 0],
+            handlers: vec![EventHandlerManifestEntry::new(
+                miden_core::events::EventName::new("test::wasm::handler"),
+                "handler",
+            )],
+        }
+    }
+
+    #[test]
+    fn event_handler_section_roundtrips_through_package_serialization() {
+        let section = sample_event_handlers();
+        let package = build_kernel_package("kernel").with_event_handlers(&section).unwrap();
+
+        let bytes = package.to_bytes();
+        let decoded = Package::read_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.event_handlers().unwrap(), Some(section));
+    }
+
+    #[test]
+    fn event_handler_section_binds_the_content_digest() {
+        let package = build_kernel_package("kernel");
+        let without = package.content_digest();
+
+        let with_handlers = package.clone().with_event_handlers(&sample_event_handlers()).unwrap();
+        let with_digest = with_handlers.content_digest();
+        assert_ne!(without, with_digest, "attaching handlers must change the identity");
+
+        // A change in only the handler bytes must change the identity.
+        let mut other_section = sample_event_handlers();
+        other_section.module.push(0);
+        let other = package.with_event_handlers(&other_section).unwrap();
+        assert_ne!(with_digest, other.content_digest());
+
+        // The identity is stable across serialization roundtrips.
+        let decoded = Package::read_from_bytes(&with_handlers.to_bytes()).unwrap();
+        assert_eq!(with_digest, decoded.content_digest());
+    }
+
+    #[test]
+    fn duplicate_event_handler_sections_are_rejected() {
+        let section = sample_event_handlers();
+        let package = build_kernel_package("kernel").with_event_handlers(&section).unwrap();
+
+        // A second attach is rejected.
+        assert!(matches!(
+            package.clone().with_event_handlers(&section),
+            Err(EventHandlerSectionError::AlreadyPresent)
+        ));
+
+        // A manually duplicated section is rejected on access.
+        let mut broken = package;
+        broken
+            .sections
+            .push(Section::new(SectionId::EVENT_HANDLERS, section.to_bytes()));
+        assert!(matches!(
+            broken.event_handlers(),
+            Err(EventHandlerSectionError::DuplicateSection)
+        ));
+    }
+
+    #[test]
+    fn oversized_event_handler_section_is_rejected_on_attach() {
+        let mut section = sample_event_handlers();
+        section.handlers = (0..=MAX_HANDLERS)
+            .map(|idx| {
+                EventHandlerManifestEntry::new(
+                    miden_core::events::EventName::from_string(format!("test::wasm::h{idx}")),
+                    format!("h{idx}"),
+                )
+            })
+            .collect();
+        assert!(matches!(
+            build_kernel_package("kernel").with_event_handlers(&section),
+            Err(EventHandlerSectionError::OverSizeCap { field: "handler count", .. })
+        ));
     }
 
     fn build_debug_package(name: &str, kind: TargetType, export: &str, context: &str) -> Package {
