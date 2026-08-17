@@ -99,7 +99,6 @@ miden-debug-types       = { path = "./crates/debug-types", version = "0.30", def
 miden-event-handler-abi = { path = "./crates/event-handler-abi", version = "0.30", default-features = false }
 miden-event-handler-macros = { path = "./crates/event-handler-macros", version = "0.30", default-features = false }
 miden-event-handler-sdk = { path = "./crates/event-handler-sdk", version = "0.30", default-features = false }
-miden-wasm-event-handlers = { path = "./crates/wasm-event-handlers", version = "0.30", default-features = false }
 miden-field             = { path = "./crates/field", version = "0.30", default-features = false }
 miden-lifted-air        = { path = "./crates/lifted-air", version = "0.30", default-features = false }
 miden-lifted-stark      = { path = "./crates/lifted-stark", version = "0.30", default-features = false }
