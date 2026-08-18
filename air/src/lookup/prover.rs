@@ -385,6 +385,32 @@ where
         };
         build(&mut batch)
     }
+
+    fn beta_powers(&self) -> &[EF] {
+        &self.challenges.beta_powers
+    }
+
+    fn bus_prefix(&self, bus_id: usize) -> EF {
+        self.challenges.bus_prefix[bus_id]
+    }
+
+    fn selected_batch2_encoded(
+        &mut self,
+        _name: &'static str,
+        _slot0_name: &'static str,
+        slot0_multiplicity: F,
+        slot0_encoded: impl FnOnce() -> EF,
+        _slot1_name: &'static str,
+        slot1_multiplicity: F,
+        slot1_encoded: impl FnOnce() -> EF,
+    ) {
+        if slot0_multiplicity != F::ZERO {
+            self.fractions.push((slot0_multiplicity, slot0_encoded()));
+        }
+        if slot1_multiplicity != F::ZERO {
+            self.fractions.push((slot1_multiplicity, slot1_encoded()));
+        }
+    }
 }
 
 // PROVER BATCH

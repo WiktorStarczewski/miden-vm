@@ -97,6 +97,41 @@ pub enum BusId {
     HasherPermLinkInput = 23,
     /// Hasher perm-link output bus: pairs controller-output rows with perm-cycle row 15.
     HasherPermLinkOutput = 24,
+    // IDs from this point are dormant until the atomic BlakeG cutover. Their ordering is pinned so
+    // the preparatory slices remain reproducible; the cutover will replace the Poseidon2 link IDs
+    // above and assign the final compact layout before regenerating protocol bindings.
+    /// Byte-pair lookup table: ordinary `[a, b, a & b]` for byte-sized operands.
+    And8Lookup = 25,
+    /// BlakeG rot12 contribution for byte position 0: `[a, b, contribution]`.
+    BlakeGRot12Pos0 = 26,
+    /// BlakeG rot12 contribution for byte position 1: `[a, b, contribution]`.
+    BlakeGRot12Pos1 = 27,
+    /// BlakeG rot12 contribution for byte position 2: `[a, b, contribution]`.
+    BlakeGRot12Pos2 = 28,
+    /// BlakeG rot12 contribution for byte position 3: `[a, b, contribution]`.
+    BlakeGRot12Pos3 = 29,
+    /// BlakeG rot7 contribution for byte position 0: `[a, b, contribution]`.
+    BlakeGRot7Pos0 = 30,
+    /// BlakeG rot7 contribution for byte position 1: `[a, b, contribution]`.
+    BlakeGRot7Pos1 = 31,
+    /// BlakeG rot7 contribution for byte position 2: `[a, b, contribution]`.
+    BlakeGRot7Pos2 = 32,
+    /// BlakeG rot7 contribution for byte position 3: `[a, b, contribution]`.
+    BlakeGRot7Pos3 = 33,
+    /// BlakeG internal chaining-value pair bus:
+    /// `[4 * compression_cycle_id + pair_index, word_even, word_odd]`.
+    BlakeGInputWord = 34,
+    /// BlakeG internal message-word bus: `[word_index, word, compression_cycle_id]`.
+    BlakeGMessageWord = 35,
+    /// AEAD-XOF BlakeG input request: `[clk, state[0..12]]`.
+    AeadBlakeGInput = 36,
+    /// AEAD-XOF BlakeG output pair: `[clk, first_lane_idx, value0, value1]`.
+    AeadBlakeGOutputPair = 37,
+    /// Dormant BlakeG compression-link bus: `[block(8), cv_in(4), cv_out(4)]`.
+    ///
+    /// This is appended while the active Poseidon2 AIR retains bus IDs 23 and 24. The atomic
+    /// protocol cutover will assign the final bus layout and regenerate its bindings.
+    HasherCompressionLink = 38,
 }
 
 impl BusId {
@@ -104,7 +139,7 @@ impl BusId {
     /// in lockstep with the enum: adding a new variant with a higher discriminant bumps
     /// `COUNT` automatically (and the assertion flags a missed update if the new variant's
     /// discriminant isn't contiguous).
-    pub const COUNT: usize = Self::HasherPermLinkOutput as usize + 1;
+    pub const COUNT: usize = Self::HasherCompressionLink as usize + 1;
 }
 
 // Per-variant discriminant locks. `BusId::COUNT` only catches gaps — a *reorder* that
@@ -112,8 +147,8 @@ impl BusId {
 // to, breaking domain separation across every emitter and consumer. These per-variant
 // asserts pin the entire layout so any reorder fails at compile time.
 //
-// If a new bus is added: append it after the current tail, bump `HasherPermLinkOutput`'s
-// expected index here only if necessary, and add a matching assert for the new variant.
+// If a new bus is added: append it after the current tail and add a matching assert for the new
+// variant. Renumbering existing entries is a protocol change and requires regenerated bindings.
 const _: () = assert!(BusId::KernelRomInit as usize == 0);
 const _: () = assert!(BusId::BlockHashTable as usize == 1);
 const _: () = assert!(BusId::LogDeferredRoot as usize == 2);
@@ -139,6 +174,20 @@ const _: () = assert!(BusId::RangeCheck as usize == 21);
 const _: () = assert!(BusId::AceWiring as usize == 22);
 const _: () = assert!(BusId::HasherPermLinkInput as usize == 23);
 const _: () = assert!(BusId::HasherPermLinkOutput as usize == 24);
+const _: () = assert!(BusId::And8Lookup as usize == 25);
+const _: () = assert!(BusId::BlakeGRot12Pos0 as usize == 26);
+const _: () = assert!(BusId::BlakeGRot12Pos1 as usize == 27);
+const _: () = assert!(BusId::BlakeGRot12Pos2 as usize == 28);
+const _: () = assert!(BusId::BlakeGRot12Pos3 as usize == 29);
+const _: () = assert!(BusId::BlakeGRot7Pos0 as usize == 30);
+const _: () = assert!(BusId::BlakeGRot7Pos1 as usize == 31);
+const _: () = assert!(BusId::BlakeGRot7Pos2 as usize == 32);
+const _: () = assert!(BusId::BlakeGRot7Pos3 as usize == 33);
+const _: () = assert!(BusId::BlakeGInputWord as usize == 34);
+const _: () = assert!(BusId::BlakeGMessageWord as usize == 35);
+const _: () = assert!(BusId::AeadBlakeGInput as usize == 36);
+const _: () = assert!(BusId::AeadBlakeGOutputPair as usize == 37);
+const _: () = assert!(BusId::HasherCompressionLink as usize == 38);
 
 // HASHER MESSAGES
 // ================================================================================================
@@ -519,6 +568,84 @@ pub enum HasherPermLinkMsg<E> {
     Output { perm_id: E, state: SpongeState<E> },
 }
 
+// BLAKEG AIR MESSAGES
+// ================================================================================================
+
+/// Hasher compression-link message: `[block(8), cv_in(4), cv_out(4)]`.
+///
+/// Binds one hasher controller row to one BlakeG compression block once the Eidos path is active.
+#[derive(Clone, Debug)]
+pub struct HasherCompressionLinkMsg<E> {
+    pub block: [E; 8],
+    pub cv_in: [E; 4],
+    pub cv_out: [E; 4],
+}
+
+/// Byte-pair lookup message (3 elements): `[a, b, result]`.
+///
+/// Ordinary AND uses `result = a & b`. BlakeG B/D rotation buses use `result` as the 32-bit
+/// contribution of this byte pair to the rotated word.
+#[derive(Clone, Debug)]
+pub struct And8Msg<E> {
+    pub bus: BusId,
+    pub a: E,
+    pub b: E,
+    pub result: E,
+}
+
+impl<E: PrimeCharacteristicRing> And8Msg<E> {
+    /// Ordinary `a & b` lookup.
+    pub fn new(a: E, b: E, result: E) -> Self {
+        Self { bus: BusId::And8Lookup, a, b, result }
+    }
+
+    /// BlakeG rot12 contribution at byte position `pos`.
+    pub fn blakeg_rot12(pos: usize, a: E, b: E, result: E) -> Self {
+        Self { bus: blakeg_rot12_bus(pos), a, b, result }
+    }
+
+    /// BlakeG rot7 contribution at byte position `pos`.
+    pub fn blakeg_rot7(pos: usize, a: E, b: E, result: E) -> Self {
+        Self { bus: blakeg_rot7_bus(pos), a, b, result }
+    }
+}
+
+pub const fn blakeg_rot12_bus(pos: usize) -> BusId {
+    match pos {
+        0 => BusId::BlakeGRot12Pos0,
+        1 => BusId::BlakeGRot12Pos1,
+        2 => BusId::BlakeGRot12Pos2,
+        3 => BusId::BlakeGRot12Pos3,
+        _ => panic!("BlakeG rot12 byte position must be in 0..4"),
+    }
+}
+
+pub const fn blakeg_rot7_bus(pos: usize) -> BusId {
+    match pos {
+        0 => BusId::BlakeGRot7Pos0,
+        1 => BusId::BlakeGRot7Pos1,
+        2 => BusId::BlakeGRot7Pos2,
+        3 => BusId::BlakeGRot7Pos3,
+        _ => panic!("BlakeG rot7 byte position must be in 0..4"),
+    }
+}
+
+/// AEAD-XOF BlakeG input request: `[clk, state[0..12]]`.
+#[derive(Clone, Debug)]
+pub struct AeadBlakeGInputMsg<E> {
+    pub clk: E,
+    pub state: [E; 12],
+}
+
+/// AEAD-XOF BlakeG output pair: `[clk, first_lane_idx, value0, value1]`.
+#[derive(Clone, Debug)]
+pub struct AeadBlakeGOutputPairMsg<E> {
+    pub clk: E,
+    pub first_lane_idx: E,
+    pub value0: E,
+    pub value1: E,
+}
+
 // KERNEL ROM MESSAGE
 // ================================================================================================
 
@@ -679,6 +806,53 @@ where
         challenges.encode(
             BusId::Bitwise as usize,
             [self.op.clone(), self.a.clone(), self.b.clone(), self.result.clone()],
+        )
+    }
+}
+
+// --- BlakeG AIR messages ------------------------------------------------------------------------
+
+impl<E, EF> LookupMessage<E, EF> for And8Msg<E>
+where
+    E: PrimeCharacteristicRing + Clone,
+    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        challenges.encode(self.bus as usize, [self.a.clone(), self.b.clone(), self.result.clone()])
+    }
+}
+
+impl<E, EF> LookupMessage<E, EF> for AeadBlakeGInputMsg<E>
+where
+    E: PrimeCharacteristicRing + Clone,
+    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        let fields: [E; 13] = core::array::from_fn(|i| {
+            if i == 0 {
+                self.clk.clone()
+            } else {
+                self.state[i - 1].clone()
+            }
+        });
+        challenges.encode(BusId::AeadBlakeGInput as usize, fields)
+    }
+}
+
+impl<E, EF> LookupMessage<E, EF> for AeadBlakeGOutputPairMsg<E>
+where
+    E: PrimeCharacteristicRing + Clone,
+    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        challenges.encode(
+            BusId::AeadBlakeGOutputPair as usize,
+            [
+                self.clk.clone(),
+                self.first_lane_idx.clone(),
+                self.value0.clone(),
+                self.value1.clone(),
+            ],
         )
     }
 }
@@ -866,6 +1040,25 @@ where
         acc += perm_id.clone();
         acc += challenges.inner_product_at(HASHER_PERM_LINK_STATE_OFFSET, state.as_slice());
         acc
+    }
+}
+
+impl<E, EF> LookupMessage<E, EF> for HasherCompressionLinkMsg<E>
+where
+    E: PrimeCharacteristicRing + Clone,
+    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        let payload: [E; 16] = core::array::from_fn(|i| {
+            if i < 8 {
+                self.block[i].clone()
+            } else if i < 12 {
+                self.cv_in[i - 8].clone()
+            } else {
+                self.cv_out[i - 12].clone()
+            }
+        });
+        challenges.encode(BusId::HasherCompressionLink as usize, payload)
     }
 }
 

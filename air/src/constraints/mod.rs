@@ -14,6 +14,8 @@ use chiplets::selectors::ChipletSelectors;
 
 use crate::{ChipletCols, CoreCols, MidenAirBuilder};
 
+pub mod and8_lookup;
+pub mod blakeg_compression;
 pub mod chiplets;
 pub mod columns;
 pub mod constants;

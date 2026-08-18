@@ -50,6 +50,10 @@ use constraints::lookup::{
     poseidon2_permutation_air::Poseidon2PermutationLookupBuilder,
 };
 pub use constraints::{
+    and8_lookup,
+    and8_lookup::columns::{And8LookupCols, And8LookupPreprocessedCols},
+    blakeg_compression,
+    blakeg_compression::{BlakeGCompressionCols, NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS},
     chiplets::columns::{
         AceCols, AceEvalCols, AceReadCols, BitwiseCols, ControllerCols, KernelRomCols, MemoryCols,
     },
