@@ -2,35 +2,37 @@
 
 use miden_core::Felt;
 
+use super::pvm_layout_const;
 use crate::helpers::read_memory_felt;
 
 const TRACE_LENGTH_LOG_PTR: u32 = 3_223_322_634;
 const ORDER_TAG_PTR: u32 = 3_223_322_639;
-const AIR_TRACE_LENGTH_LOGS_PTR: u32 = 3_223_322_736;
-const RELATION_DIGEST_PTR: u32 = 3_223_322_728;
-const ACE_REGISTRY_ROOT_PTR: u32 = 3_223_322_732;
-const OOD_EVALUATIONS_ADDRESS_PTR: u32 = 3_223_322_761;
-const CURRENT_TRACE_ROW_ADDRESS_PTR: u32 = 3_223_322_762;
-
-const PREPROCESSED_CURRENT_PTR: u32 = 3_225_426_432;
-const CURRENT_TRACE_ROW_PTR: u32 = 3_225_443_408;
+const AIR_TRACE_LENGTH_LOGS_PTR: u32 = 3_223_322_744;
+const RELATION_DIGEST_PTR: u32 = 3_223_322_732;
+const ACE_REGISTRY_ROOT_PTR: u32 = 3_223_322_736;
+const OOD_EVALUATIONS_ADDRESS_PTR: u32 = 3_223_322_770;
+const CURRENT_TRACE_ROW_ADDRESS_PTR: u32 = 3_223_322_771;
 
 // Runtime call-site vector. The precompiles-prover oracle derives the matching MASM constants
 // directly from the AIRs.
-const MIN_LOG_HEIGHTS: [u64; 10] = [5, 4, 7, 16, 1, 3, 1, 1, 2, 1];
+const MIN_LOG_HEIGHTS: [u64; 10] = [5, 5, 7, 16, 1, 3, 1, 1, 2, 1];
 const HEIGHTS: [u64; 10] = [16, 7, 12, 16, 11, 7, 10, 12, 13, 14];
-const RELATION_DIGEST: [u64; 4] = [
-    12_765_330_256_215_748_392,
-    11_318_082_190_661_185_302,
-    11_045_448_100_533_503_580,
-    1_141_539_045_039_940_094,
-];
-const ACE_REGISTRY_ROOT: [u64; 4] = [
-    2_842_017_067_341_903_454,
-    16_707_971_856_776_838_831,
-    806_847_535_208_234_121,
-    14_144_940_089_702_641_586,
-];
+
+fn masm_const(source: &str, name: &str) -> u64 {
+    let prefix = format!("const {name} = ");
+    source
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix)?.parse().ok())
+        .unwrap_or_else(|| panic!("missing generated PVM MASM constant {name}"))
+}
+
+fn pvm_const(name: &str) -> u64 {
+    masm_const(include_str!("../../asm/sys/pvm/mod.masm"), name)
+}
+
+fn pvm_word(prefix: &str) -> [u64; 4] {
+    core::array::from_fn(|index| pvm_const(&format!("{prefix}_{index}")))
+}
 
 fn source() -> &'static str {
     "use miden::core::sys::pvm
@@ -56,11 +58,11 @@ fn pvm_wrapper_stores_heights_order_tag_and_registry_metadata() {
     assert_eq!(read_memory_felt(&output, TRACE_LENGTH_LOG_PTR), Felt::from_u8(16));
     assert_eq!(
         read_memory_felt(&output, OOD_EVALUATIONS_ADDRESS_PTR),
-        Felt::from_u32(PREPROCESSED_CURRENT_PTR)
+        Felt::from_u32(pvm_layout_const("PREPROCESSED_CURRENT_PTR"))
     );
     assert_eq!(
         read_memory_felt(&output, CURRENT_TRACE_ROW_ADDRESS_PTR),
-        Felt::from_u32(CURRENT_TRACE_ROW_PTR)
+        Felt::from_u32(pvm_layout_const("CURRENT_TRACE_ROW_PTR"))
     );
 
     let mut proof_order: Vec<usize> = (0..HEIGHTS.len()).collect();
@@ -69,8 +71,8 @@ fn pvm_wrapper_stores_heights_order_tag_and_registry_metadata() {
     assert_eq!(read_memory_felt(&output, ORDER_TAG_PTR), Felt::from_u32(expected_tag));
 
     for (base, expected) in [
-        (RELATION_DIGEST_PTR, RELATION_DIGEST),
-        (ACE_REGISTRY_ROOT_PTR, ACE_REGISTRY_ROOT),
+        (RELATION_DIGEST_PTR, pvm_word("RELATION_DIGEST")),
+        (ACE_REGISTRY_ROOT_PTR, pvm_word("ACE_REGISTRY_ROOT")),
     ] {
         for (i, expected) in expected.into_iter().enumerate() {
             assert_eq!(read_memory_felt(&output, base + i as u32), Felt::new_unchecked(expected));

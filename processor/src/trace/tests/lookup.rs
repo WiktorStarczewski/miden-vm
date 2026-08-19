@@ -1,8 +1,8 @@
-//! End-to-end collection-phase smoke test for the prover-side LogUp pipeline.
+//! End-to-end collection-phase tests for the prover-side LogUp pipeline.
 //!
-//! Runs a tiny MASM basic block through `build_trace_from_ops`, materialises the resulting
-//! main trace as a [`RowMajorMatrix<Felt>`], and pipes it through [`build_lookup_fractions`]
-//! + [`accumulate`]. The test validates:
+//! Runs real processor traces through `build_trace_from_ops`, materialises the resulting main
+//! traces as [`RowMajorMatrix<Felt>`] values, and pipes them through [`build_lookup_fractions`] +
+//! [`accumulate`]. The test validates:
 //!
 //! 1. **Shape-const drift**: every bus emitter's declared `MAX_INTERACTIONS_PER_ROW` is large
 //!    enough to accommodate real trace data (the `debug_assert!` inside
@@ -18,35 +18,56 @@
 //! The oracle cross-check in (4) subsumes the "does it run to completion?" shape of a
 //! separate plumbing test, so both live in one function below.
 
-use alloc::{boxed::Box, vec::Vec};
-use core::{
-    borrow::{Borrow, BorrowMut},
-    mem::size_of,
-};
+use alloc::{format, string::String, vec::Vec};
+use std::collections::HashMap;
 
 use miden_air::{
-    BaseAir, ChipletCols, ControllerCols, LiftedAir, MidenAir, MidenMultiAir, ProverStatement,
-    StarkConfig, Statement, config, debug,
-    logup::{BusId, HasherPermLinkMsg, MIDEN_MAX_MESSAGE_WIDTH},
+    BaseAir, LiftedAir, MidenAir,
+    logup::{BusId, MIDEN_MAX_MESSAGE_WIDTH},
     lookup::{
-        Challenges, LookupMessage, accumulate, build_lookup_fractions,
+        Challenges, LookupFractions, accumulate, build_lookup_fractions,
         debug::collect_column_oracle_folds,
     },
-    trace::CHIPLET_CONTROLLER_OFFSET,
+    trace::{
+        CHIPLETS_MODE_COL, CHIPLETS_STREAM_MODE_COL,
+        and8_lookup::{AND8_TABLE_ROWS, BYTE_LOOKUP_KIND_COUNT, NUM_AND8_LOOKUP_COLS},
+        blakeg_compression::{
+            BLAKEG_COMPRESSION_CYCLE_LEN, F_COMPRESSION_MULTIPLICITY_COL, F_MODE_COL,
+            NUM_BLAKEG_COMPRESSION_COLS,
+        },
+    },
 };
 use miden_core::{
+    WORD_SIZE, Word,
+    crypto::merkle::{MerkleStore, MerkleTree},
     field::{Field, QuadFelt},
     utils::{Matrix, RowMajorMatrix},
 };
 
-use super::{Felt, VmTrace, build_trace_from_ops, rand_array};
-use crate::operation::Operation;
+use super::{Felt, VmTrace, build_trace_from_ops, build_trace_from_ops_with_inputs, rand_array};
+use crate::{AdviceInputs, StackInputs, operation::Operation};
 
-const CONTROLLER_OFFSET: usize = CHIPLET_CONTROLLER_OFFSET;
-const CONTROLLER_WIDTH: usize = size_of::<ControllerCols<u8>>();
-static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const BLAKEG_NARROW_COLUMN_CAPACITY: usize = 2;
+const BLAKEG_SINGLETON_COLUMN_CAPACITY: usize = 1;
+const BLAKEG_NARROW_LOOKUP_COLUMNS: usize = 20;
+const BLAKEG_SINGLETON_LOOKUP_COLUMNS: usize = 4;
+const BLAKEG_LOOKUP_COLUMNS: usize = BLAKEG_NARROW_LOOKUP_COLUMNS + BLAKEG_SINGLETON_LOOKUP_COLUMNS;
+const AEAD_STREAM_PAYLOAD_BASE_COL: usize = 2;
+const AEAD_STREAM_MODE_COL: usize = CHIPLETS_STREAM_MODE_COL;
+const AEAD_READ_LANE_BASE_OFFSET: usize = 3;
+const AEAD_LOW_SECOND_SRC_PTR_OFFSET: usize = 2;
+const CONTROLLER_S_CTRL_COL: usize = 0;
+const CONTROLLER_BASE_COL: usize = 1;
+const CONTROLLER_SELECTOR_COUNT: usize = 3;
+const CONTROLLER_STATE_WIDTH: usize = 12;
+const CONTROLLER_ROW_DATA_BASE_COL: usize =
+    CONTROLLER_BASE_COL + CONTROLLER_SELECTOR_COUNT + CONTROLLER_STATE_WIDTH;
+const CONTROLLER_S0_COL: usize = CONTROLLER_BASE_COL;
+const CONTROLLER_S2_COL: usize = CONTROLLER_BASE_COL + 2;
+const CONTROLLER_IS_START_COL: usize = CONTROLLER_ROW_DATA_BASE_COL + 2;
+const CONTROLLER_MERKLE_OR_PADDING_COL: usize = CHIPLETS_MODE_COL;
 
-/// Pad/Add/Mul/Drop inside a span — same flavour of ops the decoder/stack tests use, with
+/// Pad/Add/Mul/Drop inside a span - same kind of ops the decoder/stack tests use, with
 /// enough variety to exercise decoder, stack, and range-check bus emitters.
 fn tiny_span() -> Vec<Operation> {
     vec![
@@ -57,6 +78,80 @@ fn tiny_span() -> Vec<Operation> {
         Operation::Mul,
         Operation::Drop,
     ]
+}
+
+fn aead_stream_trace() -> VmTrace {
+    // Stack layout: [K_CTR(4), counter, src_ptr, dst_ptr, remaining, tail(8)].
+    build_trace_from_ops(
+        vec![Operation::CryptoStream],
+        &[
+            1, 2, 3, 4, // K_CTR
+            0, // counter
+            0, // src_ptr
+            8, // dst_ptr
+            1, // remaining
+            0, 0, 0, 0, 0, 0, 0, 0, // tail
+        ],
+    )
+}
+
+fn mixed_bitwise_aead_stream_trace() -> VmTrace {
+    // The first four operations leave the initial stack unchanged while recording one ordinary
+    // bitwise row before the AEAD stream operation in execution order.
+    build_trace_from_ops(
+        vec![
+            Operation::Pad,
+            Operation::Pad,
+            Operation::U32and,
+            Operation::Drop,
+            Operation::CryptoStream,
+        ],
+        &[
+            1, 2, 3, 4, // K_CTR
+            0, // counter
+            0, // src_ptr
+            8, // dst_ptr
+            1, // remaining
+            0, 0, 0, 0, 0, 0, 0, 0, // tail
+        ],
+    )
+}
+
+fn mpverify_trace() -> VmTrace {
+    let leaves: Vec<Word> = (0..8).map(test_word).collect();
+    let tree = MerkleTree::new(&leaves).expect("test Merkle tree should be valid");
+    let store = MerkleStore::from(&tree);
+    let leaf_idx = 5usize;
+    let node = leaves[leaf_idx];
+    let root = tree.root();
+    let stack = [
+        node[0],
+        node[1],
+        node[2],
+        node[3],
+        Felt::new_unchecked(tree.depth() as u64),
+        Felt::new_unchecked(leaf_idx as u64),
+        root[0],
+        root[1],
+        root[2],
+        root[3],
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
+    ];
+    let advice_inputs = AdviceInputs::default().with_merkle_store(store);
+    build_trace_from_ops_with_inputs(
+        vec![Operation::MpVerify(Felt::ZERO)],
+        StackInputs::new(&stack).expect("test stack inputs should be valid"),
+        advice_inputs,
+    )
+}
+
+fn test_word(value: usize) -> Word {
+    [Felt::new_unchecked(value as u64), Felt::ZERO, Felt::ZERO, Felt::ZERO].into()
 }
 
 /// Asserts the `accumulate` output matches the oracle folds bit-exactly on every
@@ -73,8 +168,8 @@ fn assert_prover_matches_oracle(
     assert_eq!(aux.height(), num_rows, "{label}: aux height mismatch");
     let aux_values = &aux.values;
 
-    // Col 0: aux[next][0] - aux[r][0] + sigma_prime == Σ_col per_row_value[col],
-    // where next wraps on the last row. Cols 1+ store V/U directly.
+    // Col 0 (accumulator): aux[r+1][0] - aux[r][0] == sum_col per_row_value[col].
+    // Cols 1+ (fraction): aux[r][col] == V/U per-row value.
     for (r, row_folds) in oracle_folds.iter().enumerate() {
         assert_eq!(row_folds.len(), aux_width, "{label} row {r}: fold width mismatch");
         let per_row_values: Vec<QuadFelt> = row_folds
@@ -83,7 +178,7 @@ fn assert_prover_matches_oracle(
             .map(|(col, &(v_col, u_col))| {
                 let u_inv = u_col.try_inverse().unwrap_or_else(|| {
                     panic!(
-                        "{label} row {r} col {col}: oracle U_col is zero — bus has a \
+                        "{label} row {r} col {col}: oracle U_col is zero - bus has a \
                          zero-denominator product, indicating a bug in the emitter or \
                          message encoding",
                     )
@@ -110,88 +205,648 @@ fn assert_prover_matches_oracle(
     }
 }
 
-fn perm_link_fractions(
-    chip_matrix: &RowMajorMatrix<Felt>,
-    poseidon2_matrix: &RowMajorMatrix<Felt>,
-    challenges: &Challenges<QuadFelt>,
-) -> Vec<(Felt, QuadFelt)> {
-    let chip_periodic = MidenAir::Chiplets.periodic_columns();
-    let poseidon2_periodic = MidenAir::Poseidon2Permutation.periodic_columns();
-    let chip_fractions =
-        build_lookup_fractions(&MidenAir::Chiplets, chip_matrix, &chip_periodic, challenges);
-    let poseidon2_fractions = build_lookup_fractions(
-        &MidenAir::Poseidon2Permutation,
-        poseidon2_matrix,
-        &poseidon2_periodic,
-        challenges,
+#[test]
+fn lookup_global_balance_closes_for_tiny_span() {
+    let trace = build_trace_from_ops(tiny_span(), &[]);
+    assert_global_lookup_balance(&trace);
+}
+
+#[test]
+fn lookup_global_balance_closes_for_bcompress() {
+    let trace = build_trace_from_ops(vec![Operation::BCompress], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_global_lookup_balance(&trace);
+}
+
+#[test]
+fn deduplicated_bcompress_keeps_unit_controller_multiplicity() {
+    // The fourth word backs up the input CV. After the first compression, swap that backup into
+    // the CV position so the second BCOMPRESS issues the identical physical request.
+    let trace = build_trace_from_ops(
+        vec![
+            Operation::BCompress,
+            Operation::SwapW2,
+            Operation::SwapW3,
+            Operation::SwapW2,
+            Operation::BCompress,
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 9, 10, 11, 12],
+    );
+    let (core_matrix, chip_matrix, blakeg_matrix, and8_matrix) =
+        trace.main_trace().to_air_matrices();
+    let (public_values, aux_inputs) = trace.public_inputs().to_air_inputs();
+    let (_, kernel_felts) = aux_inputs.split_at(2 * WORD_SIZE);
+
+    let raw = rand_array::<Felt, 4>();
+    let challenges = Challenges::<QuadFelt>::new(
+        QuadFelt::new([raw[0], raw[1]]),
+        QuadFelt::new([raw[2], raw[3]]),
+        MIDEN_MAX_MESSAGE_WIDTH,
+        BusId::COUNT,
+    );
+    let chip_report = miden_air::lookup::debug::check_trace_balance(
+        &MidenAir::CHIPLETS,
+        &chip_matrix,
+        &BaseAir::<Felt>::periodic_columns(&MidenAir::CHIPLETS),
+        &public_values,
+        &[kernel_felts],
+        &challenges,
+    );
+    let blakeg_report = miden_air::lookup::debug::check_trace_balance(
+        &MidenAir::BLAKEG_COMPRESSION,
+        &blakeg_matrix,
+        &BaseAir::<Felt>::periodic_columns(&MidenAir::BLAKEG_COMPRESSION),
+        &public_values,
+        &[],
+        &challenges,
     );
 
-    chip_fractions
-        .fractions()
+    let two = Felt::from_u8(2);
+    let controller = chip_report
+        .unmatched
         .iter()
-        .chain(poseidon2_fractions.fractions())
-        .copied()
+        .find(|entry| {
+            entry.net_multiplicity == two
+                && entry.contributions.len() == 2
+                && entry.contributions.iter().all(|contribution| {
+                    contribution.multiplicity == Felt::ONE
+                        && contribution.msg_repr.contains("HasherCompressionLinkMsg")
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "two identical controller requests were not emitted separately with unit multiplicity:\n{chip_report}"
+            )
+        });
+    let provider = blakeg_report
+        .unmatched
+        .iter()
+        .find(|entry| entry.denom == controller.denom)
+        .unwrap_or_else(|| {
+            panic!(
+                "deduplicated BlakeG provider did not emit the controller denominator:\n{blakeg_report}"
+            )
+        });
+    assert_eq!(provider.net_multiplicity, -two);
+    assert_eq!(provider.contributions.len(), 1);
+    assert_eq!(provider.contributions[0].multiplicity, -two);
+    assert!(provider.contributions[0].msg_repr.contains("HasherCompressionLinkMsg"));
+
+    // The aggregate provider cancels the two unit controller emissions in the complete four-AIR
+    // ledger; the remaining protocol buses must close as well.
+    assert_global_lookup_balance(&trace);
+    let _ = (core_matrix, and8_matrix);
+}
+
+#[test]
+fn lookup_global_balance_closes_for_aead_stream() {
+    let trace = aead_stream_trace();
+    assert_global_lookup_balance(&trace);
+}
+
+#[test]
+fn lookup_global_balance_closes_for_mixed_bitwise_aead_stream() {
+    let trace = mixed_bitwise_aead_stream_trace();
+    assert_global_lookup_balance(&trace);
+}
+
+#[test]
+fn lookup_global_balance_closes_for_fibonacci_span() {
+    let mut ops = Vec::new();
+    for _ in 0..149 {
+        ops.extend([Operation::Swap, Operation::Dup1, Operation::Add]);
+    }
+    let trace = build_trace_from_ops(ops, &[0, 1]);
+    assert_global_lookup_balance(&trace);
+}
+
+#[test]
+fn blakeg_lookup_row_shape_matches_expected_interactions() {
+    const BYTE_LOOKUP_REQUESTS_PER_BLAKEG_BLOCK: u64 = 964;
+
+    let trace = build_trace_from_ops(tiny_span(), &[]);
+    let (_, _, blakeg_matrix, and8_matrix) = trace.main_trace().to_air_matrices();
+
+    assert_eq!(
+        blakeg_matrix.height() % BLAKEG_COMPRESSION_CYCLE_LEN,
+        0,
+        "BlakeG trace height must be a whole number of compression blocks",
+    );
+
+    let raw = rand_array::<Felt, 4>();
+    let alpha = QuadFelt::new([raw[0], raw[1]]);
+    let beta = QuadFelt::new([raw[2], raw[3]]);
+    let challenges =
+        Challenges::<QuadFelt>::new(alpha, beta, MIDEN_MAX_MESSAGE_WIDTH, BusId::COUNT);
+    let blakeg_periodic = BaseAir::<Felt>::periodic_columns(&MidenAir::BLAKEG_COMPRESSION);
+    let blakeg_fractions = build_lookup_fractions(
+        &MidenAir::BLAKEG_COMPRESSION,
+        &blakeg_matrix,
+        None,
+        &blakeg_periodic,
+        &challenges,
+    );
+
+    assert_eq!(blakeg_fractions.num_rows(), blakeg_matrix.height());
+    assert_blakeg_compression_column_shape("row-shape test", &blakeg_fractions);
+
+    for (row, column_counts) in
+        blakeg_fractions.counts().chunks(blakeg_fractions.num_columns()).enumerate()
+    {
+        let cycle_row = row % BLAKEG_COMPRESSION_CYCLE_LEN;
+        let actual: usize = column_counts.iter().sum();
+        let row_start = row * NUM_BLAKEG_COMPRESSION_COLS;
+        let is_aead = blakeg_matrix.values[row_start + F_MODE_COL] == Felt::ONE;
+        let compression_multiplicity =
+            blakeg_matrix.values[row_start + F_COMPRESSION_MULTIPLICITY_COL];
+        let expected = expected_blakeg_compression_fraction_entry_range_at_cycle_row(
+            cycle_row,
+            is_aead,
+            compression_multiplicity,
+        );
+        assert!(
+            expected.contains(&actual),
+            "BlakeG lookup count mismatch at row {row} cycle row {cycle_row}",
+        );
+    }
+
+    let block_count = blakeg_matrix.height() / BLAKEG_COMPRESSION_CYCLE_LEN;
+    let expected_blakeg_byte_lookup_total =
+        block_count as u64 * BYTE_LOOKUP_REQUESTS_PER_BLAKEG_BLOCK;
+    let mut actual_blakeg_byte_lookup_total = 0;
+    for row in 0..AND8_TABLE_ROWS {
+        let row_start = row * NUM_AND8_LOOKUP_COLS;
+        for col in 0..BYTE_LOOKUP_KIND_COUNT {
+            actual_blakeg_byte_lookup_total +=
+                and8_matrix.values[row_start + col].as_canonical_u64();
+        }
+    }
+    assert_eq!(
+        actual_blakeg_byte_lookup_total, expected_blakeg_byte_lookup_total,
+        "BlakeG byte-lookup multiplicities do not match BlakeG requests",
+    );
+
+    let padding_start = AND8_TABLE_ROWS * NUM_AND8_LOOKUP_COLS;
+    let padding_byte_lookup_total: u64 =
+        and8_matrix.values[padding_start..].iter().map(Felt::as_canonical_u64).sum();
+    assert_eq!(
+        padding_byte_lookup_total, 0,
+        "byte-pair multiplicities must live only on real byte-pair table rows",
+    );
+}
+
+fn expected_blakeg_compression_narrow_interactions_at_cycle_row(cycle_row: usize) -> usize {
+    match cycle_row {
+        0 => 40,
+        1..=27 => 36,
+        28..=31 => 30,
+        _ => unreachable!("cycle row must be in 0..{BLAKEG_COMPRESSION_CYCLE_LEN}"),
+    }
+}
+
+fn expected_blakeg_compression_singletons_at_cycle_row(cycle_row: usize) -> usize {
+    match cycle_row {
+        31 => 1,
+        0..=30 => 0,
+        _ => unreachable!("cycle row must be in 0..{BLAKEG_COMPRESSION_CYCLE_LEN}"),
+    }
+}
+
+fn expected_blakeg_compression_fraction_entry_range_at_cycle_row(
+    cycle_row: usize,
+    is_aead: bool,
+    compression_multiplicity: Felt,
+) -> core::ops::RangeInclusive<usize> {
+    match cycle_row {
+        28..=31 if is_aead => {
+            let expected = expected_blakeg_compression_narrow_interactions_at_cycle_row(cycle_row)
+                + if cycle_row == 31 { 3 } else { 2 };
+            expected..=expected
+        },
+        31 if compression_multiplicity != Felt::ZERO => 31..=31,
+        _ => {
+            let expected = expected_blakeg_compression_narrow_interactions_at_cycle_row(cycle_row);
+            expected..=expected
+        },
+    }
+}
+
+#[test]
+fn blakeg_lookup_ledger_fits_narrow_slot_cap() {
+    const SLOTS_PER_BATCH_COLUMN: usize = 2;
+    const COMPRESSION_DENOMINATORS_PER_BLOCK: usize = 1133;
+
+    let trace = build_trace_from_ops(tiny_span(), &[]);
+    let (_, _, blakeg_matrix, _) = trace.main_trace().to_air_matrices();
+    let raw = rand_array::<Felt, 4>();
+    let alpha = QuadFelt::new([raw[0], raw[1]]);
+    let beta = QuadFelt::new([raw[2], raw[3]]);
+    let challenges =
+        Challenges::<QuadFelt>::new(alpha, beta, MIDEN_MAX_MESSAGE_WIDTH, BusId::COUNT);
+    let blakeg_periodic = BaseAir::<Felt>::periodic_columns(&MidenAir::BLAKEG_COMPRESSION);
+    let blakeg_fractions = build_lookup_fractions(
+        &MidenAir::BLAKEG_COMPRESSION,
+        &blakeg_matrix,
+        None,
+        &blakeg_periodic,
+        &challenges,
+    );
+    let (narrow_batch_columns, _) =
+        assert_blakeg_compression_column_shape("lookup ledger", &blakeg_fractions);
+    let narrow_slot_cap = narrow_batch_columns * SLOTS_PER_BATCH_COLUMN;
+    let row_lookup_cap = narrow_slot_cap + BLAKEG_SINGLETON_LOOKUP_COLUMNS;
+
+    let mut total = 0;
+    for cycle_row in 0..BLAKEG_COMPRESSION_CYCLE_LEN {
+        let narrow_pressure =
+            expected_blakeg_compression_narrow_interactions_at_cycle_row(cycle_row);
+        assert!(
+            narrow_pressure <= narrow_slot_cap,
+            "cycle row {cycle_row} has narrow lookup pressure {narrow_pressure}, above cap \
+             {narrow_slot_cap}",
+        );
+        total += narrow_pressure + expected_blakeg_compression_singletons_at_cycle_row(cycle_row);
+    }
+
+    assert_eq!(total, COMPRESSION_DENOMINATORS_PER_BLOCK);
+    assert!(
+        total <= BLAKEG_COMPRESSION_CYCLE_LEN * row_lookup_cap,
+        "lookup ledger must fit the fixed per-row lookup-column capacity",
+    );
+}
+
+#[test]
+fn lookup_balance_rejects_tampered_aead_output_pair_lane() {
+    let trace = aead_stream_trace();
+    let (core_matrix, mut chip_matrix, blakeg_matrix, and8_matrix) =
+        trace.main_trace().to_air_matrices();
+
+    let first_stream_row = aead_stream_rows(&chip_matrix)
+        .into_iter()
+        .next()
+        .expect("AEAD stream trace should contain stream rows");
+    mutate_chip_cell(
+        &mut chip_matrix,
+        first_stream_row,
+        AEAD_STREAM_PAYLOAD_BASE_COL + AEAD_READ_LANE_BASE_OFFSET,
+        Felt::ONE,
+    );
+
+    assert_global_lookup_balance_rejects(
+        "tampered AEAD output pair lane",
+        &trace,
+        &core_matrix,
+        &chip_matrix,
+        &blakeg_matrix,
+        &and8_matrix,
+        "AeadBlakeGOutputPairMsg",
+    );
+}
+
+#[test]
+fn lookup_balance_rejects_tampered_aead_request_source_pointer() {
+    let trace = aead_stream_trace();
+    let (core_matrix, mut chip_matrix, blakeg_matrix, and8_matrix) =
+        trace.main_trace().to_air_matrices();
+
+    let stream_rows = aead_stream_rows(&chip_matrix);
+    assert!(stream_rows.len() >= 3, "AEAD stream trace should contain low-second rows");
+    let first_low_second_row = stream_rows[2];
+    mutate_chip_cell(
+        &mut chip_matrix,
+        first_low_second_row,
+        AEAD_STREAM_PAYLOAD_BASE_COL + AEAD_LOW_SECOND_SRC_PTR_OFFSET,
+        Felt::ONE,
+    );
+
+    assert_global_lookup_balance_rejects(
+        "tampered AEAD request source pointer",
+        &trace,
+        &core_matrix,
+        &chip_matrix,
+        &blakeg_matrix,
+        &and8_matrix,
+        "AeadStreamRequestMsg",
+    );
+}
+
+#[test]
+fn lookup_balance_rejects_tampered_merkle_start_flag() {
+    let trace = mpverify_trace();
+    let (core_matrix, mut chip_matrix, blakeg_matrix, and8_matrix) =
+        trace.main_trace().to_air_matrices();
+
+    let first_merkle_start = merkle_start_rows(&chip_matrix)
+        .into_iter()
+        .next()
+        .expect("MPVERIFY trace should contain a Merkle start row");
+    mutate_chip_cell(&mut chip_matrix, first_merkle_start, CONTROLLER_IS_START_COL, -Felt::ONE);
+
+    assert_global_lookup_balance_rejects(
+        "tampered Merkle start flag",
+        &trace,
+        &core_matrix,
+        &chip_matrix,
+        &blakeg_matrix,
+        &and8_matrix,
+        "HasherMerkleVerifyInit",
+    );
+}
+
+fn assert_blakeg_compression_column_shape(
+    label: &str,
+    fractions: &LookupFractions<Felt, QuadFelt>,
+) -> (usize, usize) {
+    let shape = fractions.shape();
+
+    assert_eq!(shape.len(), BLAKEG_LOOKUP_COLUMNS, "{label}: BlakeG lookup aux width drifted",);
+
+    for (col, &count) in shape.iter().enumerate() {
+        let expected = if col < BLAKEG_NARROW_LOOKUP_COLUMNS {
+            BLAKEG_NARROW_COLUMN_CAPACITY
+        } else {
+            BLAKEG_SINGLETON_COLUMN_CAPACITY
+        };
+        assert_eq!(
+            count, expected,
+            "{label}: BlakeG lookup column {col} has shape {count}, expected {expected}",
+        );
+    }
+
+    assert_eq!(
+        fractions.num_columns(),
+        BLAKEG_LOOKUP_COLUMNS,
+        "{label}: BlakeG lookup aux width drifted",
+    );
+
+    (BLAKEG_NARROW_LOOKUP_COLUMNS, BLAKEG_SINGLETON_LOOKUP_COLUMNS)
+}
+
+fn assert_blakeg_compression_oracle_coverage(
+    label: &str,
+    blakeg_matrix: &RowMajorMatrix<Felt>,
+    fractions: &LookupFractions<Felt, QuadFelt>,
+) {
+    assert_eq!(
+        fractions.num_rows() % BLAKEG_COMPRESSION_CYCLE_LEN,
+        0,
+        "{label}: BlakeG trace height must be a whole number of compression blocks",
+    );
+
+    let (narrow_batch_columns, singleton_columns) =
+        assert_blakeg_compression_column_shape(label, fractions);
+
+    let mut seen_cycle_rows = [false; BLAKEG_COMPRESSION_CYCLE_LEN];
+    let mut saw_narrow_only_row = false;
+    let mut saw_full_narrow_pair = false;
+    let mut saw_singleton_fraction = false;
+    for (row, column_counts) in fractions.counts().chunks(fractions.num_columns()).enumerate() {
+        let cycle_row = row % BLAKEG_COMPRESSION_CYCLE_LEN;
+        seen_cycle_rows[cycle_row] = true;
+
+        for (col, &count) in column_counts[..narrow_batch_columns].iter().enumerate() {
+            assert!(
+                count <= BLAKEG_NARROW_COLUMN_CAPACITY,
+                "{label}: row {row} cycle row {cycle_row} narrow column {col} pushed {count} \
+                 fractions, above batch-2 capacity",
+            );
+            saw_full_narrow_pair |= count == 2;
+        }
+        for (offset, &count) in column_counts[narrow_batch_columns..].iter().enumerate() {
+            assert!(
+                count <= BLAKEG_SINGLETON_COLUMN_CAPACITY,
+                "{label}: row {row} cycle row {cycle_row} singleton column {} pushed {count} \
+                 fractions, above singleton capacity",
+                narrow_batch_columns + offset,
+            );
+            saw_singleton_fraction |= count == 1;
+        }
+
+        let singleton_total: usize = column_counts[narrow_batch_columns..].iter().sum();
+        saw_narrow_only_row |= singleton_total == 0;
+
+        let actual: usize = column_counts.iter().sum();
+        let row_start = row * blakeg_matrix.width();
+        let is_aead = blakeg_matrix.values[row_start + F_MODE_COL] == Felt::ONE;
+        let compression_multiplicity =
+            blakeg_matrix.values[row_start + F_COMPRESSION_MULTIPLICITY_COL];
+        let expected = expected_blakeg_compression_fraction_entry_range_at_cycle_row(
+            cycle_row,
+            is_aead,
+            compression_multiplicity,
+        );
+        assert!(
+            expected.contains(&actual),
+            "{label}: BlakeG lookup count mismatch at row {row} cycle row {cycle_row}",
+        );
+    }
+
+    assert!(
+        seen_cycle_rows.into_iter().all(|seen| seen),
+        "{label}: oracle trace must exercise every BlakeG cycle row",
+    );
+    assert_eq!(singleton_columns, BLAKEG_SINGLETON_LOOKUP_COLUMNS);
+    assert!(saw_narrow_only_row, "{label}: oracle trace must exercise narrow lookup rows");
+    assert!(
+        saw_full_narrow_pair && saw_singleton_fraction,
+        "{label}: oracle trace must exercise full batch-2 pairs and singleton lookup columns",
+    );
+}
+
+fn assert_global_lookup_balance(trace: &VmTrace) {
+    let (core_matrix, chip_matrix, blakeg_matrix, and8_matrix) =
+        trace.main_trace().to_air_matrices();
+    let residuals =
+        global_lookup_residuals(trace, &core_matrix, &chip_matrix, &blakeg_matrix, &and8_matrix);
+
+    assert!(
+        residuals.is_empty(),
+        "global LogUp balance did not close:\n{}",
+        format_lookup_residuals(residuals)
+    );
+}
+
+fn assert_global_lookup_balance_rejects(
+    label: &str,
+    trace: &VmTrace,
+    core_matrix: &RowMajorMatrix<Felt>,
+    chip_matrix: &RowMajorMatrix<Felt>,
+    blakeg_matrix: &RowMajorMatrix<Felt>,
+    and8_matrix: &RowMajorMatrix<Felt>,
+    expected_msg: &str,
+) {
+    let residuals =
+        global_lookup_residuals(trace, core_matrix, chip_matrix, blakeg_matrix, and8_matrix);
+    assert!(!residuals.is_empty(), "{label}: tampered trace unexpectedly balanced");
+
+    let found_expected_msg = residuals
+        .iter()
+        .any(|(_, (_, lines))| lines.iter().any(|line| line.contains(expected_msg)));
+    assert!(
+        found_expected_msg,
+        "{label}: expected residual containing {expected_msg}; got:\n{}",
+        format_lookup_residuals(residuals),
+    );
+}
+
+fn global_lookup_residuals(
+    trace: &VmTrace,
+    core_matrix: &RowMajorMatrix<Felt>,
+    chip_matrix: &RowMajorMatrix<Felt>,
+    blakeg_matrix: &RowMajorMatrix<Felt>,
+    and8_matrix: &RowMajorMatrix<Felt>,
+) -> Vec<(QuadFelt, (Felt, Vec<String>))> {
+    let (public_values, aux_inputs) = trace.public_inputs().to_air_inputs();
+    let (core_boundary_inputs, kernel_felts) = aux_inputs.split_at(2 * WORD_SIZE);
+
+    let raw = rand_array::<Felt, 4>();
+    let alpha = QuadFelt::new([raw[0], raw[1]]);
+    let beta = QuadFelt::new([raw[2], raw[3]]);
+    let challenges =
+        Challenges::<QuadFelt>::new(alpha, beta, MIDEN_MAX_MESSAGE_WIDTH, BusId::COUNT);
+
+    let chip_periodic = BaseAir::<Felt>::periodic_columns(&MidenAir::CHIPLETS);
+    let blakeg_periodic = BaseAir::<Felt>::periodic_columns(&MidenAir::BLAKEG_COMPRESSION);
+
+    let reports = [
+        (
+            "Core",
+            miden_air::lookup::debug::check_trace_balance(
+                &MidenAir::CORE,
+                core_matrix,
+                &[],
+                &public_values,
+                &[core_boundary_inputs],
+                &challenges,
+            ),
+        ),
+        (
+            "Chiplets",
+            miden_air::lookup::debug::check_trace_balance(
+                &MidenAir::CHIPLETS,
+                chip_matrix,
+                &chip_periodic,
+                &public_values,
+                &[kernel_felts],
+                &challenges,
+            ),
+        ),
+        (
+            "BlakeGCompression",
+            miden_air::lookup::debug::check_trace_balance(
+                &MidenAir::BLAKEG_COMPRESSION,
+                blakeg_matrix,
+                &blakeg_periodic,
+                &public_values,
+                &[],
+                &challenges,
+            ),
+        ),
+        (
+            "And8Lookup",
+            miden_air::lookup::debug::check_trace_balance(
+                &MidenAir::AND8_LOOKUP,
+                and8_matrix,
+                &[],
+                &public_values,
+                &[],
+                &challenges,
+            ),
+        ),
+    ];
+
+    let mut totals: HashMap<QuadFelt, (Felt, Vec<String>)> = HashMap::new();
+    for (air_name, report) in reports {
+        for unmatched in report.unmatched {
+            let entry = totals.entry(unmatched.denom).or_insert_with(|| (Felt::ZERO, Vec::new()));
+            entry.0 += unmatched.net_multiplicity;
+            entry.1.push(format!("{air_name}: net {:?}", unmatched.net_multiplicity));
+            for contribution in unmatched.contributions.iter().take(3) {
+                entry.1.push(format!(
+                    "  row={} col={} group={} mult={:?} msg={}",
+                    contribution.row,
+                    contribution.column_idx,
+                    contribution.group_idx,
+                    contribution.multiplicity,
+                    contribution.msg_repr
+                ));
+            }
+        }
+    }
+
+    let mut residuals: Vec<_> =
+        totals.into_iter().filter(|(_, (net, _))| *net != Felt::ZERO).collect();
+    residuals.sort_by_key(|(denom, _)| *denom);
+    residuals
+}
+
+fn format_lookup_residuals(residuals: Vec<(QuadFelt, (Felt, Vec<String>))>) -> String {
+    residuals
+        .into_iter()
+        .take(8)
+        .map(|(denom, (net, lines))| format!("denom {denom:?} net {net:?}\n{}", lines.join("\n")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn aead_stream_rows(chip_matrix: &RowMajorMatrix<Felt>) -> Vec<usize> {
+    let width = chip_matrix.width();
+    (0..chip_matrix.height())
+        .filter(|&row| {
+            let base = row * width;
+            chip_matrix.values[base] == Felt::ZERO
+                && chip_matrix.values[base + 1] == Felt::ZERO
+                && chip_matrix.values[base + AEAD_STREAM_MODE_COL] == Felt::ONE
+        })
         .collect()
 }
 
-fn net_multiplicity(fractions: &[(Felt, QuadFelt)], denom: QuadFelt) -> Felt {
-    let mut net = Felt::ZERO;
-    for &(multiplicity, encoded) in fractions {
-        if encoded == denom {
-            net += multiplicity;
-        }
-    }
-    net
+fn merkle_start_rows(chip_matrix: &RowMajorMatrix<Felt>) -> Vec<usize> {
+    let width = chip_matrix.width();
+    (0..chip_matrix.height())
+        .filter(|&row| {
+            let base = row * width;
+            chip_matrix.values[base + CONTROLLER_S_CTRL_COL] == Felt::ONE
+                && chip_matrix.values[base + CONTROLLER_MERKLE_OR_PADDING_COL] == Felt::ONE
+                && chip_matrix.values[base + CONTROLLER_S0_COL] == Felt::ONE
+                && chip_matrix.values[base + CONTROLLER_S2_COL] == Felt::ONE
+                && chip_matrix.values[base + CONTROLLER_IS_START_COL] == Felt::ONE
+        })
+        .collect()
 }
 
-fn chiplet_row(matrix: &RowMajorMatrix<Felt>, row: usize) -> &ChipletCols<Felt> {
-    let width = matrix.width();
-    matrix.values[row * width..(row + 1) * width].borrow()
-}
-
-fn controller_row(matrix: &RowMajorMatrix<Felt>, row: usize) -> &ControllerCols<Felt> {
-    chiplet_row(matrix, row).controller()
-}
-
-fn controller_row_mut(matrix: &mut RowMajorMatrix<Felt>, row: usize) -> &mut ControllerCols<Felt> {
-    let width = matrix.width();
-    let start = row * width + CONTROLLER_OFFSET;
-    matrix.values[start..start + CONTROLLER_WIDTH].borrow_mut()
-}
-
-fn assert_trace_constraints_reject(
-    trace: &VmTrace,
-    core_matrix: RowMajorMatrix<Felt>,
-    chip_matrix: RowMajorMatrix<Felt>,
-    poseidon2_matrix: RowMajorMatrix<Felt>,
-) {
-    let (public_values, aux_inputs) = trace.public_inputs().to_air_inputs();
-    let statement =
-        Statement::<Felt, QuadFelt, _>::new(MidenMultiAir::new(), public_values, aux_inputs)
-            .expect("valid statement inputs");
-    let prover_statement =
-        ProverStatement::new(statement, vec![core_matrix, chip_matrix, poseidon2_matrix])
-            .expect("valid trace shapes");
-
-    let config = config::poseidon2_config(config::pcs_params(), config::RELATION_DIGEST);
-    let _guard = PANIC_HOOK_LOCK.lock().expect("panic hook lock poisoned");
-    let panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        debug::check_constraints(&prover_statement, config.challenger());
-    }));
-    std::panic::set_hook(panic_hook);
-    assert!(result.is_err(), "mutated trace should violate AIR constraints");
+fn mutate_chip_cell(chip_matrix: &mut RowMajorMatrix<Felt>, row: usize, col: usize, delta: Felt) {
+    let width = chip_matrix.width();
+    chip_matrix.values[row * width + col] += delta;
 }
 
 #[test]
 fn build_lookup_fractions_matches_constraint_path_oracle() {
     let trace = build_trace_from_ops(tiny_span(), &[]);
+    assert_lookup_fractions_match_constraint_path_oracle("tiny span", &trace);
+}
 
-    let (core_matrix, chip_matrix, poseidon2_matrix) = trace.main_trace().to_air_matrices();
+#[test]
+fn build_lookup_fractions_matches_constraint_path_oracle_for_aead_stream() {
+    let trace = aead_stream_trace();
+    assert_lookup_fractions_match_constraint_path_oracle("AEAD stream", &trace);
+}
+
+#[test]
+fn build_lookup_fractions_matches_constraint_path_oracle_for_mixed_bitwise_aead_stream() {
+    let trace = mixed_bitwise_aead_stream_trace();
+    assert_lookup_fractions_match_constraint_path_oracle("mixed bitwise/AEAD stream", &trace);
+}
+
+fn assert_lookup_fractions_match_constraint_path_oracle(label: &str, trace: &VmTrace) {
+    let (core_matrix, chip_matrix, blakeg_matrix, and8_matrix) =
+        trace.main_trace().to_air_matrices();
     let public_vals = trace.to_public_values();
-    let chip_periodic = MidenAir::Chiplets.periodic_columns();
-    let poseidon2_periodic = MidenAir::Poseidon2Permutation.periodic_columns();
+    // Core has no periodic columns.
+    let chip_periodic = BaseAir::<Felt>::periodic_columns(&MidenAir::CHIPLETS);
+    let blakeg_periodic = BaseAir::<Felt>::periodic_columns(&MidenAir::BLAKEG_COMPRESSION);
+    let and8_preprocessed = MidenAir::AND8_LOOKUP
+        .preprocessed_trace()
+        .expect("byte-pair lookup AIR declares a preprocessed table");
 
     // QuadFelt challenges for LogUp, built from 4 random Felts (QuadFelt itself doesn't
     // implement Randomizable, so we draw base-field elements and pair them).
@@ -202,167 +857,105 @@ fn build_lookup_fractions_matches_constraint_path_oracle() {
         Challenges::<QuadFelt>::new(alpha, beta, MIDEN_MAX_MESSAGE_WIDTH, BusId::COUNT);
 
     // --- Core ---
-    let core_fractions = build_lookup_fractions(&MidenAir::Core, &core_matrix, &[], &challenges);
+    let core_fractions =
+        build_lookup_fractions(&MidenAir::CORE, &core_matrix, None, &[], &challenges);
     assert!(
         !core_fractions.fractions().is_empty(),
-        "no Core fractions collected — trace is degenerate or emitters are broken",
+        "no Core fractions collected - trace is degenerate or emitters are broken",
     );
     let (core_aux, core_sigma_prime) = accumulate(&core_fractions);
     let core_folds =
-        collect_column_oracle_folds(&MidenAir::Core, &core_matrix, &[], &public_vals, &challenges);
+        collect_column_oracle_folds(&MidenAir::CORE, &core_matrix, &[], &public_vals, &challenges);
     assert_prover_matches_oracle(
-        "Core",
+        &format!("{label} Core"),
         &core_aux,
         core_sigma_prime,
         &core_folds,
-        LiftedAir::<Felt, QuadFelt>::aux_width(&MidenAir::Core),
+        LiftedAir::<Felt, QuadFelt>::aux_width(&MidenAir::CORE),
     );
 
     // --- Chiplets ---
-    let chip_fractions =
-        build_lookup_fractions(&MidenAir::Chiplets, &chip_matrix, &chip_periodic, &challenges);
+    let chip_fractions = build_lookup_fractions(
+        &MidenAir::CHIPLETS,
+        &chip_matrix,
+        None,
+        &chip_periodic,
+        &challenges,
+    );
     assert!(
         !chip_fractions.fractions().is_empty(),
-        "no Chiplets fractions collected — trace is degenerate or emitters are broken",
+        "no Chiplets fractions collected - trace is degenerate or emitters are broken",
     );
     let (chip_aux, chip_sigma_prime) = accumulate(&chip_fractions);
     let chip_folds = collect_column_oracle_folds(
-        &MidenAir::Chiplets,
+        &MidenAir::CHIPLETS,
         &chip_matrix,
         &chip_periodic,
         &public_vals,
         &challenges,
     );
     assert_prover_matches_oracle(
-        "Chiplets",
+        &format!("{label} Chiplets"),
         &chip_aux,
         chip_sigma_prime,
         &chip_folds,
-        LiftedAir::<Felt, QuadFelt>::aux_width(&MidenAir::Chiplets),
+        LiftedAir::<Felt, QuadFelt>::aux_width(&MidenAir::CHIPLETS),
     );
 
-    // --- Poseidon2 permutation ---
-    let poseidon2_fractions = build_lookup_fractions(
-        &MidenAir::Poseidon2Permutation,
-        &poseidon2_matrix,
-        &poseidon2_periodic,
+    // --- BlakeG compression ---
+    let blakeg_fractions = build_lookup_fractions(
+        &MidenAir::BLAKEG_COMPRESSION,
+        &blakeg_matrix,
+        None,
+        &blakeg_periodic,
         &challenges,
     );
     assert!(
-        !poseidon2_fractions.fractions().is_empty(),
-        "no Poseidon2 fractions collected; trace is degenerate or emitters are broken",
+        !blakeg_fractions.fractions().is_empty(),
+        "no BlakeG-compression fractions collected - trace is degenerate or emitters are broken",
     );
-    let (poseidon2_aux, poseidon2_sigma_prime) = accumulate(&poseidon2_fractions);
-    let poseidon2_folds = collect_column_oracle_folds(
-        &MidenAir::Poseidon2Permutation,
-        &poseidon2_matrix,
-        &poseidon2_periodic,
+    assert_blakeg_compression_oracle_coverage(label, &blakeg_matrix, &blakeg_fractions);
+    let (blakeg_aux, blakeg_sigma_prime) = accumulate(&blakeg_fractions);
+    let blakeg_folds = collect_column_oracle_folds(
+        &MidenAir::BLAKEG_COMPRESSION,
+        &blakeg_matrix,
+        &blakeg_periodic,
         &public_vals,
         &challenges,
     );
     assert_prover_matches_oracle(
-        "Poseidon2Permutation",
-        &poseidon2_aux,
-        poseidon2_sigma_prime,
-        &poseidon2_folds,
-        LiftedAir::<Felt, QuadFelt>::aux_width(&MidenAir::Poseidon2Permutation),
-    );
-}
-
-#[test]
-fn perm_link_rejects_swapped_controller_outputs() {
-    let trace =
-        build_trace_from_ops(vec![Operation::HPerm, Operation::HPerm], &[8, 7, 6, 5, 4, 3, 2, 1]);
-    let (core_matrix, chip_matrix, poseidon2_matrix) = trace.main_trace().to_air_matrices();
-
-    let output_rows: Vec<_> = (0..chip_matrix.height())
-        .filter(|&row| {
-            let chiplet = chiplet_row(&chip_matrix, row);
-            let ctrl = chiplet.controller();
-            chiplet.chiplet_selectors()[0] == Felt::ZERO
-                && ctrl.s0 == Felt::ZERO
-                && ctrl.s1 == Felt::ZERO
-                && ctrl.s2 == Felt::ONE
-        })
-        .take(2)
-        .collect();
-    assert_eq!(output_rows.len(), 2, "expected two controller output rows");
-
-    let ctrl_a = controller_row(&chip_matrix, output_rows[0]);
-    let ctrl_b = controller_row(&chip_matrix, output_rows[1]);
-    let state_a = ctrl_a.state;
-    let state_b = ctrl_b.state;
-    assert_ne!(state_a, state_b, "test needs two distinct permutation outputs");
-
-    let perm_id_a = ctrl_a.perm_id;
-    let perm_id_b = ctrl_b.perm_id;
-    assert_ne!(perm_id_a, perm_id_b, "test needs two distinct permutation ids");
-
-    let challenges = Challenges::<QuadFelt>::new(
-        QuadFelt::new([Felt::new_unchecked(7), Felt::ZERO]),
-        QuadFelt::new([Felt::new_unchecked(11), Felt::ZERO]),
-        MIDEN_MAX_MESSAGE_WIDTH,
-        BusId::COUNT,
+        &format!("{label} BlakeGCompression"),
+        &blakeg_aux,
+        blakeg_sigma_prime,
+        &blakeg_folds,
+        LiftedAir::<Felt, QuadFelt>::aux_width(&MidenAir::BLAKEG_COMPRESSION),
     );
 
-    let honest_fractions = perm_link_fractions(&chip_matrix, &poseidon2_matrix, &challenges);
-    for msg in [
-        HasherPermLinkMsg::Output { perm_id: perm_id_a, state: state_a },
-        HasherPermLinkMsg::Output { perm_id: perm_id_b, state: state_b },
-    ] {
-        assert_eq!(
-            net_multiplicity(&honest_fractions, msg.encode(&challenges)),
-            Felt::ZERO,
-            "honest controller output link is balanced"
-        );
-    }
-
-    let mut state_swapped_chip_matrix = chip_matrix.clone();
-    controller_row_mut(&mut state_swapped_chip_matrix, output_rows[0]).state = state_b;
-    controller_row_mut(&mut state_swapped_chip_matrix, output_rows[1]).state = state_a;
-
-    let swapped_fractions =
-        perm_link_fractions(&state_swapped_chip_matrix, &poseidon2_matrix, &challenges);
-    for msg in [
-        HasherPermLinkMsg::Output { perm_id: perm_id_a, state: state_b },
-        HasherPermLinkMsg::Output { perm_id: perm_id_b, state: state_a },
-    ] {
-        assert_eq!(
-            net_multiplicity(&swapped_fractions, msg.encode(&challenges)),
-            Felt::ONE,
-            "swapped controller output leaves an unmatched perm-link addition"
-        );
-    }
-
-    let mut tuple_swapped_chip_matrix = chip_matrix;
-    {
-        let row = controller_row_mut(&mut tuple_swapped_chip_matrix, output_rows[0]);
-        row.state = state_b;
-        row.perm_id = perm_id_b;
-    }
-    {
-        let row = controller_row_mut(&mut tuple_swapped_chip_matrix, output_rows[1]);
-        row.state = state_a;
-        row.perm_id = perm_id_a;
-    }
-
-    let balanced_fractions =
-        perm_link_fractions(&tuple_swapped_chip_matrix, &poseidon2_matrix, &challenges);
-    for msg in [
-        HasherPermLinkMsg::Output { perm_id: perm_id_a, state: state_a },
-        HasherPermLinkMsg::Output { perm_id: perm_id_b, state: state_b },
-    ] {
-        assert_eq!(
-            net_multiplicity(&balanced_fractions, msg.encode(&challenges)),
-            Felt::ZERO,
-            "swapping output tuples keeps the perm-link bus balanced"
-        );
-    }
-
-    assert_trace_constraints_reject(
-        &trace,
-        core_matrix,
-        tuple_swapped_chip_matrix,
-        poseidon2_matrix,
+    // --- Byte-pair lookup table ---
+    let and8_fractions = build_lookup_fractions(
+        &MidenAir::AND8_LOOKUP,
+        &and8_matrix,
+        Some(&and8_preprocessed),
+        &[],
+        &challenges,
+    );
+    assert!(
+        !and8_fractions.fractions().is_empty(),
+        "no byte-pair table fractions collected - BlakeG compression must drive byte lookups",
+    );
+    let (and8_aux, and8_sigma_prime) = accumulate(&and8_fractions);
+    let and8_folds = collect_column_oracle_folds(
+        &MidenAir::AND8_LOOKUP,
+        &and8_matrix,
+        &[],
+        &public_vals,
+        &challenges,
+    );
+    assert_prover_matches_oracle(
+        &format!("{label} And8Lookup"),
+        &and8_aux,
+        and8_sigma_prime,
+        &and8_folds,
+        LiftedAir::<Felt, QuadFelt>::aux_width(&MidenAir::AND8_LOOKUP),
     );
 }

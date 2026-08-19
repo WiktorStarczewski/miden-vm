@@ -557,6 +557,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_bit_grinding_and_verification_leave_the_transcript_unchanged() {
+        let mut challenger = EidosChallenger::new(word([1, 2, 3, 4]));
+        challenger.observe_felt(felt(9));
+        let before = snapshot(&challenger);
+
+        assert_eq!(challenger.grind(0), ZERO);
+        assert_eq!(snapshot(&challenger), before);
+
+        let mut verifier = challenger.clone();
+        assert!(verifier.check_witness(0, ZERO));
+        assert_eq!(snapshot(&verifier), before);
+    }
+
+    #[test]
     fn observe_after_partial_sample_discards_remaining_output() {
         let init = word([1, 2, 3, 4]);
         let value = felt(7);

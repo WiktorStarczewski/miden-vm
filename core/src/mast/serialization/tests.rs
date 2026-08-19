@@ -2,17 +2,18 @@ use core::assert_matches;
 use std::{
     string::{String, ToString},
     sync::{Arc, Mutex, Once},
+    thread::{self, ThreadId},
 };
 
 use super::*;
 use crate::{
     Felt, Word,
-    chiplets::hasher,
     mast::{
         BasicBlockNodeBuilder, CallNodeBuilder, DynNodeBuilder, ExecutableMastForest,
         ExternalNodeBuilder, JoinNodeBuilder, LoopNodeBuilder, MastForestError, MastForestView,
         MastNodeExt, MastNodeId, OP_BATCH_SIZE, OpBatch, SparseMastForest, SparseMastForestBuilder,
         SplitNodeBuilder, UntrustedMastForest, UntrustedMastForestReadOptions, VisitKind,
+        node::hash_op_batches,
     },
     operations::Operation,
     serde::{ByteReader, Deserializable, DeserializationError, Serializable, SliceReader},
@@ -20,7 +21,7 @@ use crate::{
 };
 
 struct TestLogger {
-    messages: Mutex<Vec<String>>,
+    messages: Mutex<Vec<(ThreadId, String)>>,
 }
 
 impl log::Log for TestLogger {
@@ -30,7 +31,10 @@ impl log::Log for TestLogger {
 
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
-            self.messages.lock().unwrap().push(record.args().to_string());
+            self.messages
+                .lock()
+                .unwrap()
+                .push((thread::current().id(), record.args().to_string()));
         }
     }
 
@@ -52,9 +56,17 @@ fn with_captured_logs<T>(level: log::LevelFilter, f: impl FnOnce() -> T) -> (T, 
 
     let _guard = TEST_LOGGER_GUARD.lock().unwrap();
     log::set_max_level(level);
+    let current_thread = thread::current().id();
     TEST_LOGGER.messages.lock().unwrap().clear();
     let result = f();
-    let messages = TEST_LOGGER.messages.lock().unwrap().clone();
+    let messages = TEST_LOGGER
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(thread_id, _)| *thread_id == current_thread)
+        .map(|(_, message)| message.clone())
+        .collect();
     (result, messages)
 }
 
@@ -137,7 +149,7 @@ fn confirm_operation_structure() {
         Operation::MStream => (),
         Operation::Pipe => (),
         Operation::CryptoStream => (),
-        Operation::HPerm => (),
+        Operation::BCompress => (),
         Operation::MpVerify(_) => (),
         Operation::MrUpdate => (),
         Operation::FriE2F4 => (),
@@ -227,7 +239,7 @@ fn sample_basic_block_operations_all_variants() -> Vec<Operation> {
         Operation::MStream,
         Operation::Pipe,
         Operation::CryptoStream,
-        Operation::HPerm,
+        Operation::BCompress,
         Operation::MpVerify(Felt::from_u32(1022)),
         Operation::MrUpdate,
         Operation::FriE2F4,
@@ -313,7 +325,7 @@ fn assert_operation_encoded_size_matches_serialized_len(operation: Operation) {
         | Operation::MStream
         | Operation::Pipe
         | Operation::CryptoStream
-        | Operation::HPerm
+        | Operation::BCompress
         | Operation::MpVerify(_)
         | Operation::MrUpdate
         | Operation::FriE2F4
@@ -1528,7 +1540,7 @@ fn test_batched_construction_preserves_structure() {
 fn assert_header_flags(bytes: &[u8], expected_flags: u8) {
     assert_eq!(&bytes[0..4], b"MAST", "Magic should be MAST");
     assert_eq!(bytes[4], expected_flags, "unexpected serialization flags");
-    assert_eq!(&bytes[5..8], &[0, 0, 4], "Version should be [0, 0, 4]");
+    assert_eq!(&bytes[5..8], &[0, 0, 5], "Version should be [0, 0, 5]");
 }
 
 fn read_header_counts(bytes: &[u8]) -> (usize, usize) {
@@ -1575,9 +1587,12 @@ fn test_header_counts_match_node_kinds() {
     assert_eq!(external_node_count, 1);
 }
 
-/// Test that legacy version headers are rejected.
+/// Version 4 encoded opcode 0x50 as HPERM, while version 5 interprets it as BCOMPRESS. Every load
+/// path must reject version-4 bytes before it can attach the new semantics to an old stored digest.
 #[test]
-fn test_legacy_version_is_rejected() {
+fn test_hperm_wire_version_is_rejected_by_every_load_path() {
+    assert_eq!(VERSION, [0, 0, 5]);
+
     let mut forest = MastForest::new();
     let block_id = BasicBlockNodeBuilder::new(vec![Operation::Add])
         .add_to_forest(&mut forest)
@@ -1585,12 +1600,25 @@ fn test_legacy_version_is_rejected() {
     forest.make_root(block_id);
 
     let mut bytes = forest.to_bytes();
-    bytes[5..8].copy_from_slice(&[0, 0, 3]);
+    bytes[5..8].copy_from_slice(&[0, 0, 4]);
 
-    let result = MastForest::read_from_bytes(&bytes);
+    assert_unsupported_version(MastForest::read_from_bytes(&bytes));
+    assert_unsupported_version(MastForest::read_view_from_bytes(
+        &bytes,
+        MastForestReadMode::Materialized,
+    ));
+    assert_unsupported_version(MastForest::read_view_from_bytes(
+        &bytes,
+        MastForestReadMode::WireBacked,
+    ));
+    assert_unsupported_version(UntrustedMastForest::read_from_bytes(&bytes));
+}
+
+fn assert_unsupported_version<T: core::fmt::Debug>(result: Result<T, DeserializationError>) {
     assert_matches!(
         result,
-        Err(DeserializationError::InvalidValue(msg)) if msg.contains("Unsupported version")
+        Err(DeserializationError::InvalidValue(msg))
+            if msg.contains("Unsupported version")
     );
 }
 
@@ -2116,15 +2144,10 @@ fn locate_single_block_indptr_and_digest_offsets(bytes: &[u8]) -> (usize, usize)
 }
 
 fn compute_single_block_digest_from_decoded_groups(bytes: &[u8]) -> Option<Word> {
-    use crate::chiplets::hasher;
-
     let forest = MastForest::read_from_bytes(bytes).ok()?;
     let block = forest[MastNodeId::new_unchecked(0)].unwrap_basic_block().clone();
 
-    let op_groups: Vec<Felt> =
-        block.op_batches().iter().flat_map(|batch| *batch.groups()).collect();
-
-    Some(hasher::hash_elements(&op_groups))
+    Some(hash_op_batches(block.op_batches()))
 }
 
 /// Test that UntrustedMastForest::validate rejects a non-full batch before the last batch.
@@ -2132,8 +2155,7 @@ fn compute_single_block_digest_from_decoded_groups(bytes: &[u8]) -> Option<Word>
 fn test_untrusted_forest_rejects_non_full_prefix_batch() {
     let op_batches = vec![make_batch(4, Operation::Add), make_batch(2, Operation::Mul)];
 
-    let op_groups: Vec<Felt> = op_batches.iter().flat_map(OpBatch::groups).copied().collect();
-    let digest = hasher::hash_elements(&op_groups);
+    let digest = hash_op_batches(&op_batches);
 
     let mut forest = MastForest::new();
     let block_id = BasicBlockNodeBuilder::from_op_batches(op_batches, digest)
@@ -2153,8 +2175,7 @@ fn test_untrusted_forest_rejects_non_full_prefix_batch() {
 fn test_untrusted_forest_accepts_full_prefix_batch() {
     let op_batches = vec![make_batch(OP_BATCH_SIZE, Operation::Add), make_batch(4, Operation::Mul)];
 
-    let op_groups: Vec<Felt> = op_batches.iter().flat_map(OpBatch::groups).copied().collect();
-    let digest = hasher::hash_elements(&op_groups);
+    let digest = hash_op_batches(&op_batches);
 
     let mut forest = MastForest::new();
     let block_id = BasicBlockNodeBuilder::from_op_batches(op_batches, digest)

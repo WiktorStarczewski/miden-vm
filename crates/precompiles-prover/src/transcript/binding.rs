@@ -49,7 +49,7 @@ pub enum ValueTag {
 /// `(h0, h1, h2, h3, value_tag, ptr, bound_ptr)` binding a node's 4-felt
 /// hash to a typed value.
 ///
-/// - `h` — the node's hash (`Poseidon2(preimage)[0..4]`), the bus key.
+/// - `h` — the node's hash (`Eidos(preimage)[0..4]`), the bus key.
 /// - `value_tag` — the [`ValueTag`] discriminant.
 /// - `ptr` — canonical value handle for value-bindings; `0` for `True`.
 /// - `bound_ptr` — for a `Uint` value, the ptr of the uint storing its modulus `p − 1`; `0` for

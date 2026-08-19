@@ -20,7 +20,6 @@ use miden_processor::{HostLibrary, event::EventHandler};
 use miden_utils_sync::LazyLock;
 
 use crate::handlers::{
-    aead_decrypt::{AEAD_DECRYPT_EVENT_NAME, handle_aead_decrypt},
     debug::default_debug_handlers,
     falcon_div::{FALCON_DIV_EVENT_NAME, handle_falcon_div},
     precompiles::{
@@ -66,9 +65,8 @@ pub const PVM_PROOF_REQUEST_EVENT_NAME: EventName =
 ///
 /// The core library provides several categories of functionality:
 ///
-/// - **Cryptographic primitives**: Poseidon2, Blake3, SHA-256, Falcon signature verification,
-///   authenticated encryption (AEAD decryption), and stable core facades for bundled deferred
-///   precompiles under `::miden::core::*`.
+/// - **Cryptographic primitives**: Eidos, Blake3, SHA-256, Falcon signature verification, and
+///   stable core facades for bundled deferred precompiles under `::miden::core::*`.
 /// - **Mathematical operations**: Division operations for u64, u128, and u256.
 /// - **Data structures**: Sparse Merkle Tree operations, Merkle Mountain Range (MMR), and sorted
 ///   array utilities with lower-bound search capabilities.
@@ -198,7 +196,6 @@ impl CoreLibrary {
             (FALCON_DIV_EVENT_NAME, Arc::new(handle_falcon_div)),
             (LOWERBOUND_ARRAY_EVENT_NAME, Arc::new(handle_lowerbound_array)),
             (LOWERBOUND_KEY_VALUE_EVENT_NAME, Arc::new(handle_lowerbound_key_value)),
-            (AEAD_DECRYPT_EVENT_NAME, Arc::new(handle_aead_decrypt)),
             (KECCAK256_DIGEST_EVENT_NAME, Arc::new(handle_keccak256_digest)),
             (UINT_FIELD_INV_EVENT_NAME, Arc::new(handle_uint_field_inv)),
         ];

@@ -1,7 +1,5 @@
 use miden_core::{Felt, field::PrimeField64};
 
-use crate::constraints::and8_lookup::columns::blakeg_rotation_contribution;
-
 use super::{
     layout::*,
     model::{execute_fused_rounds, initial_working_state, low_output, xof_lanes},
@@ -12,6 +10,7 @@ use super::{
     },
     views::{FooterOverlayRow, FusedGRow, LookupSlot},
 };
+use crate::constraints::and8_lookup::columns::blakeg_rotation_contribution;
 
 fn test_block() -> [u32; 16] {
     [
@@ -149,6 +148,15 @@ fn trace_writer_rejects_noncanonical_multiplicity() {
         test_h(),
         TraceMode::CompressionWithMultiplicity { multiplicity: Felt::ORDER_U64 },
     );
+}
+
+#[test]
+#[should_panic(expected = "packed BlakeG input must be a canonical field element")]
+fn trace_writer_rejects_noncanonical_packed_input() {
+    let mut block = test_block();
+    block[0] = 1;
+    block[1] = u32::MAX;
+    let _ = generate_trace_block(block, test_h(), TraceMode::Compression);
 }
 
 #[test]

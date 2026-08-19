@@ -113,6 +113,7 @@ fn test_all_hash_functions_prove_verify() {
     for (hash_fn, hash_name) in [
         (HashFunction::Blake3_256, "Blake3_256"),
         (HashFunction::Keccak, "Keccak"),
+        (HashFunction::Eidos, "Eidos"),
         (HashFunction::Rpo256, "RPO"),
         (HashFunction::Poseidon2, "Poseidon2"),
         (HashFunction::Rpx256, "RPX"),
@@ -174,7 +175,7 @@ fn test_equal_heights_recursive() {
             push.1 drop
         end
     ";
-    assert_prove_verify(source, HashFunction::Poseidon2, "Poseidon2", false, true);
+    assert_prove_verify(source, HashFunction::Eidos, "Eidos", false, true);
 }
 
 /// Hash-heavy program where chiplets grow beyond the core trace. Regression for per-AIR-height
@@ -185,7 +186,7 @@ fn test_hash_heavy_divergent_heights() {
         begin
             padw padw padw
             repeat.20
-                hperm
+                bcompress
             end
             dropw dropw dropw
         end
@@ -193,20 +194,106 @@ fn test_hash_heavy_divergent_heights() {
     assert_prove_verify(source, HashFunction::Blake3_256, "Blake3", false, false);
 }
 
-/// Exercises the MASM recursive verifier when the Poseidon2 permutation AIR is taller than the
-/// core trace.
+/// Exercises the MASM recursive verifier when the BlakeG compression AIR is taller than the core
+/// trace.
 #[test]
 fn test_hash_heavy_divergent_heights_recursive() {
     let source = "
         begin
             padw padw padw
             repeat.20
-                hperm
+                bcompress
             end
             dropw dropw dropw
         end
     ";
-    assert_prove_verify(source, HashFunction::Poseidon2, "Poseidon2", false, true);
+    assert_prove_verify(source, HashFunction::Eidos, "Eidos", false, true);
+}
+
+/// Regression for phase alignment in the shared bitwise/AEAD stream trace region. The ordinary
+/// `u32and` executes first, but the stream entry must still begin on a period-8 boundary.
+#[test]
+fn test_mixed_u32and_crypto_stream_prove_verify() {
+    let source = "
+        begin
+            push.1 push.1 u32and drop
+            padw push.100 mem_storew_le dropw
+            padw push.104 mem_storew_le dropw
+            push.1 push.0 push.200 push.100 padw
+            crypto_stream
+            dropw dropw
+        end
+    ";
+    assert_prove_verify(source, HashFunction::Eidos, "Eidos", false, false);
+}
+
+/// A precompile request produces deferred material: the outer statement binds a non-TRUE
+/// deferred root and the default prover attaches a STARK-backed deferred proof. The MASM
+/// recursive verifier must consume that non-trivial deferred root end to end.
+#[test]
+fn test_eidos_recursive_verify_with_precompile_requests() {
+    // One keccak256 chunk hashed through the precompile wrapper registers a deferred claim.
+    const IN_PTR: u32 = 128;
+    const OUT_PTR: u32 = 256;
+    const CHUNK_BYTES: u32 = 32;
+
+    let stores = (0..8_u32)
+        .map(|i| format!("push.{} push.{} mem_store", i + 1, IN_PTR + i))
+        .collect::<Vec<_>>()
+        .join("\n            ");
+    let source = format!(
+        "
+        begin
+            {stores}
+            push.{OUT_PTR}
+            push.{CHUNK_BYTES}
+            push.{IN_PTR}
+            exec.::miden::precompiles::hashes::keccak256::hash_1_chunk_mem
+        end
+        "
+    );
+
+    let core_lib = CoreLibrary::default();
+    let mut assembler = Assembler::default();
+    for package in core_lib.packages() {
+        assembler
+            .link_package(package, Linkage::Dynamic)
+            .expect("failed to link core library package");
+    }
+    let program = assembler
+        .assemble_program("program", source.as_str())
+        .expect("failed to assemble keccak precompile fixture")
+        .unwrap_program();
+
+    let stack_inputs = StackInputs::default();
+    let mut host = DefaultHost::default()
+        .with_library(&core_lib)
+        .expect("failed to load core library into the host");
+    let witness = FastProcessor::new_with_options(
+        stack_inputs,
+        AdviceInputs::default(),
+        ExecutionOptions::default(),
+    )
+    .expect("processor initialization failed")
+    .execute_for_proving_sync(&program, &mut host)
+    .expect("execution failed");
+    let stack_outputs = *witness.claim().stack_outputs();
+    let proof = Prover::new()
+        .with_hash_fn(HashFunction::Eidos)
+        .prove_full(witness)
+        .expect("Proving failed");
+
+    // The precompile request left non-trivial deferred material behind.
+    let ExecutionProof::Complete { vm, precompile: Some(_) } = &proof else {
+        panic!("expected a complete proof with STARK-backed precompile material");
+    };
+    assert_ne!(vm.precompile_root, miden_core::deferred::TRUE_DIGEST);
+
+    assert_recursive_verify(program.to_info(), stack_inputs, stack_outputs, &proof);
+
+    let claim = ExecutionClaim::from_program_info(program.into(), stack_inputs, stack_outputs);
+    let outcome = Verifier::new().verify(&claim, &proof).expect("Verification failed");
+    assert!(outcome.is_complete());
 }
 
 // PROVER API LIFECYCLE TESTS
@@ -274,14 +361,28 @@ mod prover_api_lifecycle {
         // `precompiles::register_expr`, and `precompiles::log_deferred` procedures. The processor's
         // built-in registry seeds the constant U256 value nodes used here.
         let source = format!(
-            "begin\n\
+            "const DEFERRED_NODE_DOMAIN = 0x01000501\n\
+             const EIDOS_INIT_CV_0 = 4280581858871862887\n\
+             const EIDOS_INIT_CV_1 = 2688637133034287986\n\
+             const EIDOS_INIT_CV_2 = 1947077364412317696\n\
+             const EIDOS_INIT_CV_3_BASE = 6620516959492505600\n\
+             proc init_deferred_cv\n\
+                 push.EIDOS_INIT_CV_3_BASE add\n\
+                 swap push.EIDOS_INIT_CV_2 add\n\
+                 push.EIDOS_INIT_CV_1.EIDOS_INIT_CV_0\n\
+             end\n\
+             begin\n\
                  push.{}\n\
                  push.{}\n\
                  push.{}\n\
                  movdnw.2\n\
                  adv.register_deferred\n\
-                 hperm\n\
-                 swapw.2 dropw dropw\n\
+                 push.DEFERRED_NODE_DOMAIN push.12 exec.init_deferred_cv\n\
+                 movdnw.2\n\
+                 bcompress\n\
+                 dropw dropw\n\
+                 swapw padw swapw bcompress\n\
+                 dropw dropw\n\
                  padw padw movdnw.2\n\
                  log_deferred\n\
                  dropw dropw dropw\n\

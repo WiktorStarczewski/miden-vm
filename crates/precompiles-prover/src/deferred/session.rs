@@ -13,7 +13,7 @@ use crate::{
     ec::trace::EcPointPtr,
     math::{U256, from_limbs32},
     session::{EcNode, Session, Truthy, UintNode, strategies},
-    transcript::poseidon2::P2Digest,
+    transcript::eidos::EidosDigest,
 };
 
 /// wNAF window for [`translate_ec_msm`](DeferredSessionBuilder::translate_ec_msm)'s joint-wNAF
@@ -45,7 +45,10 @@ pub(crate) enum DeferredSessionError {
     UnsupportedMsm { digest: Digest, reason: &'static str },
 
     #[error("translated root mismatch: expected {expected:?}, got {actual:?}")]
-    RootMismatch { expected: P2Digest, actual: P2Digest },
+    RootMismatch {
+        expected: EidosDigest,
+        actual: EidosDigest,
+    },
 
     #[error("deferred MSM node {digest:?} has no nonzero scalar")]
     UnsupportedMsmAllZeroScalars { digest: Digest },
@@ -62,7 +65,7 @@ pub(crate) fn session_from_deferred_state(
     };
 
     let root = builder.translate_truthy(state.root())?;
-    let expected = P2Digest::from(state.root());
+    let expected = EidosDigest::from(state.root());
     let actual = root.hash();
     if actual != expected {
         return Err(DeferredSessionError::RootMismatch { expected, actual });
@@ -116,7 +119,7 @@ impl<'a> DeferredSessionBuilder<'a> {
             let lhs = self.translate_truthy(lhs)?;
             let rhs = self.translate_truthy(rhs)?;
             let node = self.session.assert_and(lhs, rhs);
-            debug_assert_eq!(node.hash(), P2Digest::from(digest));
+            debug_assert_eq!(node.hash(), EidosDigest::from(digest));
             return Ok(node);
         }
 
@@ -133,7 +136,7 @@ impl<'a> DeferredSessionBuilder<'a> {
                 let lhs = self.translate_uint(lhs)?;
                 let rhs = self.translate_uint(rhs)?;
                 let node = self.session.uint_is(&lhs.node, &rhs.node);
-                debug_assert_eq!(node.hash(), P2Digest::from(digest));
+                debug_assert_eq!(node.hash(), EidosDigest::from(digest));
                 return Ok(node);
             },
             Some(_) => {
@@ -152,7 +155,7 @@ impl<'a> DeferredSessionBuilder<'a> {
                 let lhs = self.translate_ec(lhs)?;
                 let rhs = self.translate_ec(rhs)?;
                 let node = self.session.ec_is(&lhs.node, &rhs.node);
-                debug_assert_eq!(node.hash(), P2Digest::from(digest));
+                debug_assert_eq!(node.hash(), EidosDigest::from(digest));
                 Ok(node)
             },
             Some(_) | None => {
@@ -197,7 +200,7 @@ impl<'a> DeferredSessionBuilder<'a> {
             },
         };
 
-        debug_assert_eq!(node.hash(), P2Digest::from(digest));
+        debug_assert_eq!(node.hash(), EidosDigest::from(digest));
         Ok(TranslatedUint { node, value, domain })
     }
 
@@ -244,7 +247,7 @@ impl<'a> DeferredSessionBuilder<'a> {
             },
         };
 
-        debug_assert_eq!(node.hash(), P2Digest::from(digest));
+        debug_assert_eq!(node.hash(), EidosDigest::from(digest));
         Ok(TranslatedEc { node, curve })
     }
 
@@ -261,7 +264,7 @@ impl<'a> DeferredSessionBuilder<'a> {
         let (actual, claim) = self.session.keccak(&input);
         let actual = actual.to_u32s().into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         debug_assert_eq!(expected, actual);
-        debug_assert_eq!(claim.hash(), P2Digest::from(digest));
+        debug_assert_eq!(claim.hash(), EidosDigest::from(digest));
         Ok(claim)
     }
 

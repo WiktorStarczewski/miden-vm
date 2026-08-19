@@ -11,7 +11,7 @@ use miden_core_lib::{CoreLibrary, dsa::ecdsa_k256_keccak};
 use miden_crypto::{
     SequentialCommit,
     dsa::ecdsa_k256_keccak::{PublicKey, Signature, SigningKey},
-    hash::keccak::Keccak256,
+    hash::{eidos::Eidos, keccak::Keccak256},
 };
 use miden_precompiles::{K1Scalar, SECP256K1_LAMBDA, scalar_mul_mod_n};
 use miden_precompiles_prover::{HashFunction, prove_deferred_state, verify_deferred};
@@ -19,7 +19,6 @@ use miden_processor::{
     DefaultHost, ExecutionError, ExecutionOptions, ExecutionOutput, FastProcessor, StackInputs,
     advice::{AdviceInputs, AdviceStack},
 };
-use miden_utils_testing::crypto::Poseidon2;
 use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 
 use crate::{
@@ -31,7 +30,7 @@ use crate::{
 };
 
 // Core invokes the separately packaged precompile wrappers through dynamic MAST calls.
-const VERIFY_EXPECTED_CYCLES: u64 = 1_587;
+const VERIFY_EXPECTED_CYCLES: u64 = 2_589;
 const VERIFY_EXPECTED_WIRE_BYTES: usize = 2_455;
 const MESSAGE_PTR: u32 = 128;
 
@@ -172,7 +171,7 @@ fn core_ecdsa_k256_keccak_verify_traps_on_wrong_pk_comm() {
 fn core_ecdsa_k256_keccak_verify_traps_on_off_curve_public_key() {
     let mut fixture = valid_fixture();
     fixture.advice[8..16].copy_from_slice(&[Felt::from_u32(0); 8]);
-    fixture.public_key_commitment = Poseidon2::hash_elements(&fixture.advice[..16]);
+    fixture.public_key_commitment = Eidos::hash_elements(&fixture.advice[..16]);
 
     run_verify(&fixture).expect_err("off-curve public key advice must trap");
 }
@@ -183,7 +182,7 @@ fn core_ecdsa_k256_keccak_verify_traps_on_non_u32_limb() {
 
     let mut pubkey_fixture = valid_fixture();
     pubkey_fixture.advice[0] = non_u32;
-    pubkey_fixture.public_key_commitment = Poseidon2::hash_elements(&pubkey_fixture.advice[..16]);
+    pubkey_fixture.public_key_commitment = Eidos::hash_elements(&pubkey_fixture.advice[..16]);
     run_verify(&pubkey_fixture).expect_err("non-u32 public-key limb must trap");
 
     let mut r_fixture = valid_fixture();

@@ -11,7 +11,7 @@ mod signing_key {
 
     use crate::{
         dsa::ecdsa_k256_keccak::{PublicKey, Signature, SigningKey},
-        hash::poseidon2::Poseidon2,
+        hash::eidos::Eidos,
         rand::test_utils::seeded_rng,
     };
 
@@ -253,14 +253,14 @@ mod signing_key {
             Felt::new_unchecked(0x483ada77),
         ];
         const COMMITMENT: Word = Word::new([
-            Felt::new_unchecked(11823917948314246078),
-            Felt::new_unchecked(15960174880805474786),
-            Felt::new_unchecked(15208912687411787098),
-            Felt::new_unchecked(1636772189670681504),
+            Felt::new_unchecked(978726711400728090),
+            Felt::new_unchecked(7713459834786525445),
+            Felt::new_unchecked(4281610356263577956),
+            Felt::new_unchecked(6969970642614717957),
         ]);
 
         assert_eq!(public_key.to_bytes(), COMPRESSED_SEC1);
-        assert_eq!(public_key.to_commitment(), Poseidon2::hash_elements(&NATIVE_ELEMENTS));
+        assert_eq!(public_key.to_commitment(), Eidos::hash_elements(&NATIVE_ELEMENTS));
         assert_eq!(public_key.to_commitment(), COMMITMENT);
     }
 

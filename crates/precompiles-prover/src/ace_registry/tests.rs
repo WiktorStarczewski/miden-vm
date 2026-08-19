@@ -19,18 +19,28 @@ fn external_assertion_matches_the_protocol_version() {
         QuadFelt::new([Felt::from(3u32), Felt::from(5u32)]),
         QuadFelt::new([Felt::from(7u32), Felt::from(11u32)]),
     ];
-    let aux_values: [[QuadFelt; 1]; NUM_CHIPLETS] = core::array::from_fn(|i| {
-        [QuadFelt::new([Felt::from((i + 1) as u32), Felt::from((2 * i + 1) as u32)])]
-    });
-    let aux_refs: Vec<&[QuadFelt]> = aux_values.iter().map(<[QuadFelt; 1]>::as_slice).collect();
+    let aux_values: Vec<Vec<QuadFelt>> = (0..NUM_CHIPLETS)
+        .map(|i| {
+            let count = if matches!(i, 1 | 3) { 2 } else { 1 };
+            (0..count)
+                .map(|j| {
+                    QuadFelt::new([
+                        Felt::from((i + j + 1) as u32),
+                        Felt::from((2 * i + j + 1) as u32),
+                    ])
+                })
+                .collect()
+        })
+        .collect();
+    let aux_refs: Vec<&[QuadFelt]> = aux_values.iter().map(Vec::as_slice).collect();
 
     let actual = ChipletMultiAir::new()
-        .eval_external(&challenges, &[], &[], &aux_refs, &[])
+        .eval_external(&challenges, &[], &[], &aux_refs, &[0; NUM_CHIPLETS])
         .expect("fixture denominators are non-zero");
     let expected = match PVM_PROTOCOL_ID {
-        1 => QuadFelt::new([
-            Felt::new_unchecked(17_120_654_257_594_545_925),
-            Felt::new_unchecked(12_713_559_468_620_802_518),
+        2 => QuadFelt::new([
+            Felt::new_unchecked(17_120_654_257_594_545_933),
+            Felt::new_unchecked(12_713_559_468_620_802_530),
         ]),
         version => panic!("add an external-assertion vector for protocol version {version}"),
     };
@@ -141,7 +151,7 @@ fn padding_subtrees_share_one_vector() {
 /// counterpart of the Miden VM's segment test in air/tests/ace_codegen.rs.
 #[test]
 fn assembled_segments_match_from_scratch_hashing_for_structured_orders() {
-    use miden_core::crypto::hash::Poseidon2;
+    use miden_core::crypto::hash::Eidos;
 
     let factory = factory();
     let canonical: Vec<usize> = (0..NUM_CHIPLETS).collect();
@@ -154,12 +164,12 @@ fn assembled_segments_match_from_scratch_hashing_for_structured_orders() {
         let instructions = circuit.encoded.instructions();
         let (prefix, common) = instructions.split_at(circuit.shuffle_prefix_len);
         assert_eq!(
-            Poseidon2::hash_elements(prefix),
+            Eidos::hash_elements(prefix),
             circuit.shuffle_commitment,
             "resumed prefix digest diverges from from-scratch hashing for {order:?}"
         );
         assert_eq!(
-            Poseidon2::hash_elements(common),
+            Eidos::hash_elements(common),
             circuit.common_commitment,
             "cached common digest diverges from from-scratch hashing for {order:?}"
         );

@@ -1,11 +1,11 @@
 //! Snapshot schema for the VM-side synthetic benchmark.
 //!
 //! A producer JSON file (e.g. `bench-tx.json` from `protocol/bin/bench-transaction/`) maps
-//! scenario keys to entries; only the `trace` section of each entry is consumed.
+//! scenario keys to entries. Each entry supplies provenance metadata and a `trace` section.
 //!
 //! `trace` carries the AIR-side row totals used by the verifier (`core_rows`, `chiplets_rows`,
-//! `poseidon2_permutation_rows`, `range_rows`). `shape` (nested under `trace`) is an advisory
-//! per-chiplet breakdown used by the solver. The loader checks
+//! `blakeg_compression_rows`, `byte_pair_lookup_rows`). `shape` (nested under `trace`) is an
+//! advisory per-chiplet breakdown used by the solver. The loader checks
 //! `trace.chiplets_rows == shape.chiplets_sum()`.
 
 use std::{collections::BTreeMap, path::Path};
@@ -16,8 +16,8 @@ use serde::Deserialize;
 /// length changes.
 const MIN_TRACE_LEN: u64 = 64;
 
-/// One Poseidon2 permutation cycle occupies 16 rows.
-const POSEIDON2_CYCLE_LEN: u64 = 16;
+/// One BlakeG compression cycle occupies 32 rows.
+const BLAKEG_COMPRESSION_CYCLE_LEN: u64 = 32;
 
 /// A single scenario's trace snapshot, extracted from a producer JSON file.
 ///
@@ -28,10 +28,39 @@ const POSEIDON2_CYCLE_LEN: u64 = 16;
 /// layouts at deserialization time.
 #[derive(Debug, Clone)]
 pub struct TraceSnapshot {
+    /// Whether the row counts came from an Eidos-capable producer or from a documented provisional
+    /// conversion of an older snapshot.
+    pub provenance: SnapshotProvenance,
     /// Hard-target totals. The verifier's bracket check operates on these.
     pub trace: TraceTotals,
     /// Advisory per-chiplet breakdown used by the solver for shaping.
     pub shape: TraceBreakdown,
+}
+
+/// Origin of a snapshot's trace-row counts.
+///
+/// Missing provenance defaults to `ProducerMeasured` for compatibility with producer-generated
+/// snapshots that predate this field. Derived snapshots must opt into the provisional marker
+/// explicitly so benchmark output cannot present them as measurements.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotProvenance {
+    #[default]
+    ProducerMeasured,
+    DerivedPendingProducerPort,
+}
+
+impl SnapshotProvenance {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ProducerMeasured => "producer_measured",
+            Self::DerivedPendingProducerPort => "derived_pending_producer_port",
+        }
+    }
+
+    pub fn is_provisional(self) -> bool {
+        self == Self::DerivedPendingProducerPort
+    }
 }
 
 /// Hard-target aggregates -- the verifier's primary contract.
@@ -42,12 +71,12 @@ pub struct TraceTotals {
     /// Total chiplets trace length, matching `ChipletsLengths::trace_len` in the processor (sum of
     /// per-chiplet lengths + 1 mandatory padding row).
     pub chiplets_rows: u64,
-    /// Poseidon2 permutation AIR trace length. Snapshots without a per-AIR Poseidon2 target use
-    /// zero.
-    pub poseidon2_permutation_rows: u64,
-    /// Range-checker trace length. Derived from memory + bitwise activity; not independently
-    /// targeted but tracked so the verifier can warn if it ever dominates.
-    pub range_rows: u64,
+    /// BlakeG compression AIR trace length. Legacy snapshots without a separate native-hash AIR
+    /// target use zero.
+    pub blakeg_compression_rows: u64,
+    /// Fixed And8 byte-pair lookup AIR height. Historical snapshots may supply the former
+    /// `range_rows` field; the loader accepts it as a bracket-only compatibility alias.
+    pub byte_pair_lookup_rows: u64,
 }
 
 /// Per-chiplet row counts. Advisory only -- the solver uses these to size individual snippets so
@@ -74,10 +103,14 @@ pub struct TraceShape {
 }
 
 impl TraceTotals {
-    /// Padded power-of-two bracket for core/range rows:
-    /// `next_pow2(max(core_rows, range_rows))`.
-    pub fn padded_core_side(&self) -> u64 {
-        self.core_rows.max(self.range_rows).next_power_of_two().max(MIN_TRACE_LEN)
+    /// Padded power-of-two bracket for the core AIR.
+    pub fn padded_core(&self) -> u64 {
+        self.core_rows.next_power_of_two().max(MIN_TRACE_LEN)
+    }
+
+    /// Padded power-of-two bracket for the fixed And8 byte-pair lookup AIR.
+    pub fn padded_and8_lookup(&self) -> u64 {
+        self.byte_pair_lookup_rows.next_power_of_two().max(MIN_TRACE_LEN)
     }
 
     /// Padded power-of-two bracket for the chiplets side of the trace.
@@ -85,33 +118,25 @@ impl TraceTotals {
         self.chiplets_rows.next_power_of_two().max(MIN_TRACE_LEN)
     }
 
-    /// Padded power-of-two bracket for the Poseidon2 permutation trace.
-    pub fn padded_poseidon2_permutation(&self) -> u64 {
-        self.poseidon2_permutation_rows.next_power_of_two().max(MIN_TRACE_LEN)
+    /// Padded power-of-two bracket for the BlakeG compression trace.
+    pub fn padded_blakeg_compression(&self) -> u64 {
+        self.blakeg_compression_rows.next_power_of_two().max(MIN_TRACE_LEN)
     }
 
-    /// True when the snapshot contains a per-AIR Poseidon2 row target.
-    pub fn has_poseidon2_permutation_target(&self) -> bool {
-        self.poseidon2_permutation_rows > 0
+    /// True when the snapshot contains a per-AIR BlakeG compression target.
+    pub fn has_blakeg_compression_target(&self) -> bool {
+        self.blakeg_compression_rows > 0
     }
 
-    /// Single global padded length as reported by the processor's
-    /// `TraceLenSummary::padded_trace_len`. Used by the calibrator to cross-check our derived
-    /// formulas against the prover.
+    /// Maximum physical AIR height. Used by the calibrator to cross-check the benchmark formulas
+    /// against the processor's authoritative per-AIR heights.
     pub fn padded_total(&self) -> u64 {
         self.core_rows
-            .max(self.range_rows)
+            .max(self.byte_pair_lookup_rows)
             .max(self.chiplets_rows)
-            .max(self.poseidon2_permutation_rows)
+            .max(self.blakeg_compression_rows)
             .next_power_of_two()
             .max(MIN_TRACE_LEN)
-    }
-
-    /// True iff `range_rows` is the largest unpadded component.
-    pub fn range_dominates(&self) -> bool {
-        self.range_rows > self.core_rows
-            && self.range_rows > self.chiplets_rows
-            && self.range_rows > self.poseidon2_permutation_rows
     }
 }
 
@@ -145,11 +170,11 @@ impl TraceShape {
         Self { totals, breakdown }
     }
 
-    /// Logical hasher-work rows used by the solver. When a Poseidon2 row target is present, use it;
-    /// otherwise use the chiplets hasher row count.
+    /// Logical hasher-work rows used by the solver. When a BlakeG AIR target is present, use it;
+    /// otherwise use the legacy in-chiplets hasher row count.
     pub fn hasher_work_rows(&self) -> u64 {
-        if self.totals.poseidon2_permutation_rows > 0 {
-            self.totals.poseidon2_permutation_rows
+        if self.totals.blakeg_compression_rows > 0 {
+            self.totals.blakeg_compression_rows
         } else {
             self.breakdown.hasher_rows
         }
@@ -172,18 +197,9 @@ impl TraceSnapshot {
             let trace = TraceTotals {
                 core_rows: entry.trace.core_rows,
                 chiplets_rows: entry.trace.chiplets_rows,
-                poseidon2_permutation_rows: entry.trace.poseidon2_permutation_rows,
-                range_rows: entry.trace.range_rows,
+                blakeg_compression_rows: entry.trace.blakeg_compression_rows.unwrap_or(0),
+                byte_pair_lookup_rows: entry.trace.byte_pair_lookup_rows,
             };
-            if trace.poseidon2_permutation_rows > 0
-                && !trace.poseidon2_permutation_rows.is_multiple_of(POSEIDON2_CYCLE_LEN)
-            {
-                return Err(SnapshotError::InvalidPoseidon2Rows {
-                    scenario: key,
-                    rows: trace.poseidon2_permutation_rows,
-                    cycle_len: POSEIDON2_CYCLE_LEN,
-                });
-            }
             let shape = entry.trace.chiplets_shape;
             let expected = shape.chiplets_sum();
             if trace.chiplets_rows != expected {
@@ -193,7 +209,23 @@ impl TraceSnapshot {
                     from_shape: expected,
                 });
             }
-            out.push((key, TraceSnapshot { trace, shape }));
+            if trace.blakeg_compression_rows > 0
+                && !trace.blakeg_compression_rows.is_multiple_of(BLAKEG_COMPRESSION_CYCLE_LEN)
+            {
+                return Err(SnapshotError::InvalidBlakeGRows {
+                    scenario: key,
+                    rows: trace.blakeg_compression_rows,
+                    cycle_len: BLAKEG_COMPRESSION_CYCLE_LEN,
+                });
+            }
+            out.push((
+                key,
+                TraceSnapshot {
+                    provenance: entry.provenance,
+                    trace,
+                    shape,
+                },
+            ));
         }
         Ok(out)
     }
@@ -205,9 +237,12 @@ impl TraceSnapshot {
 }
 
 /// Each scenario entry in a producer JSON. The producer also writes cycle counts at the top level
-/// (`prologue`, `epilogue`, ...), but the consumer ignores everything except `trace`.
+/// (`prologue`, `epilogue`, ...), but the consumer ignores everything except provenance and
+/// `trace`.
 #[derive(Deserialize)]
 struct RawScenarioEntry {
+    #[serde(default)]
+    provenance: SnapshotProvenance,
     trace: RawTrace,
 }
 
@@ -216,8 +251,9 @@ struct RawTrace {
     core_rows: u64,
     chiplets_rows: u64,
     #[serde(default)]
-    poseidon2_permutation_rows: u64,
-    range_rows: u64,
+    blakeg_compression_rows: Option<u64>,
+    #[serde(alias = "range_rows")]
+    byte_pair_lookup_rows: u64,
     chiplets_shape: TraceBreakdown,
 }
 
@@ -240,9 +276,9 @@ pub enum SnapshotError {
         from_shape: u64,
     },
     #[error(
-        "snapshot inconsistency in scenario {scenario:?}: poseidon2_permutation_rows = {rows} is not a multiple of {cycle_len}"
+        "snapshot inconsistency in scenario {scenario:?}: blakeg_compression_rows = {rows} is not a multiple of {cycle_len}"
     )]
-    InvalidPoseidon2Rows {
+    InvalidBlakeGRows {
         scenario: String,
         rows: u64,
         cycle_len: u64,
@@ -253,63 +289,74 @@ pub enum SnapshotError {
 mod tests {
     use super::*;
 
-    /// Expected padded brackets for each committed scenario. Keyed by `(producer_stem,
-    /// scenario_key)` since each producer file holds many scenarios. A mismatch means refresh
-    /// the snapshot from the producer before updating these numbers.
-    ///
-    /// Mirrors `COMMITTED_SCENARIO_EXPECTATIONS` in `protocol/bin/bench-transaction/`'s test
-    /// module; refresh both together when a kernel change moves a bracket.
-    struct CommittedScenarioExpectation {
+    /// Provisional padded brackets for each checked-in derived scenario. Keyed by
+    /// `(producer_stem, scenario_key)` since each file holds many scenarios. Replace this table
+    /// when an Eidos-capable producer supplies measured row counts.
+    struct ProvisionalScenarioExpectation {
         producer_stem: &'static str,
         scenario_key: &'static str,
-        padded_core_side: u64,
+        padded_core: u64,
+        padded_and8: u64,
         padded_chiplets: u64,
+        padded_blakeg: u64,
     }
 
-    const COMMITTED_SCENARIO_EXPECTATIONS: &[CommittedScenarioExpectation] = &[
-        CommittedScenarioExpectation {
+    const PROVISIONAL_SCENARIO_EXPECTATIONS: &[ProvisionalScenarioExpectation] = &[
+        ProvisionalScenarioExpectation {
             producer_stem: "bench-tx",
             scenario_key: "consume single P2ID note",
-            padded_core_side: 131_072,
-            padded_chiplets: 131_072,
+            padded_core: 131_072,
+            padded_and8: 65_536,
+            padded_chiplets: 8_192,
+            padded_blakeg: 131_072,
         },
-        CommittedScenarioExpectation {
+        ProvisionalScenarioExpectation {
             producer_stem: "bench-tx",
             scenario_key: "consume two P2ID notes",
-            padded_core_side: 131_072,
-            padded_chiplets: 262_144,
+            padded_core: 131_072,
+            padded_and8: 65_536,
+            padded_chiplets: 8_192,
+            padded_blakeg: 262_144,
         },
-        CommittedScenarioExpectation {
+        ProvisionalScenarioExpectation {
             producer_stem: "bench-tx",
             scenario_key: "create single P2ID note",
-            padded_core_side: 131_072,
-            padded_chiplets: 131_072,
+            padded_core: 131_072,
+            padded_and8: 65_536,
+            padded_chiplets: 8_192,
+            padded_blakeg: 131_072,
         },
-        CommittedScenarioExpectation {
+        ProvisionalScenarioExpectation {
             producer_stem: "bench-tx",
             scenario_key: "consume CLAIM note (L1 to Miden)",
-            padded_core_side: 65_536,
-            padded_chiplets: 262_144,
+            padded_core: 65_536,
+            padded_and8: 65_536,
+            padded_chiplets: 16_384,
+            padded_blakeg: 262_144,
         },
-        CommittedScenarioExpectation {
+        ProvisionalScenarioExpectation {
             producer_stem: "bench-tx",
             scenario_key: "consume CLAIM note (L2 to Miden)",
-            padded_core_side: 65_536,
-            padded_chiplets: 262_144,
+            padded_core: 65_536,
+            padded_and8: 65_536,
+            padded_chiplets: 16_384,
+            padded_blakeg: 262_144,
         },
-        CommittedScenarioExpectation {
+        ProvisionalScenarioExpectation {
             producer_stem: "bench-tx",
             scenario_key: "consume B2AGG note (bridge-out)",
-            padded_core_side: 262_144,
-            padded_chiplets: 1_048_576,
+            padded_core: 262_144,
+            padded_and8: 65_536,
+            padded_chiplets: 65_536,
+            padded_blakeg: 1_048_576,
         },
     ];
 
     fn expectation_for(
         producer_stem: &str,
         scenario_key: &str,
-    ) -> Option<&'static CommittedScenarioExpectation> {
-        COMMITTED_SCENARIO_EXPECTATIONS.iter().find(|expected| {
+    ) -> Option<&'static ProvisionalScenarioExpectation> {
+        PROVISIONAL_SCENARIO_EXPECTATIONS.iter().find(|expected| {
             expected.producer_stem == producer_stem && expected.scenario_key == scenario_key
         })
     }
@@ -325,8 +372,8 @@ mod tests {
         let totals = TraceTotals {
             core_rows: 1000,
             chiplets_rows: breakdown.chiplets_sum(),
-            poseidon2_permutation_rows: 300,
-            range_rows: 100,
+            blakeg_compression_rows: 300,
+            byte_pair_lookup_rows: 100,
         };
         (totals, breakdown)
     }
@@ -345,12 +392,13 @@ mod tests {
         let (t, _) = sample_shape();
         // max(1000, 100, 651, 300) = 1000 -> next pow2 = 1024
         assert_eq!(t.padded_total(), 1024);
-        // core + range: max(1000, 100) = 1000 → 1024
-        assert_eq!(t.padded_core_side(), 1024);
+        // Core: 1000 → 1024. Fixed byte-pair lookup: 100 → 128.
+        assert_eq!(t.padded_core(), 1024);
+        assert_eq!(t.padded_and8_lookup(), 128);
         // chiplets alone: 651 → 1024
         assert_eq!(t.padded_chiplets(), 1024);
-        // Poseidon2 alone: 300 -> 512
-        assert_eq!(t.padded_poseidon2_permutation(), 512);
+        // BlakeG alone: 300 -> 512
+        assert_eq!(t.padded_blakeg_compression(), 512);
     }
 
     #[test]
@@ -358,30 +406,13 @@ mod tests {
         let totals = TraceTotals {
             core_rows: 1,
             chiplets_rows: 1,
-            poseidon2_permutation_rows: 0,
-            range_rows: 0,
+            blakeg_compression_rows: 0,
+            byte_pair_lookup_rows: 0,
         };
         assert_eq!(totals.padded_total(), MIN_TRACE_LEN);
-        assert_eq!(totals.padded_core_side(), MIN_TRACE_LEN);
+        assert_eq!(totals.padded_core(), MIN_TRACE_LEN);
+        assert_eq!(totals.padded_and8_lookup(), MIN_TRACE_LEN);
         assert_eq!(totals.padded_chiplets(), MIN_TRACE_LEN);
-    }
-
-    #[test]
-    fn range_dominates_is_detected() {
-        let totals = TraceTotals {
-            core_rows: 100,
-            chiplets_rows: 200,
-            poseidon2_permutation_rows: 300,
-            range_rows: 500,
-        };
-        assert!(totals.range_dominates());
-        let totals = TraceTotals {
-            core_rows: 500,
-            chiplets_rows: 200,
-            poseidon2_permutation_rows: 300,
-            range_rows: 100,
-        };
-        assert!(!totals.range_dominates());
     }
 
     #[test]
@@ -407,6 +438,12 @@ mod tests {
                 .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
             assert!(!scenarios.is_empty(), "{} contained no scenarios", path.display());
             for (key, snap) in &scenarios {
+                assert_eq!(
+                    snap.provenance,
+                    SnapshotProvenance::DerivedPendingProducerPort,
+                    "{producer_stem}/{key}: checked-in snapshot must remain visibly provisional \
+                     until replaced by an Eidos-capable producer measurement",
+                );
                 assert!(snap.trace.core_rows > 0, "{key}: core_rows must be > 0");
                 assert!(snap.trace.chiplets_rows > 0, "{key}: chiplets_rows must be > 0");
                 assert_eq!(
@@ -418,16 +455,36 @@ mod tests {
                 match expectation_for(&producer_stem, key) {
                     Some(expected) => {
                         assert_eq!(
-                            snap.trace.padded_core_side(),
-                            expected.padded_core_side,
-                            "{producer_stem}/{key}: padded_core_side does not match expectation; \
-                             refresh the snapshot and update COMMITTED_SCENARIO_EXPECTATIONS",
+                            snap.trace.padded_core(),
+                            expected.padded_core,
+                            "{producer_stem}/{key}: padded_core does not match expectation; \
+                             replace the provisional snapshot or update \
+                             PROVISIONAL_SCENARIO_EXPECTATIONS",
+                        );
+                        assert_eq!(
+                            snap.trace.padded_and8_lookup(),
+                            expected.padded_and8,
+                            "{producer_stem}/{key}: padded_and8 does not match expectation; \
+                             replace the provisional snapshot or update \
+                             PROVISIONAL_SCENARIO_EXPECTATIONS",
                         );
                         assert_eq!(
                             snap.trace.padded_chiplets(),
                             expected.padded_chiplets,
                             "{producer_stem}/{key}: padded_chiplets does not match expectation; \
-                             refresh the snapshot and update COMMITTED_SCENARIO_EXPECTATIONS",
+                             replace the provisional snapshot or update \
+                             PROVISIONAL_SCENARIO_EXPECTATIONS",
+                        );
+                        assert_eq!(
+                            snap.trace.padded_blakeg_compression(),
+                            expected.padded_blakeg,
+                            "{producer_stem}/{key}: padded_blakeg does not match expectation; \
+                             replace the provisional snapshot or update \
+                             PROVISIONAL_SCENARIO_EXPECTATIONS",
+                        );
+                        assert_eq!(
+                            snap.trace.byte_pair_lookup_rows, 65_536,
+                            "{producer_stem}/{key}: fixed And8 table must contain 65,536 rows",
                         );
                         discovered.insert((producer_stem.clone(), key.clone()));
                     },
@@ -438,14 +495,14 @@ mod tests {
             }
         }
 
-        let expected: BTreeSet<(String, String)> = COMMITTED_SCENARIO_EXPECTATIONS
+        let expected: BTreeSet<(String, String)> = PROVISIONAL_SCENARIO_EXPECTATIONS
             .iter()
             .map(|e| (e.producer_stem.to_string(), e.scenario_key.to_string()))
             .collect();
         let missing: BTreeSet<_> = expected.difference(&discovered).cloned().collect();
         assert!(
             unexpected.is_empty() && missing.is_empty(),
-            "committed scenarios drifted from COMMITTED_SCENARIO_EXPECTATIONS in snapshot.rs:\n  \
+            "checked-in scenarios drifted from PROVISIONAL_SCENARIO_EXPECTATIONS in snapshot.rs:\n  \
              unexpected (in snapshots/ but not in the table -- add an entry): {unexpected:?}\n  \
              missing    (in the table but not in any snapshots/*.json -- refresh the snapshot or remove the entry): {missing:?}",
         );
@@ -457,9 +514,9 @@ mod tests {
             "consume single P2ID note": {
                 "trace": {
                     "core_rows": 100,
-                    "chiplets_rows": 11,
-                    "range_rows": 50,
-                    "chiplets_shape": { "hasher_rows": 10, "bitwise_rows": 0, "memory_rows": 0 }
+                    "chiplets_rows": 33,
+                    "byte_pair_lookup_rows": 50,
+                    "chiplets_shape": { "hasher_rows": 32, "bitwise_rows": 0, "memory_rows": 0 }
                 }
             }
         }"#;
@@ -470,6 +527,30 @@ mod tests {
         let (_, snap) = &scenarios[0];
         assert_eq!(snap.shape.kernel_rom_rows, 0);
         assert_eq!(snap.shape.ace_rows, 0);
+        assert_eq!(snap.trace.blakeg_compression_rows, 0);
+        assert_eq!(snap.provenance, SnapshotProvenance::ProducerMeasured);
+    }
+
+    #[test]
+    fn loads_explicit_provisional_provenance() {
+        let provisional = r#"{
+            "derived": {
+                "provenance": "derived_pending_producer_port",
+                "trace": {
+                    "core_rows": 100,
+                    "chiplets_rows": 33,
+                    "blakeg_compression_rows": 64,
+                    "byte_pair_lookup_rows": 65536,
+                    "chiplets_shape": { "hasher_rows": 32, "bitwise_rows": 0, "memory_rows": 0 }
+                }
+            }
+        }"#;
+        let tmp = std::env::temp_dir().join("synthetic-bench-provenance.json");
+        std::fs::write(&tmp, provisional).unwrap();
+        let scenarios = TraceSnapshot::load_all(&tmp).expect("load provisional snapshot");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(scenarios[0].1.provenance, SnapshotProvenance::DerivedPendingProducerPort);
+        assert!(scenarios[0].1.provenance.is_provisional());
     }
 
     #[test]
@@ -480,7 +561,7 @@ mod tests {
                 "trace": {
                     "core_rows": 100,
                     "chiplets_rows": 500,
-                    "range_rows": 0,
+                    "byte_pair_lookup_rows": 0,
                     "chiplets_shape": { "hasher_rows": 10, "bitwise_rows": 0, "memory_rows": 0 }
                 }
             }
@@ -493,23 +574,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_misaligned_poseidon2_rows() {
+    fn rejects_misaligned_blakeg_rows() {
         let misaligned = r#"{
             "broken": {
                 "trace": {
                     "core_rows": 100,
                     "chiplets_rows": 11,
-                    "poseidon2_permutation_rows": 17,
-                    "range_rows": 0,
+                    "blakeg_compression_rows": 17,
+                    "byte_pair_lookup_rows": 0,
                     "chiplets_shape": { "hasher_rows": 10, "bitwise_rows": 0, "memory_rows": 0 }
                 }
             }
         }"#;
-        let tmp = std::env::temp_dir().join("synthetic-bench-poseidon2-misaligned.json");
+        let tmp = std::env::temp_dir().join("synthetic-bench-blakeg-misaligned.json");
         std::fs::write(&tmp, misaligned).unwrap();
-        let err = TraceSnapshot::load_all(&tmp).expect_err("expected Poseidon2 row rejection");
+        let err = TraceSnapshot::load_all(&tmp).expect_err("expected BlakeG row rejection");
         let _ = std::fs::remove_file(&tmp);
-        assert!(matches!(err, SnapshotError::InvalidPoseidon2Rows { rows: 17, .. }));
+        assert!(matches!(err, SnapshotError::InvalidBlakeGRows { rows: 17, .. }));
     }
 
     #[test]
@@ -523,10 +604,11 @@ mod tests {
                 "epilogue": { "total": 72351 },
                 "trace": {
                     "core_rows": 77699,
-                    "chiplets_rows": 123129,
-                    "range_rows": 20203,
+                    "chiplets_rows": 6538,
+                    "blakeg_compression_rows": 120352,
+                    "byte_pair_lookup_rows": 65536,
                     "chiplets_shape": {
-                        "hasher_rows": 120352,
+                        "hasher_rows": 3761,
                         "bitwise_rows": 416,
                         "memory_rows": 2297,
                         "kernel_rom_rows": 63,
@@ -543,6 +625,7 @@ mod tests {
         let (key, snap) = &scenarios[0];
         assert_eq!(key, "consume single P2ID note");
         assert_eq!(snap.trace.core_rows, 77_699);
-        assert_eq!(snap.shape.hasher_rows, 120_352);
+        assert_eq!(snap.shape.hasher_rows, 3_761);
+        assert_eq!(snap.trace.blakeg_compression_rows, 120_352);
     }
 }

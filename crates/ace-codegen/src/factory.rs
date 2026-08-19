@@ -11,28 +11,20 @@
 //! The registry leaf of an ordering is `merge(H(constants | shuffle), H(common))` over
 //! the two `adv_pipe`-aligned stream segments.
 
-use miden_core::{Felt, Word, crypto::hash::Poseidon2};
+use miden_core::{Felt, Word, crypto::hash::Eidos};
 use miden_crypto::{
-    field::{ExtensionField, Field},
-    hash::poseidon2::Poseidon2Permutation256,
-    stark::symmetric::Permutation,
+    field::ExtensionField,
+    hash::eidos::{PACKED_LANES, PackedBlock, PackedDigest, RATE},
 };
-use miden_field::{PackedValue, PrimeCharacteristicRing};
 
 use crate::{
     AceError, EXT_DEGREE, encode::EncodedCircuit, factored::ShuffleEncodeBuffer,
     pipeline::FactoredMultiAirCircuit,
 };
 
-/// Poseidon2 sponge rate in base-field elements.
-const RATE_WIDTH: usize = Poseidon2::RATE_RANGE.end - Poseidon2::RATE_RANGE.start;
-
-/// Packed base-field element of the platform's SIMD backend.
-type PackedFelt = <Felt as Field>::Packing;
-
 /// Number of proof orders [`FactoredCircuitFactory::leaves_for_orders`] hashes per
-/// packed Poseidon2 permutation (1 on backends without a packed implementation).
-pub const LEAF_LANES: usize = <PackedFelt as PackedValue>::WIDTH;
+/// packed Eidos compression.
+pub const LEAF_LANES: usize = PACKED_LANES;
 
 /// Reusable scratch for [`FactoredCircuitFactory::leaves_for_orders`].
 #[derive(Default)]
@@ -55,9 +47,9 @@ pub struct FactoredEncodedCircuit {
     pub encoded: EncodedCircuit,
     /// Length in felts of the per-order stream prefix (constants + shuffle section).
     pub shuffle_prefix_len: usize,
-    /// Poseidon2 digest of the per-order prefix.
+    /// Eidos digest of the per-order prefix.
     pub shuffle_commitment: Word,
-    /// Poseidon2 digest of the order-invariant common section.
+    /// Eidos digest of the order-invariant common section.
     pub common_commitment: Word,
     /// Registry leaf and advice-map key: `merge(shuffle_commitment, common_commitment)`.
     pub commitment: Word,
@@ -69,11 +61,11 @@ pub struct FactoredCircuitFactory<EF> {
     /// Sponge state after absorbing the constants section.
     ///
     /// The constants section is byte-identical for every proof order and a whole number
-    /// of rate blocks, and the sponge's length binding depends only on `total_len %
-    /// RATE_WIDTH` (identical across orders because all stream sections are
-    /// rate-aligned), so hashing a per-order prefix may resume from this state and
+    /// of Eidos blocks. Every order has the same prefix length, so the length-bound Eidos
+    /// chaining word is initialized for that complete prefix before the constants are
+    /// absorbed. Hashing a per-order prefix can therefore resume from this state and
     /// absorb only the shuffle section.
-    constants_state: [Felt; Poseidon2::STATE_WIDTH],
+    constants_state: Word,
     /// Felt length of the constants section absorbed into `constants_state`.
     const_felts: usize,
     /// Digest of the order-invariant common section, computed once.
@@ -99,8 +91,8 @@ where
         let instructions = encoded.instructions();
         let const_felts = encoded.num_constants() * EXT_DEGREE;
         let prefix_len = const_felts + factored.num_shuffle_ops();
-        if !const_felts.is_multiple_of(RATE_WIDTH)
-            || !prefix_len.is_multiple_of(RATE_WIDTH)
+        if !const_felts.is_multiple_of(RATE)
+            || !prefix_len.is_multiple_of(RATE)
             || prefix_len >= instructions.len()
         {
             return Err(AceError::InvalidInputLayout {
@@ -108,9 +100,13 @@ where
             });
         }
 
-        let mut constants_state = [<Felt as PrimeCharacteristicRing>::ZERO; Poseidon2::STATE_WIDTH];
+        let prefix_len_u32 =
+            u32::try_from(prefix_len).map_err(|_| AceError::InvalidInputLayout {
+                message: "ACE stream prefix length must fit in Eidos's u32 length binding".into(),
+            })?;
+        let mut constants_state = Eidos::init_chaining_word(0, prefix_len_u32);
         absorb_rate_blocks(&mut constants_state, &instructions[..const_felts]);
-        let common_commitment = Poseidon2::hash_elements(&instructions[prefix_len..]);
+        let common_commitment = Eidos::hash_elements(&instructions[prefix_len..]);
 
         let mut buffer = ShuffleEncodeBuffer::new();
         let fast = factored.encode_shuffle_section_for_order(&canonical, &mut buffer)?;
@@ -121,9 +117,7 @@ where
         }
         let mut resumed = constants_state;
         absorb_rate_blocks(&mut resumed, fast);
-        let resumed_prefix =
-            Word::new(resumed[Poseidon2::RATE0_RANGE].try_into().expect("digest is one word"));
-        if resumed_prefix != Poseidon2::hash_elements(&instructions[..prefix_len]) {
+        if resumed != Eidos::hash_elements(&instructions[..prefix_len]) {
             return Err(AceError::InvalidInputLayout {
                 message: "resumed prefix hash diverges from hashing the full prefix".into(),
             });
@@ -163,13 +157,12 @@ where
         let shuffle = self.factored.encode_shuffle_section_for_order(proof_order, buffer)?;
         let mut state = self.constants_state;
         absorb_rate_blocks(&mut state, shuffle);
-        let shuffle_commitment =
-            Word::new(state[Poseidon2::RATE0_RANGE].try_into().expect("digest is one word"));
-        Ok(Poseidon2::merge(&[shuffle_commitment, self.common_commitment]))
+        let shuffle_commitment = state;
+        Ok(Eidos::merge(&[shuffle_commitment, self.common_commitment]))
     }
 
     /// Compute registry leaves for a batch of proof orders, hashing `LEAF_LANES`
-    /// orders per packed Poseidon2 permutation.
+    /// orders per packed Eidos compression.
     ///
     /// Produces exactly the leaves [`Self::leaf_for_order`] produces, in order — the
     /// shuffle sections of every proof order have identical length, which is what makes
@@ -197,44 +190,34 @@ where
 
             // Resume the (order-invariant) post-constants sponge state in every lane and
             // absorb the per-lane shuffle sections in lockstep.
-            let mut state: [PackedFelt; Poseidon2::STATE_WIDTH] = core::array::from_fn(|e| {
-                let mut packed = <PackedFelt as PrimeCharacteristicRing>::ZERO;
-                packed.as_slice_mut().fill(self.constants_state[e]);
-                packed
-            });
+            let mut state: PackedDigest =
+                core::array::from_fn(|element| [self.constants_state[element]; LEAF_LANES]);
             // Rate alignment is established at construction; assert rather than debug_assert
             // so a miscount cannot silently truncate a hashed block in a release build.
             assert!(
-                scratch.streams[0].len().is_multiple_of(RATE_WIDTH),
+                scratch.streams[0].len().is_multiple_of(RATE),
                 "shuffle streams must be rate-aligned"
             );
-            let blocks = scratch.streams[0].len() / RATE_WIDTH;
+            let blocks = scratch.streams[0].len() / RATE;
             for block in 0..blocks {
-                for i in 0..RATE_WIDTH {
-                    let elem = &mut state[Poseidon2::RATE_RANGE.start + i];
-                    for lane in 0..LEAF_LANES {
-                        elem.as_slice_mut()[lane] = scratch.streams[lane][block * RATE_WIDTH + i];
+                let mut packed_block: PackedBlock = [[Felt::ZERO; LEAF_LANES]; RATE];
+                for (i, packed_elements) in packed_block.iter_mut().enumerate() {
+                    for (packed_element, stream) in packed_elements.iter_mut().zip(&scratch.streams)
+                    {
+                        *packed_element = stream[block * RATE + i];
                     }
                 }
-                Poseidon2Permutation256.permute_mut(&mut state);
+                state = Eidos::compress_packed_block(state, packed_block);
             }
 
-            // Batched `Poseidon2::merge(shuffle_commitment, common_commitment)`: rate =
-            // the two digests, capacity zero, one permutation, digest = first rate word.
-            let mut merge_state: [PackedFelt; Poseidon2::STATE_WIDTH] =
-                core::array::from_fn(|_| <PackedFelt as PrimeCharacteristicRing>::ZERO);
-            for i in 0..4 {
-                merge_state[i] = state[Poseidon2::RATE0_RANGE.start + i];
-                let mut common = <PackedFelt as PrimeCharacteristicRing>::ZERO;
-                common.as_slice_mut().fill(self.common_commitment[i]);
-                merge_state[4 + i] = common;
-            }
-            Poseidon2Permutation256.permute_mut(&mut merge_state);
+            let common: PackedDigest =
+                core::array::from_fn(|element| [self.common_commitment[element]; LEAF_LANES]);
+            let leaves = Eidos::merge_packed(&[state, common]);
 
-            for lane in 0..chunk.len() {
-                let leaf: [Felt; 4] = core::array::from_fn(|i| merge_state[i].as_slice()[lane]);
-                out.push(Word::new(leaf));
-            }
+            out.extend((0..chunk.len()).map(|lane| {
+                let leaf: [Felt; 4] = core::array::from_fn(|i| leaves[i][lane]);
+                Word::new(leaf)
+            }));
         }
         Ok(())
     }
@@ -264,7 +247,7 @@ where
         }
         let shuffle_prefix_len = self.const_felts + self.factored.num_shuffle_ops();
         if encoded.num_constants() * EXT_DEGREE != self.const_felts
-            || !stream_len.is_multiple_of(RATE_WIDTH)
+            || !stream_len.is_multiple_of(RATE)
             || shuffle_prefix_len >= stream_len
         {
             return Err(AceError::InvalidInputLayout {
@@ -274,10 +257,9 @@ where
 
         let mut state = self.constants_state;
         absorb_rate_blocks(&mut state, &instructions[self.const_felts..shuffle_prefix_len]);
-        let shuffle_commitment =
-            Word::new(state[Poseidon2::RATE0_RANGE].try_into().expect("digest is one word"));
+        let shuffle_commitment = state;
         let common_commitment = self.common_commitment;
-        let commitment = Poseidon2::merge(&[shuffle_commitment, common_commitment]);
+        let commitment = Eidos::merge(&[shuffle_commitment, common_commitment]);
 
         Ok(FactoredEncodedCircuit {
             encoded,
@@ -289,16 +271,18 @@ where
     }
 }
 
-/// Absorb whole rate blocks into a Poseidon2 sponge state.
-fn absorb_rate_blocks(state: &mut [Felt; Poseidon2::STATE_WIDTH], elements: &[Felt]) {
+/// Absorb whole rate blocks into an initialized Eidos chaining word.
+fn absorb_rate_blocks(state: &mut Word, elements: &[Felt]) {
     // `chunks_exact` would silently drop a trailing partial block, yielding a wrong digest;
     // assert rather than debug_assert so a miscount cannot survive a release build.
     assert!(
-        elements.len().is_multiple_of(RATE_WIDTH),
+        elements.len().is_multiple_of(RATE),
         "sponge absorption requires whole rate blocks"
     );
-    for block in elements.chunks_exact(RATE_WIDTH) {
-        state[Poseidon2::RATE_RANGE].copy_from_slice(block);
-        Poseidon2::apply_permutation(state);
+    for block in elements.chunks_exact(RATE) {
+        *state = Eidos::compress_block(
+            *state,
+            block.try_into().expect("a full Eidos block has RATE elements"),
+        );
     }
 }

@@ -203,7 +203,11 @@ pub(super) fn compress_raw_xof_with_parameter_words(
 ///
 /// Lane `i` of the result is identical to `compress_raw(cv_i, block_i)`, where
 /// `cv_i[j] = cv[j][i]` and `block_i[j] = block[j][i]`.
-#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "x86_64"))))]
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", not(target_feature = "neon")),
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+))]
 pub(super) fn compress_packed<const LANES: usize>(
     cv: [[u32; LANES]; 8],
     block: [[u32; LANES]; 16],

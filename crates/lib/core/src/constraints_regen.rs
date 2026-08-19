@@ -6,14 +6,14 @@ use alloc::{
 };
 use std::{fs, io, println};
 
-use miden_ace_codegen::padding_leaf;
 use miden_air::{
     AIRS, MIDEN_AIR_COUNT, MidenAir, PROOF_ORDER_COUNT, ProofOrder,
     ace::RecursiveAceCircuitFactory,
     config::{ACE_CIRCUIT_REGISTRY_DEPTH, relation_digest},
 };
-use miden_core::{Felt, Word, crypto::hash::Poseidon2};
+use miden_core::{Felt, Word};
 use miden_crypto::{
+    hash::eidos::Eidos,
     merkle::MerkleTree,
     stark::{QuotientRecompositionInputs, air::BaseAir, quotient_recomposition_inputs},
 };
@@ -25,6 +25,7 @@ pub enum Mode {
 }
 
 const PROTOCOL_ID: u64 = 1;
+const ACE_REGISTRY_PADDING_DOMAIN: u64 = 0xace;
 const ACE_REGISTRY_LEAF_COUNT: usize = 1 << ACE_CIRCUIT_REGISTRY_DEPTH;
 const AIR_CONFIG_PATH: &str = "../../../air/src/config.rs";
 const CONSTRAINTS_EVAL_PATH: &str = "asm/sys/vm/constraints_eval.masm";
@@ -37,6 +38,10 @@ const PVM_LAYOUT_PATH: &str = "asm/sys/pvm/layout.masm";
 /// Computes the relation digest used by recursive verification.
 pub fn compute_relation_digest(registry_root: &[Felt; 4]) -> [Felt; 4] {
     relation_digest(PROTOCOL_ID, &Word::new(*registry_root))
+}
+
+fn native_padding_leaf() -> Word {
+    Eidos::hash_elements(&[Felt::new_unchecked(ACE_REGISTRY_PADDING_DOMAIN)])
 }
 
 /// Runs write (`--write`) or staleness-check (`--check`) mode.
@@ -90,15 +95,12 @@ fn compute_artifacts() -> io::Result<ComputedArtifacts> {
             .circuit_for_order(&order)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
 
-        // Compare the encode-only leaf with the assembled stream for every order before
-        // deriving the root. This catches encoding divergence between the two construction
-        // paths. It is not a hash oracle: both paths share the factory's cached sponge states.
-        // Hash behavior is covered separately by the one-shot builder sweep in
-        // air/tests/ace_codegen.rs and miden-crypto's packed-vs-scalar differential test.
-        let fast_leaf = factory
+        // Recompute the registry leaf through the registry-builder API and require it to agree
+        // with the assembled circuit before deriving the root.
+        let registry_leaf = factory
             .leaf_for_order(&order, &mut leaf_buffer)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-        if fast_leaf != circuit.commitment {
+        if registry_leaf != circuit.commitment {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -111,7 +113,7 @@ fn compute_artifacts() -> io::Result<ComputedArtifacts> {
         let common = &circuit.instructions[circuit.shuffle_prefix_len..];
         match &common_section {
             None => {
-                if Poseidon2::hash_elements(common) != circuit.common_commitment {
+                if Eidos::hash_elements(common) != circuit.common_commitment {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "ACE common-section digest does not match the emitted common section",
@@ -279,6 +281,8 @@ fn word_to_array(word: Word) -> [Felt; 4] {
 
 struct AceCircuitRegistry {
     root: [Felt; 4],
+    #[cfg_attr(not(test), allow(dead_code))]
+    leaves: Vec<Word>,
 }
 
 impl AceCircuitRegistry {
@@ -291,7 +295,7 @@ impl AceCircuitRegistry {
             ));
         }
 
-        let mut leaves = alloc::vec![padding_leaf(); ACE_REGISTRY_LEAF_COUNT];
+        let mut leaves = alloc::vec![native_padding_leaf(); ACE_REGISTRY_LEAF_COUNT];
         let mut seen = vec![false; active_leaf_count];
 
         for artifact in order_artifacts {
@@ -327,7 +331,7 @@ impl AceCircuitRegistry {
             )
         })?;
 
-        Ok(Self { root: word_to_array(tree.root()) })
+        Ok(Self { root: word_to_array(tree.root()), leaves })
     }
 }
 
@@ -550,7 +554,63 @@ struct OrderArtifact {
 mod tests {
     use alloc::string::ToString;
 
-    use super::check_vm_ace_stream_capacity;
+    use super::*;
+
+    #[test]
+    fn ace_registry_places_commitments_by_order_tag() {
+        let artifacts = dummy_artifacts();
+        let registry = AceCircuitRegistry::from_order_artifacts(&artifacts).unwrap();
+
+        for artifact in artifacts {
+            assert_eq!(
+                registry.leaves[artifact.order.tag() as usize],
+                word_from_array(artifact.circuit_commitment)
+            );
+        }
+    }
+
+    #[test]
+    fn ace_registry_uses_padding_leaves_outside_supported_orders() {
+        let registry = AceCircuitRegistry::from_order_artifacts(&dummy_artifacts()).unwrap();
+
+        for index in PROOF_ORDER_COUNT..ACE_REGISTRY_LEAF_COUNT {
+            assert_eq!(registry.leaves[index], native_padding_leaf());
+        }
+    }
+
+    #[test]
+    fn ace_registry_rejects_missing_and_duplicate_tags() {
+        let mut missing = dummy_artifacts();
+        missing.pop();
+        assert!(AceCircuitRegistry::from_order_artifacts(&missing).is_err());
+
+        let mut duplicate = dummy_artifacts();
+        duplicate[1].order = duplicate[0].order.clone();
+        assert!(AceCircuitRegistry::from_order_artifacts(&duplicate).is_err());
+    }
+
+    fn dummy_artifacts() -> Vec<OrderArtifact> {
+        ProofOrder::variants()
+            .into_iter()
+            .map(|order| {
+                let tag = order.tag() as u64;
+                OrderArtifact {
+                    order,
+                    num_inputs: 1,
+                    num_eval_gates: 1,
+                    stream_len: 16,
+                    shuffle_prefix_len: 8,
+                    common_commitment: [Felt::ZERO; 4],
+                    circuit_commitment: [
+                        Felt::new_unchecked(tag + 1),
+                        Felt::new_unchecked(tag + 2),
+                        Felt::new_unchecked(tag + 3),
+                        Felt::new_unchecked(tag + 4),
+                    ],
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn vm_ace_stream_capacity_accepts_exact_fit_and_rejects_overflow() {

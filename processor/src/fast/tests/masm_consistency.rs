@@ -368,39 +368,29 @@ fn test_masm_errors_consistency(
     insta::assert_debug_snapshot!(testname, fast_err);
 }
 
-/// Tests that `log_deferred` correctly folds a verified statement digest into the rolling
-/// deferred root via Poseidon2.
-///
-/// Verifies:
-/// 1. Poseidon2 input layout `[DEFERRED_ROOT_PREV, STATEMENT, Tag::AND]`.
-/// 2. Output identity-mapped to the stack: rate0_out → `stack[0..4]` (= `DEFERRED_ROOT_NEW`),
-///    rate1_out → `stack[4..8]`, cap_out → `stack[8..12]`.
-/// 3. Deferred root initialised to `[0, 0, 0, 0]` (`TRUE_DIGEST`) for the first call.
+/// Tests that `log_deferred` folds a statement word into the rolling deferred root.
 #[test]
 fn test_log_deferred_correctness() {
-    use miden_core::{
-        crypto::hash::Poseidon2,
-        deferred::{Node, TRUE_DIGEST, Tag},
-    };
+    use miden_core::{chiplets::blakeg, deferred::TRUE_DIGEST};
 
-    // The opcode reads STATEMENT from stack[4..8]; use implicit TRUE so the empty deferred registry
-    // can verify the statement.
-    let stack_inputs = [1, 2, 3, 4, 0, 0, 0, 0, 9, 10, 11, 12].map(Felt::new_unchecked);
-    let statement = TRUE_DIGEST;
-    let state_prev = TRUE_DIGEST;
+    // The opcode reads STMNT from stack[4..8] and writes STATE_NEW to stack[0..4].
+    // `log_deferred` only accepts a registered statement that evaluates to TRUE. The framework
+    // TRUE node is implicitly registered by every processor, so it is the minimal valid fixture
+    // for testing the constrained root transition directly.
+    let mut stack_inputs = [1, 2, 3, 4, 0, 0, 0, 0, 9, 10, 11, 12].map(Felt::new_unchecked);
+    stack_inputs[4..8].copy_from_slice(TRUE_DIGEST.as_elements());
+    let stmnt = TRUE_DIGEST;
+    let state_prev = Word::empty();
 
-    // Hasher input: [RATE0 = DEFERRED_ROOT_PREV, RATE1 = STATEMENT, CAP = Tag::AND].
+    // Hasher input: [STATE_PREV, STMNT, Eidos merge CV].
     let mut hasher_state = [ZERO; 12];
     hasher_state[0..4].copy_from_slice(state_prev.as_slice());
-    hasher_state[4..8].copy_from_slice(statement.as_slice());
-    hasher_state[8..12].copy_from_slice(&Tag::AND.as_word());
+    hasher_state[4..8].copy_from_slice(stmnt.as_slice());
+    hasher_state[8..12].copy_from_slice(miden_core::deferred::DEFERRED_ROOT_DOMAIN.as_slice());
 
-    Poseidon2::apply_permutation(&mut hasher_state);
+    blakeg::compress_state(&mut hasher_state);
 
-    let expected_state_new: Word = hasher_state[0..4].try_into().unwrap();
-    assert_eq!(expected_state_new, Node::and(state_prev, statement).digest());
-    let expected_out_rate1: Word = hasher_state[4..8].try_into().unwrap();
-    let expected_out_cap: Word = hasher_state[8..12].try_into().unwrap();
+    let expected_state_new: Word = hasher_state[8..12].try_into().unwrap();
 
     let program_source = "begin log_deferred end";
     let program = {
@@ -416,12 +406,10 @@ fn test_log_deferred_correctness() {
     let execution_output = processor.execute_sync(&program, &mut host).unwrap();
 
     let actual_state_new = execution_output.stack.get_word(0).unwrap();
-    let actual_out_rate1 = execution_output.stack.get_word(4).unwrap();
-    let actual_out_cap = execution_output.stack.get_word(8).unwrap();
+    let actual_stmnt = execution_output.stack.get_word(4).unwrap();
 
     assert_eq!(expected_state_new, actual_state_new, "STATE_NEW mismatch");
-    assert_eq!(expected_out_rate1, actual_out_rate1, "OUT_RATE1 mismatch");
-    assert_eq!(expected_out_cap, actual_out_cap, "OUT_CAP mismatch");
+    assert_eq!(stmnt, actual_stmnt, "STMNT should be preserved by the opcode");
 }
 
 // Workaround to make insta and rstest work together.

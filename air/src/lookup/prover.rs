@@ -30,6 +30,7 @@ where
     EF: ExtensionField<F>,
 {
     main: RowWindow<'a, F>,
+    preprocessed: RowWindow<'a, F>,
     periodic_values: &'a [F],
     challenges: &'a Challenges<EF>,
     /// Dense per-column fraction buffers shared across all rows.
@@ -42,7 +43,7 @@ where
     F: Field,
     EF: ExtensionField<F>,
 {
-    /// Create a new prover-path adapter for one row pair.
+    /// Create a prover-path adapter for one row pair.
     ///
     /// - `main`: two-row window over the current and next base-field rows.
     /// - `periodic_values`: periodic columns at the current row.
@@ -58,6 +59,7 @@ where
     /// Panics in debug builds if `fractions.num_columns() != air.num_columns()`.
     pub fn new<A>(
         main: RowWindow<'a, F>,
+        preprocessed: RowWindow<'a, F>,
         periodic_values: &'a [F],
         challenges: &'a Challenges<EF>,
         air: &A,
@@ -73,6 +75,7 @@ where
         );
         Self {
             main,
+            preprocessed,
             periodic_values,
             challenges,
             fractions,
@@ -108,6 +111,7 @@ where
 pub fn build_lookup_fractions<A, F, EF>(
     air: &A,
     main_trace: &RowMajorMatrix<F>,
+    preprocessed_trace: Option<&RowMajorMatrix<F>>,
     periodic_columns: &[Vec<F>],
     challenges: &Challenges<EF>,
 ) -> LookupFractions<F, EF>
@@ -120,6 +124,16 @@ where
     let num_rows = main_trace.height();
     let width = main_trace.width();
     let flat: &[F] = main_trace.values.borrow();
+    let (preprocessed_width, preprocessed_flat): (usize, &[F]) =
+        preprocessed_trace.map_or((0, &[][..]), |trace| {
+            assert_eq!(
+                trace.height(),
+                num_rows,
+                "lookup-fraction collection expects preprocessed and main traces to have equal height"
+            );
+            (trace.width(), trace.values.borrow())
+        });
+    let empty_row: &[F] = &[];
 
     let shape = air.column_shape().to_vec();
 
@@ -134,11 +148,25 @@ where
             let nxt_idx = (r + 1) % num_rows;
             let next = &flat[nxt_idx * width..(nxt_idx + 1) * width];
             let window = RowWindow::from_two_rows(curr, next);
+            let preprocessed_window = if preprocessed_width == 0 {
+                RowWindow::from_two_rows(empty_row, empty_row)
+            } else {
+                let curr = &preprocessed_flat[r * preprocessed_width..(r + 1) * preprocessed_width];
+                let next = &preprocessed_flat
+                    [nxt_idx * preprocessed_width..(nxt_idx + 1) * preprocessed_width];
+                RowWindow::from_two_rows(curr, next)
+            };
             for (i, col) in periodic_columns.iter().enumerate() {
                 periodic_row[i] = col[r % col.len()];
             }
-            let mut lb =
-                ProverLookupBuilder::new(window, &periodic_row, challenges, air, &mut chunk);
+            let mut lb = ProverLookupBuilder::new(
+                window,
+                preprocessed_window,
+                &periodic_row,
+                challenges,
+                air,
+                &mut chunk,
+            );
             air.eval(&mut lb);
         }
         chunk
@@ -202,6 +230,7 @@ where
     type PeriodicVar = F;
 
     type MainWindow = RowWindow<'a, F>;
+    type PreprocessedWindow = RowWindow<'a, F>;
 
     type Column<'c>
         = ProverColumn<'c, F, EF>
@@ -210,6 +239,10 @@ where
 
     fn main(&self) -> Self::MainWindow {
         self.main
+    }
+
+    fn preprocessed(&self) -> &Self::PreprocessedWindow {
+        &self.preprocessed
     }
 
     fn periodic_values(&self) -> &[Self::PeriodicVar] {
@@ -346,7 +379,7 @@ where
         M: LookupMessage<F, EF>,
     {
         // The prover path short-circuits on `flag == F::ZERO`, while the constraint path
-        // evaluates the encode unconditionally. The two agree only when `flag ∈ {0, 1}`.
+        // evaluates the encode unconditionally. The two agree only when `flag in {0, 1}`.
         // Every Miden bus emitter today drives `flag` as a product of decoder/op selectors
         // pinned boolean by the AIR. This debug assertion catches regressions at test time.
         debug_assert!(
@@ -354,7 +387,7 @@ where
             "ProverGroup::insert flag must be in {{0, 1}}; non-boolean flag would diverge \
              from the constraint path",
         );
-        if flag == F::ZERO {
+        if flag == F::ZERO || multiplicity == F::ZERO {
             return;
         }
         let v = msg().encode(self.challenges);
@@ -374,7 +407,7 @@ where
             "ProverGroup::batch flag must be in {{0, 1}}; non-boolean flag would diverge \
              from the constraint path",
         );
-        // When `active == false` every push inside the batch is a no-op — the
+        // When `active == false` every push inside the batch is a no-op - the
         // `msg.encode()` call is skipped too. The `build` closure still runs so
         // it can produce its `R` return value without requiring `R: Default`.
         let active = flag != F::ZERO;
@@ -420,12 +453,10 @@ where
 ///
 /// Holds the same mutable borrow of the column's fraction `Vec` as the
 /// enclosing [`ProverGroup`], plus an `active` flag copied from the
-/// outer `batch(flag, …)` call. When `active == false` every push is a
-/// no-op — the `msg.encode()` call is skipped too, so inactive batches
-/// do essentially no work.
+/// outer `batch(flag, ...)` call. Inactive batches skip message encoding and do not push.
 ///
 /// Each push appends one fraction entry when active. There's no `(N, D)` state
-/// inside the batch — LogUp's aux-trace builder handles the combination downstream.
+/// inside the batch - LogUp's aux-trace builder handles the combination downstream.
 pub struct ProverBatch<'b, F, EF>
 where
     F: Field,
@@ -448,7 +479,7 @@ where
     where
         M: LookupMessage<F, EF>,
     {
-        if !self.active {
+        if !self.active || multiplicity == F::ZERO {
             return;
         }
         let v = msg.encode(self.challenges);
@@ -462,7 +493,7 @@ where
         encoded: impl FnOnce() -> EF,
         _deg: Deg,
     ) {
-        if !self.active {
+        if !self.active || multiplicity == F::ZERO {
             return;
         }
         let v = encoded();
@@ -489,7 +520,7 @@ mod tests {
     };
 
     /// Minimal `LookupMessage` used by [`SmokeAir`] to drive a `Vec::push` into the
-    /// prover builder's fraction buffer. Encodes to `bus_prefix[0] + β⁰·value`, which is
+    /// prover builder's fraction buffer. Encodes to `bus_prefix[0] + beta^0*value`, which is
     /// always non-zero for non-trivial challenges (so `accumulate_slow` can `try_inverse`
     /// without blowing up).
     #[derive(Clone, Copy, Debug)]
@@ -504,7 +535,7 @@ mod tests {
     }
 
     /// Two-column stand-in for the real Miden lookup AIR, with a handcrafted `eval` body
-    /// that respects its own shape on **every** row — no mutual-exclusion assumptions, so
+    /// that respects its own shape on **every** row - no mutual-exclusion assumptions, so
     /// random (non-trace) input data drives it without tripping the shape debug_assert.
     ///
     /// - Column 0 always pushes 2 fractions (one `add`, one `remove`) with shape 2.
@@ -590,17 +621,17 @@ mod tests {
 
         let air = SmokeAir;
 
-        // Any reasonable non-zero challenges — SmokeMsg encodes to `bus_prefix[0] + v`
+        // Any reasonable non-zero challenges - SmokeMsg encodes to `bus_prefix[0] + v`
         // which is non-zero as long as the challenges are.
         let alpha = QuadFelt::new([Felt::new_unchecked(7), Felt::new_unchecked(11)]);
         let beta = QuadFelt::new([Felt::new_unchecked(13), Felt::new_unchecked(17)]);
         // SmokeAir hard-codes `max_message_width = 1` / `num_bus_ids = 1` in its
-        // `LookupAir` impl — the trait-method path can't be called directly because
+        // `LookupAir` impl - the trait-method path can't be called directly because
         // `LookupAir<LB>` is generic over `LB` and disambiguation fails at a value call.
         let challenges = Challenges::<QuadFelt>::new(alpha, beta, 1, 1);
 
         // `SmokeAir::eval` never touches the main trace, periodic columns, or public
-        // values — pass dummy zero-length slices.
+        // values - pass dummy zero-length slices.
         let empty_row: Vec<Felt> = vec![];
         let periodic_values: Vec<Felt> = vec![];
 
@@ -611,8 +642,10 @@ mod tests {
 
         for _row in 0..NUM_ROWS {
             let window = RowWindow::from_two_rows(&empty_row, &empty_row);
+            let preprocessed = RowWindow::from_two_rows(&empty_row, &empty_row);
             let mut lb = ProverLookupBuilder::new(
                 window,
+                preprocessed,
                 &periodic_values,
                 &challenges,
                 &air,

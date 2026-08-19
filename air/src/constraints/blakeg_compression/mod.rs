@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "compiled ahead of the atomic MVM cutover; remove this allowance when the AIR is wired"
-)]
-
 //! Standalone 32-row BlakeG compression arithmetization.
 //!
 //! Each cycle contains 28 fused G rows followed by four footer rows. The fused rows execute the
@@ -18,12 +13,8 @@
 //! ID directly. This prevents inputs from one physical compression from satisfying the internal
 //! lookups of another.
 //!
-//! # Integration status
-//!
-//! This module is deliberately dormant until the atomic MVM cutover wires its constraints,
-//! periodic columns, lookup columns, and trace builder into a `BlakeGCompressionAir`. Keeping the
-//! module dormant makes this extraction reviewable without changing the active Poseidon2 proof
-//! relation.
+//! The Miden VM instantiates this module as its native compression AIR. The processor constructs
+//! the same 32-row blocks through the public trace-writing API exported below.
 
 mod algebra;
 
@@ -77,6 +68,6 @@ pub use layout::NUM_COLS;
 pub use lookup::BlakeGCompressionCols;
 pub use trace::{
     BlakeGByteLookup, BlakeGFeltRow, BlakeGFeltTraceBlock, ByteLookupRecorder, TraceMode,
-    generate_felt_trace_block, write_felt_trace_block,
+    generate_felt_trace_block, retag_felt_trace_block_cycle_id, write_felt_trace_block,
     write_felt_trace_block_into_zeroed_with_lookups,
 };

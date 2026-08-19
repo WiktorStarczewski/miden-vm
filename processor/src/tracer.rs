@@ -134,13 +134,24 @@ pub trait Tracer {
     // IN-CYCLE METHODS
     // --------------------------------------------------------------------------------------------
 
-    /// Records the result of a call to `Hasher::permute()`.
+    /// Records the result of a block-preserving BlakeG compression.
     ///
-    /// Called by: `HPERM`, `LOG_DEFERRED`.
-    fn record_hasher_permute(
+    /// Called by: `BCOMPRESS`, `LOG_DEFERRED`.
+    fn record_hasher_bcompress(
         &mut self,
         _input_state: [Felt; STATE_WIDTH],
         _output_state: [Felt; STATE_WIDTH],
+    ) {
+    }
+
+    /// Records one AEAD-XOF compression request.
+    ///
+    /// Called by: `AEADSTREAM`.
+    fn record_hasher_aead_xof(
+        &mut self,
+        _ctx: ContextId,
+        _clk: RowIndex,
+        _input_state: [Felt; STATE_WIDTH],
     ) {
     }
 
@@ -250,15 +261,15 @@ pub trait Tracer {
     ) {
     }
 
-    /// Records a `CRYPTO_STREAM` operation: reading 2 plaintext words from source memory and
-    /// writing 2 ciphertext words to destination memory.
+    /// Records an `AEADSTREAM` operation.
     ///
-    /// Called by: `CRYPTO_STREAM`.
-    fn record_crypto_stream(
+    /// Called by: `AEADSTREAM`.
+    fn record_aead_stream(
         &mut self,
         _plaintext: [Word; 2],
         _src_addr: Felt,
-        _ciphertext: [Word; 2],
+        _keystream: [Felt; 16],
+        _ciphertext: [Felt; 16],
         _dst_addr: Felt,
         _ctx: ContextId,
         _clk: RowIndex,
@@ -292,8 +303,8 @@ pub trait Tracer {
     /// Called by: `U32XOR`.
     fn record_u32xor(&mut self, _a: Felt, _b: Felt) {}
 
-    /// Records the high and low 32-bit limbs of the result of a u32 operation for the purposes of
-    /// the range checker. This is expected to result in four 16-bit range checks.
+    /// Records the high and low 32-bit limbs of the result of a u32 operation. This is expected to
+    /// result in four 16-bit range-check requests.
     ///
     /// Called by: `U32SPLIT`, `U32ADD`, `U32ADD3`, `U32SUB`, `U32MUL`, `U32MADD`, `U32DIV`,
     /// `U32ASSERT2`.
@@ -428,11 +439,10 @@ pub enum OperationHelperRegisters {
     /// The helper registers hold the four 16-bit limbs of `second` and `first` (used for range
     /// checking).
     U32Assert2 { first: Felt, second: Felt },
-    /// Helper for the `HPERM` operation, which applies a Poseidon2 permutation to the top 12
-    /// stack elements.
+    /// Helper for the `BCOMPRESS` operation.
     ///
-    /// - `addr`: the address in the hasher chiplet where the permutation is recorded.
-    HPerm { addr: Felt },
+    /// - `addr`: the address in the hasher chiplet where the compression is recorded.
+    BCompress { addr: Felt },
     /// Helper for Merkle path operations (`MPVERIFY` and `MRUPDATE`), which verify or update a
     /// node in a Merkle tree.
     ///
@@ -457,11 +467,11 @@ pub enum OperationHelperRegisters {
     ///   coefficients: `(acc * alpha + s[0]) * alpha + s[1]`.
     HornerEvalExt { alpha: QuadFelt, acc_tmp: QuadFelt },
     /// Helper for the `LOG_DEFERRED` operation, which folds a verified statement digest into
-    /// the rolling deferred root via a Poseidon2 permutation.
+    /// the rolling deferred root via the VM hasher (BlakeG compression).
     ///
-    /// - `addr`: start row of the hasher-chiplet permutation.
+    /// - `addr`: address in the hasher chiplet where the compression is recorded.
     /// - `state_prev`: the previous deferred root, provided non-deterministically and used as the
-    ///   rate0 input to the permutation.
+    ///   rate0 input to the compression.
     LogDeferred { addr: Felt, state_prev: Word },
     /// No helper registers are needed for this operation. All helper columns are set to ZERO.
     Empty,
@@ -590,7 +600,7 @@ impl OperationHelperRegisters {
                     ZERO,
                 ]
             },
-            Self::HPerm { addr } => [*addr, ZERO, ZERO, ZERO, ZERO, ZERO],
+            Self::BCompress { addr } => [*addr, ZERO, ZERO, ZERO, ZERO, ZERO],
             Self::MerklePath { addr } => [*addr, ZERO, ZERO, ZERO, ZERO, ZERO],
             Self::HornerEvalBase { alpha, tmp0, tmp1 } => [
                 alpha.as_basis_coefficients_slice()[0],

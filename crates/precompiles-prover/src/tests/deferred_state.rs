@@ -29,7 +29,7 @@ use crate::{
         SessionTracesTestExt, bus_balance::session_stack_residual,
         verify_deferred as verify_session,
     },
-    transcript::poseidon2::P2Digest,
+    transcript::eidos::EidosDigest,
     verify_deferred,
 };
 
@@ -41,7 +41,7 @@ struct SyntheticKeccakDeferredState {
     expected_digest: Digest,
     assertion_digest: Digest,
     vm_root: Digest,
-    root: P2Digest,
+    root: EidosDigest,
 }
 
 /// Builds the Keccak-only VM deferred state for `input`:
@@ -78,7 +78,7 @@ fn synthetic_keccak_state(input: &[u8]) -> SyntheticKeccakDeferredState {
         expected_digest,
         assertion_digest,
         vm_root,
-        root: P2Digest::from(vm_root),
+        root: EidosDigest::from(vm_root),
     }
 }
 
@@ -235,7 +235,7 @@ fn all_node_vm_state() -> DeferredState {
 
 fn translated_traces_check(state: &DeferredState) {
     let DeferredSession { session, root } = session_from_deferred_state(state).unwrap();
-    assert_eq!(root.hash(), P2Digest::from(state.root()));
+    assert_eq!(root.hash(), EidosDigest::from(state.root()));
     let traces = session.finish(root);
     traces.check();
 }
@@ -250,7 +250,7 @@ fn synthetic_keccak_deferred_state_reconstructs_root() {
         synthetic.vm_root,
         VmNode::and(VM_TRUE_DIGEST, synthetic.assertion_digest).digest(),
     );
-    assert_eq!(synthetic.root, P2Digest::from(synthetic.vm_root));
+    assert_eq!(synthetic.root, EidosDigest::from(synthetic.vm_root));
     assert!(synthetic.state.get_node(&synthetic.input_digest).is_some());
     assert!(synthetic.state.get_node(&synthetic.expected_digest).is_some());
     assert!(synthetic.state.get_node(&synthetic.assertion_digest).is_some());
@@ -282,7 +282,7 @@ fn session_public_root_matches_synthetic_deferred_state_for_all_supported_node_t
     let state = all_node_vm_state();
     let DeferredSession { session, root } = session_from_deferred_state(&state).unwrap();
 
-    assert_eq!(root.hash(), P2Digest::from(state.root()));
+    assert_eq!(root.hash(), EidosDigest::from(state.root()));
     let traces = session.finish(root);
     traces.check();
 }
@@ -363,7 +363,7 @@ fn keccak_deferred_state_proof_verifies_and_rejects_trailing_bytes() {
     assert_eq!(traces.public_root(), synthetic.root);
 
     let proof = traces.prove();
-    assert_eq!(P2Digest::from(proof.1), synthetic.root);
+    assert_eq!(EidosDigest::from(proof.1), synthetic.root);
     verify_session(&proof).expect("Keccak deferred-state proof should verify");
 
     // The proof encoding is exact: an otherwise-valid proof with a trailing byte is rejected.

@@ -44,19 +44,6 @@ impl Plan {
             self.entries.insert(name, n);
         }
     }
-
-    /// Increment the iteration count for `name` by `delta`.
-    pub fn add(&mut self, name: &'static str, delta: u64) {
-        if delta == 0 {
-            return;
-        }
-        self.set(name, self.iters(name) + delta);
-    }
-
-    /// Decrement the iteration count for `name` by `delta`, saturating at zero.
-    pub fn sub_saturating(&mut self, name: &'static str, delta: u64) {
-        self.set(name, self.iters(name).saturating_sub(delta));
-    }
 }
 
 /// Solve for the iteration counts that reproduce `target`'s per-component row counts. Per-chiplet
@@ -72,7 +59,6 @@ pub fn solve(calibration: &Calibration, target: &TraceShape) -> Plan {
             Component::Hasher => target.hasher_work_rows() as f64,
             Component::Bitwise => target.breakdown.bitwise_rows as f64,
             Component::Memory => target.breakdown.memory_target() as f64,
-            Component::Range => target.totals.range_rows as f64,
         }
     };
 
@@ -133,7 +119,7 @@ mod tests {
 
     fn shape_of(
         core_rows: u64,
-        range_rows: u64,
+        byte_pair_lookup_rows: u64,
         hasher: u64,
         bitwise: u64,
         memory: u64,
@@ -148,8 +134,8 @@ mod tests {
         let totals = TraceTotals {
             core_rows,
             chiplets_rows: breakdown.chiplets_sum(),
-            poseidon2_permutation_rows: hasher,
-            range_rows,
+            blakeg_compression_rows: hasher,
+            byte_pair_lookup_rows,
         };
         TraceShape::new(totals, breakdown)
     }
@@ -167,24 +153,24 @@ mod tests {
     }
 
     #[test]
-    fn low_hasher_target_does_not_add_hperm() {
+    fn low_hasher_target_does_not_add_bcompress() {
         let cal = calibrate().expect("calibrate");
         let plan = solve(&cal, &low_hasher_target());
         assert_eq!(
             plan.iters("hasher"),
             0,
-            "when the decoder (via memory + pad) already overshoots the hasher target, no hperm iterations should be added",
+            "when the decoder (via memory + pad) already overshoots the hasher target, no bcompress iterations should be added",
         );
         assert!(plan.iters("memory") > 0);
     }
 
     #[test]
-    fn high_hasher_target_requires_hperm() {
+    fn high_hasher_target_requires_bcompress() {
         let cal = calibrate().expect("calibrate");
         let plan = solve(&cal, &high_hasher_target());
         assert!(
             plan.iters("hasher") > 0,
-            "a hasher target above the main/4 floor should require hperm iterations",
+            "a hasher target above the core-induced floor should require bcompress iterations",
         );
     }
 

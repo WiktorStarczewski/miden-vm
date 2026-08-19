@@ -32,11 +32,8 @@ use super::message::LookupMessage;
 
 /// Expected post-flag `(V, U)` contribution for one interaction or scope.
 ///
-/// Every builder method takes a `Deg` as its last argument so authors can
-/// declare the expected degrees inline. Production adapters ignore the value
-/// (it is `Copy` and dead-code-eliminated after inlining). A debug adapter
-/// can compare the declared degrees against the symbolic expression it just
-/// accumulated and panic with the interaction's `name` if they disagree.
+/// Every builder method takes a `Deg` so debug adapters can check declared degrees against the
+/// symbolic expression they just accumulated. Production adapters ignore it.
 ///
 /// - `v`: degree of the numerator (`V`) contribution after multiplying by the surrounding flag.
 /// - `u`: degree of the denominator (`U`) contribution after multiplying by the surrounding flag.
@@ -44,26 +41,9 @@ use super::message::LookupMessage;
 /// Field order mirrors the `(V, U)` tuple convention used throughout the
 /// adapter code: numerator first, denominator second.
 ///
-/// ## Semantics by call site
-///
-/// - **Single interactions** ([`LookupGroup::add`], `remove`, `insert`, `insert_encoded`, and the
-///   corresponding [`LookupBatch`] methods): `(v, u) = (deg(m · D) + deg(f), deg(D) + deg(f))`
-///   where `m` is the interaction's signed multiplicity, `D` is its denominator polynomial, and `f`
-///   is the gating flag (the enclosing batch flag for `LookupBatch` methods). The standalone
-///   post-flag contribution this interaction would make if folded directly into the enclosing
-///   group's `(V_g, U_g)`.
-///
-/// - **Batch outer** ([`LookupGroup::batch`]): the post-flag contribution the *whole* batch makes
-///   to the enclosing group's `(V_g, U_g)` — `(deg(N) + deg(f), deg(D) + deg(f))` where `(N, D)` is
-///   the running pair the inner-loop body accumulates and `f` is the batch flag. The pre-flag `(N,
-///   D)` is mechanically derivable from the inner-loop body — `((k − 1) · d_v, k · d_v)` for `k`
-///   interactions of inner denominator degree `d_v` — so it is documented inline at each batch site
-///   rather than carried in the struct.
-///
-/// - **Group / column scope** ([`LookupColumn::group`], `group_with_cached_encoding`,
-///   [`LookupBuilder::next_column`]): the total post-flag `(V, U)` contribution of the group /
-///   column to the surrounding accumulator. Useful as a budget audit number when the author wants
-///   to assert what the scope as a whole contributes.
+/// Single interactions use the degree of their standalone post-flag contribution. Batch, group,
+/// and column scopes use the degree of the total `(V, U)` pair they contribute to the enclosing
+/// scope.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Deg {
     pub v: usize,
@@ -75,31 +55,12 @@ pub struct Deg {
 
 /// The trace-reading handle handed to a [`super::LookupAir`] implementation.
 ///
-/// `LookupBuilder` deliberately mirrors the subset of `LiftedAirBuilder`'s
-/// associated types needed to read `main` and `periodic_values`. It is
-/// **not** a sub-trait of `AirBuilder`: the constraint
-/// emission surface (`assert_zero` / `when_first_row` / …) and the
-/// permutation column plumbing stay hidden, which keeps the simple lookup
-/// path free of challenge access.
+/// `LookupBuilder` exposes trace access and per-column scoping. It hides constraint emission,
+/// permutation columns, and challenge access from lookup authors.
 ///
 /// Implementors must not shortcut the per-column scoping: a [`super::LookupAir`]
 /// author that opens `n` columns must issue exactly `n` calls to
 /// [`LookupBuilder::next_column`], matching [`super::LookupAir::num_columns`].
-///
-/// ## Associated-type layout
-///
-/// The base-field stack (`F`, `Expr`, `Var`) and extension-field stack
-/// (`EF`, `ExprEF`, `VarEF`) mirror the upstream `AirBuilder` /
-/// `ExtensionBuilder` split one-for-one; `Algebra<Var>` on `Expr` lets the
-/// lookup author multiply main-trace variables with arbitrary expressions
-/// without crossing trait boundaries. `PeriodicVar` / `MainWindow` come
-/// from `AirBuilder` and are passed through the adapter unchanged.
-///
-/// The per-column handle is a generic associated type
-/// ([`Self::Column`](Self::Column)) so that each `column(...)` call can
-/// borrow from `self` without outliving the closure. Its bound pins the
-/// expression and extension-variable types to keep them in sync with the
-/// outer builder.
 pub trait LookupBuilder: Sized {
     // --- base field stack (copied from AirBuilder) ---
 
@@ -133,13 +94,12 @@ pub trait LookupBuilder: Sized {
     type ExprEF: Algebra<Self::Expr> + Algebra<Self::EF>;
 
     /// Variable type over extension-field trace cells (permutation
-    /// columns and the α/β challenges).
+    /// columns and the alpha/beta challenges).
     type VarEF: Into<Self::ExprEF> + Copy + Send + Sync;
 
     // --- auxiliary trace access types ---
 
-    /// Periodic column value at the current row (copied from
-    /// `AirBuilder::PeriodicVar`).
+    /// Periodic column value at the current row.
     type PeriodicVar: Into<Self::Expr> + Copy;
 
     /// Two-row window over the main trace, returned as-is from the
@@ -148,6 +108,9 @@ pub trait LookupBuilder: Sized {
     /// and pass either to `borrow`-based view types without re-reading
     /// the handle.
     type MainWindow: WindowAccess<Self::Var> + Clone;
+
+    /// Two-row preprocessed trace window. Empty for AIRs without preprocessed columns.
+    type PreprocessedWindow: WindowAccess<Self::Var> + Clone;
 
     /// Per-column handle opened by [`Self::next_column`]. Holds the adapter's per-column
     /// state (running `(V, U)` on the constraint path, fraction collector on the prover
@@ -160,6 +123,9 @@ pub trait LookupBuilder: Sized {
 
     /// Two-row main trace window. Pass-through to the wrapped builder.
     fn main(&self) -> Self::MainWindow;
+
+    /// Two-row preprocessed trace window.
+    fn preprocessed(&self) -> &Self::PreprocessedWindow;
 
     /// Periodic column values at the current row.
     fn periodic_values(&self) -> &[Self::PeriodicVar];
@@ -194,7 +160,7 @@ pub trait LookupBuilder: Sized {
 ///
 /// Multiple groups may be opened per column; the adapter is responsible
 /// for composing them according to the column accumulator algebra
-/// (`V ← V·U_g + V_g·U`, `U ← U·U_g`). Groups opened inside the same
+/// (`V <- V*U_g + V_g*U`, `U <- U*U_g`). Groups opened inside the same
 /// column are assumed *product-closed*, not mutually exclusive.
 pub trait LookupColumn {
     /// Expression type over base-field elements. Pinned to
@@ -205,7 +171,7 @@ pub trait LookupColumn {
     /// [`LookupBuilder::ExprEF`] through [`LookupBuilder::Column`]. The
     /// [`Algebra<Self::Expr>`] bound lets [`LookupMessage::encode`]
     /// multiply an `Expr`-typed payload slot by an `ExprEF`-typed
-    /// β-power without manually lifting.
+    /// beta-power without manually lifting.
     type ExprEF: PrimeCharacteristicRing + Clone + Algebra<Self::Expr>;
 
     /// Per-group handle used for the simple (challenge-free) path.
@@ -223,13 +189,13 @@ pub trait LookupColumn {
     /// Open a group with two sibling descriptions for the same
     /// interaction set.
     ///
-    /// - `canonical` runs on the prover path. It sees the simple [`LookupGroup`] surface — no
+    /// - `canonical` runs on the prover path. It sees the simple [`LookupGroup`] surface - no
     ///   challenges, no `insert_encoded`. Zero-valued flag closures are skipped by the backing
     ///   fraction collector.
     /// - `encoded` runs on the constraint path. It sees the same [`LookupGroup`] surface, plus the
     ///   encoding primitives `beta_powers()`, `bus_prefix()`, and `insert_encoded()`. Authors use
-    ///   this to precompute shared encoding fragments (e.g. a common `α + β·addr` prefix) and reuse
-    ///   them across mutually-exclusive variants.
+    ///   this to precompute shared encoding fragments (e.g. a common `alpha + beta*addr` prefix)
+    ///   and reuse them across mutually-exclusive variants.
     ///
     /// Both closures must produce mathematically identical `(V, U)`
     /// pairs; the split is purely an optimization for expensive
@@ -267,7 +233,7 @@ pub trait LookupGroup {
     /// Expression type over extension-field elements. Pinned to
     /// [`LookupBuilder::ExprEF`] through the column. The
     /// [`Algebra<Self::Expr>`] bound mirrors [`LookupColumn::ExprEF`]
-    /// and lets [`LookupMessage::encode`] use `ExprEF × Expr` products.
+    /// and lets [`LookupMessage::encode`] use `ExprEF * Expr` products.
     type ExprEF: PrimeCharacteristicRing + Clone + Algebra<Self::Expr>;
 
     /// Transient handle returned by [`batch`](Self::batch). GAT so the
@@ -372,11 +338,11 @@ pub trait LookupGroup {
 
     // ---- encoding primitives (cached-encoding path only) ----
 
-    /// Precomputed powers `[β⁰, β¹, …, β^(W-1)]`, where
+    /// Precomputed powers `[beta^0, beta^1, ..., beta^(W-1)]`, where
     /// `W = max_message_width` from the enclosing
     /// [`LookupAir`](super::LookupAir).
     ///
-    /// The slice length is exactly `W` — there is **no** trailing `β^W`
+    /// The slice length is exactly `W` - there is **no** trailing `beta^W`
     /// entry, because that power is the per-bus step baked into every
     /// [`Challenges::bus_prefix`](super::Challenges) entry
     /// at builder-construction time. Authors that want to build their
@@ -389,7 +355,7 @@ pub trait LookupGroup {
     ///
     /// # Panics
     ///
-    /// Default implementation panics — only valid inside the `encoded`
+    /// Default implementation panics - only valid inside the `encoded`
     /// closure of [`LookupColumn::group_with_cached_encoding`].
     fn beta_powers(&self) -> &[Self::ExprEF] {
         panic!(
@@ -398,16 +364,14 @@ pub trait LookupGroup {
     }
 
     /// Look up the precomputed bus prefix
-    /// `bus_prefix[bus_id] = α + (bus_id + 1) · β^W` for the given
+    /// `bus_prefix[bus_id] = alpha + (bus_id + 1) * beta^W` for the given
     /// coarse bus ID.
     ///
-    /// Returns an owned [`Self::ExprEF`] by cloning the entry — the
-    /// underlying storage is a `Box<[ExprEF]>` on the adapter and
-    /// `ExprEF` is typically a ring element, so cloning is cheap.
+    /// Returns an owned [`Self::ExprEF`] by cloning the adapter entry.
     ///
     /// # Panics
     ///
-    /// Default implementation panics — only valid inside the `encoded`
+    /// Default implementation panics - only valid inside the `encoded`
     /// closure of [`LookupColumn::group_with_cached_encoding`].
     /// Also panics if `bus_id` is out of bounds of the adapter's
     /// `num_bus_ids`.
@@ -429,7 +393,7 @@ pub trait LookupGroup {
     ///
     /// # Panics
     ///
-    /// Default implementation panics — only valid inside the `encoded`
+    /// Default implementation panics - only valid inside the `encoded`
     /// closure of [`LookupColumn::group_with_cached_encoding`].
     fn insert_encoded(
         &mut self,
@@ -469,7 +433,7 @@ pub trait LookupBatch {
     type Expr: PrimeCharacteristicRing + Clone;
 
     /// Expression type over extension-field elements. Must match the
-    /// enclosing group's `ExprEF` — [`LookupMessage::encode`] returns an
+    /// enclosing group's `ExprEF` - [`LookupMessage::encode`] returns an
     /// extension-field value and the batch's underlying algebra operates
     /// on that type. The [`Algebra<Self::Expr>`] bound mirrors the
     /// enclosing group's `ExprEF` bound.
@@ -513,7 +477,7 @@ pub trait LookupBatch {
 // BOUNDARY BUILDER
 // ================================================================================================
 
-/// Handle for emitting **once-per-proof** "outer" interactions — contributions to the
+/// Handle for emitting **once-per-proof** "outer" interactions - contributions to the
 /// LogUp sum that are not tied to any main-trace row.
 ///
 /// Typical sources are statement-supplied boundary seeds and terminals (kernel ROM init, block
@@ -527,7 +491,7 @@ pub trait BoundaryBuilder {
     /// Base field for boundary-interaction multiplicities and encoded message slots.
     type F: Field;
 
-    /// Extension field used by [`LookupMessage::encode`] — matches the enclosing
+    /// Extension field used by [`LookupMessage::encode`] - matches the enclosing
     /// `LookupAir`'s `LB::EF`.
     type EF: ExtensionField<Self::F>;
 

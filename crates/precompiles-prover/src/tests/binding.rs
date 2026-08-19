@@ -14,7 +14,7 @@ use crate::{
     relations::{BusId, MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
     transcript::{
         binding::{BindingMsg, ValueTag},
-        poseidon2::Poseidon2InMsg,
+        eidos::EidosInMsg,
     },
 };
 
@@ -80,7 +80,7 @@ fn binding_bus_has_disjoint_prefix() {
     let beta = QuadFelt::from_u64(2);
     let challenges = Challenges::<QuadFelt>::new(alpha, beta, MAX_MESSAGE_WIDTH, NUM_BUS_IDS);
 
-    // Identical leading 6-felt payload on Binding vs Poseidon2In, with
+    // Identical leading 6-felt payload on Binding vs EidosIn, with
     // Binding's 7th slot (bound_ptr) zeroed: they then differ *only* by
     // the bus prefix.
     let p = [
@@ -98,8 +98,8 @@ fn binding_bus_has_disjoint_prefix() {
         bound_ptr: Felt::ZERO,
     }
     .encode(&challenges);
-    let enc_in = Poseidon2InMsg {
-        perm_seq_id: p[0],
+    let enc_in = EidosInMsg {
+        absorption_id: p[0],
         tag: p[1],
         c: [p[2], p[3], p[4], p[5]],
     }

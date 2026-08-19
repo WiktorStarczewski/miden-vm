@@ -98,7 +98,7 @@ fn masm_claim_commitment_matches_native() {
     build_test!(source.as_str(), &[]).expect_stack(&expected);
 }
 
-/// The MASM `poseidon2::hash_elements_in_domain` must agree with the native implementation for
+/// The MASM `eidos::hash_elements_in_domain` must agree with the native implementation for
 /// rate-aligned, unaligned, and empty inputs, exercising the kernel commitment's domain.
 #[test]
 fn hash_elements_in_domain_matches_native() {
@@ -140,14 +140,14 @@ fn hash_elements_in_domain_matches_native() {
         let source = format!(
             "
             use miden::core::sys
-            use miden::core::crypto::hashes::poseidon2
+            use miden::core::crypto::hashes::eidos
 
             begin
                 {store_ops}
                 push.{domain_int}
                 push.{num_elements}
                 push.{PTR}
-                exec.poseidon2::hash_elements_in_domain
+                exec.eidos::hash_elements_in_domain
                 exec.sys::truncate_stack
             end
             ",
@@ -174,14 +174,14 @@ fn element_hash_procedures_reject_non_u32_length() {
     let expected_error_code = miden_core::mast::error_code_from_msg(ERROR_MSG);
 
     let invocations = [
-        format!("push.0 push.{NON_U32_LENGTH} push.{PTR} exec.poseidon2::prepare_hasher_state"),
-        format!("push.{NON_U32_LENGTH} push.{PTR} exec.poseidon2::hash_elements"),
-        format!("push.1 push.{NON_U32_LENGTH} push.{PTR} exec.poseidon2::hash_elements_in_domain"),
-        format!("push.{NON_U32_LENGTH} push.{PTR} exec.poseidon2::pad_and_hash_elements"),
+        format!("push.0 push.{NON_U32_LENGTH} push.{PTR} exec.eidos::prepare_hasher_state"),
+        format!("push.{NON_U32_LENGTH} push.{PTR} exec.eidos::hash_elements"),
+        format!("push.1 push.{NON_U32_LENGTH} push.{PTR} exec.eidos::hash_elements_in_domain"),
+        format!("push.{NON_U32_LENGTH} push.{PTR} exec.eidos::pad_and_hash_elements"),
     ];
 
     for invocation in invocations {
-        let source = format!("use miden::core::crypto::hashes::poseidon2 begin {invocation} end");
+        let source = format!("use miden::core::crypto::hashes::eidos begin {invocation} end");
         let test = build_test!(source.as_str(), &[]);
         let err = test.execute().expect_err("a non-u32 length must be rejected");
         match err {

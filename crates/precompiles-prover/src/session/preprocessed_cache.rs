@@ -18,7 +18,9 @@ use miden_lifted_stark::{Preprocessed, StarkConfig, lmcs::Lmcs};
 use super::prove::ChipletMultiAir;
 use crate::{
     logup::NUM_PUBLIC_VALUES,
-    stark_config::{Blake3Config, KeccakConfig, Poseidon2Config, RpoConfig, RpxConfig},
+    stark_config::{
+        Blake3Config, EidosConfig, KeccakConfig, Poseidon2Config, RpoConfig, RpxConfig,
+    },
 };
 
 /// Either a process-cached (`std`) or freshly built (`no_std`) bundle;
@@ -92,3 +94,4 @@ cached_preprocessed!(rpo, RpoConfig);
 cached_preprocessed!(rpx, RpxConfig);
 cached_preprocessed!(poseidon2, Poseidon2Config);
 cached_preprocessed!(keccak, KeccakConfig);
+cached_preprocessed!(eidos, EidosConfig);

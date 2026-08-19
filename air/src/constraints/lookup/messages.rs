@@ -1,6 +1,6 @@
 //! Message structs for LogUp bus interactions.
 //!
-//! Each struct represents a reduced denominator encoding: `α + Σ βⁱ · field_i`.
+//! Each struct represents a reduced denominator encoding: `alpha + sum(beta^i * field_i)`.
 //! Fields are named for readability; the [`super::lookup::LookupMessage`] trait
 //! (implemented further down in this file) provides the `encode` method that
 //! produces the extension-field value.
@@ -13,6 +13,7 @@
 
 use miden_core::{
     WORD_SIZE,
+    chiplets::blakeg,
     field::{Algebra, PrimeCharacteristicRing},
 };
 
@@ -41,9 +42,6 @@ type WordFields<E> = [E; WORD_SIZE];
 /// MASM-side computation in lockstep, or the build fails here.
 pub const MIDEN_MAX_MESSAGE_WIDTH: usize = 16;
 
-// Tripwire for the MASM-side `gamma = beta^16` hardcoding in
-// `crates/lib/core/asm/sys/vm/public_inputs.masm:239-251` (4 sequential squarings).
-// If this width ever changes, that MASM must change in lockstep.
 const _: () = assert!(
     MIDEN_MAX_MESSAGE_WIDTH == 16,
     "MIDEN_MAX_MESSAGE_WIDTH is hardcoded as 16 by the MASM recursive verifier (4 squarings to reach gamma = beta^16). Update `crates/lib/core/asm/sys/vm/public_inputs.masm` before changing this constant.",
@@ -58,7 +56,7 @@ const _: () = assert!(
 #[repr(usize)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BusId {
-    // --- Out-of-circuit (boundary correction / eval_external) ---
+    // --- Out-of-circuit (boundary correction / reduced_aux_values) ---
     /// Kernel ROM init: kernel procedure digests from variable-length public inputs.
     KernelRomInit = 0,
     /// Block hash table (decoder p2): root program hash boundary correction.
@@ -69,7 +67,8 @@ pub enum BusId {
     // --- In-circuit buses ---
     KernelRomCall = 3,
     HasherLinearHashInit = 4,
-    HasherReturnState = 5,
+    /// Reserved hasher bus id. One-row controller rows use `HasherReturnHash`.
+    ReservedHasherBus5 = 5,
     HasherAbsorption = 6,
     HasherReturnHash = 7,
     HasherMerkleVerifyInit = 8,
@@ -93,13 +92,10 @@ pub enum BusId {
     RangeCheck = 21,
     /// ACE wiring bus (LogUp).
     AceWiring = 22,
-    /// Hasher perm-link input bus: pairs controller-input rows with perm-cycle row 0.
-    HasherPermLinkInput = 23,
-    /// Hasher perm-link output bus: pairs controller-output rows with perm-cycle row 15.
-    HasherPermLinkOutput = 24,
-    // IDs from this point are dormant until the atomic BlakeG cutover. Their ordering is pinned so
-    // the preparatory slices remain reproducible; the cutover will replace the Poseidon2 link IDs
-    // above and assign the final compact layout before regenerating protocol bindings.
+    /// Hasher compression-link bus: `[block(8), cv_in(4), cv_out(4)]`.
+    HasherCompressionLink = 23,
+    /// Reserved to keep following bus ids stable.
+    ReservedHasherBus24 = 24,
     /// Byte-pair lookup table: ordinary `[a, b, a & b]` for byte-sized operands.
     And8Lookup = 25,
     /// BlakeG rot12 contribution for byte position 0: `[a, b, contribution]`.
@@ -123,15 +119,12 @@ pub enum BusId {
     BlakeGInputWord = 34,
     /// BlakeG internal message-word bus: `[word_index, word, compression_cycle_id]`.
     BlakeGMessageWord = 35,
+    /// AEAD stream operation request: `[ctx, clk, src_ptr, dst_ptr, lane_base]`.
+    AeadStreamRequest = 36,
     /// AEAD-XOF BlakeG input request: `[clk, state[0..12]]`.
-    AeadBlakeGInput = 36,
+    AeadBlakeGInput = 37,
     /// AEAD-XOF BlakeG output pair: `[clk, first_lane_idx, value0, value1]`.
-    AeadBlakeGOutputPair = 37,
-    /// Dormant BlakeG compression-link bus: `[block(8), cv_in(4), cv_out(4)]`.
-    ///
-    /// This is appended while the active Poseidon2 AIR retains bus IDs 23 and 24. The atomic
-    /// protocol cutover will assign the final bus layout and regenerate its bindings.
-    HasherCompressionLink = 38,
+    AeadBlakeGOutputPair = 38,
 }
 
 impl BusId {
@@ -139,10 +132,10 @@ impl BusId {
     /// in lockstep with the enum: adding a new variant with a higher discriminant bumps
     /// `COUNT` automatically (and the assertion flags a missed update if the new variant's
     /// discriminant isn't contiguous).
-    pub const COUNT: usize = Self::HasherCompressionLink as usize + 1;
+    pub const COUNT: usize = Self::AeadBlakeGOutputPair as usize + 1;
 }
 
-// Per-variant discriminant locks. `BusId::COUNT` only catches gaps — a *reorder* that
+// Per-variant discriminant locks. `BusId::COUNT` only catches gaps. A *reorder* that
 // kept the high watermark would silently swap which `bus_prefix[i]` each variant resolves
 // to, breaking domain separation across every emitter and consumer. These per-variant
 // asserts pin the entire layout so any reorder fails at compile time.
@@ -154,7 +147,7 @@ const _: () = assert!(BusId::BlockHashTable as usize == 1);
 const _: () = assert!(BusId::LogDeferredRoot as usize == 2);
 const _: () = assert!(BusId::KernelRomCall as usize == 3);
 const _: () = assert!(BusId::HasherLinearHashInit as usize == 4);
-const _: () = assert!(BusId::HasherReturnState as usize == 5);
+const _: () = assert!(BusId::ReservedHasherBus5 as usize == 5);
 const _: () = assert!(BusId::HasherAbsorption as usize == 6);
 const _: () = assert!(BusId::HasherReturnHash as usize == 7);
 const _: () = assert!(BusId::HasherMerkleVerifyInit as usize == 8);
@@ -172,8 +165,8 @@ const _: () = assert!(BusId::StackOverflowTable as usize == 19);
 const _: () = assert!(BusId::SiblingTable as usize == 20);
 const _: () = assert!(BusId::RangeCheck as usize == 21);
 const _: () = assert!(BusId::AceWiring as usize == 22);
-const _: () = assert!(BusId::HasherPermLinkInput as usize == 23);
-const _: () = assert!(BusId::HasherPermLinkOutput as usize == 24);
+const _: () = assert!(BusId::HasherCompressionLink as usize == 23);
+const _: () = assert!(BusId::ReservedHasherBus24 as usize == 24);
 const _: () = assert!(BusId::And8Lookup as usize == 25);
 const _: () = assert!(BusId::BlakeGRot12Pos0 as usize == 26);
 const _: () = assert!(BusId::BlakeGRot12Pos1 as usize == 27);
@@ -185,9 +178,9 @@ const _: () = assert!(BusId::BlakeGRot7Pos2 as usize == 32);
 const _: () = assert!(BusId::BlakeGRot7Pos3 as usize == 33);
 const _: () = assert!(BusId::BlakeGInputWord as usize == 34);
 const _: () = assert!(BusId::BlakeGMessageWord as usize == 35);
-const _: () = assert!(BusId::AeadBlakeGInput as usize == 36);
-const _: () = assert!(BusId::AeadBlakeGOutputPair as usize == 37);
-const _: () = assert!(BusId::HasherCompressionLink as usize == 38);
+const _: () = assert!(BusId::AeadStreamRequest as usize == 36);
+const _: () = assert!(BusId::AeadBlakeGInput as usize == 37);
+const _: () = assert!(BusId::AeadBlakeGOutputPair as usize == 38);
 
 // HASHER MESSAGES
 // ================================================================================================
@@ -207,7 +200,7 @@ pub struct HasherMsg<E> {
 /// Payload for a [`HasherMsg`]; width varies per interaction kind.
 #[derive(Clone, Debug)]
 pub enum HasherPayload<E> {
-    /// 12-lane sponge state.
+    /// 12-lane BlakeG state.
     State(SpongeState<E>),
     /// 8-lane rate.
     Rate(Rate<E>),
@@ -218,9 +211,9 @@ pub enum HasherPayload<E> {
 impl<E: PrimeCharacteristicRing + Clone> HasherMsg<E> {
     // --- State messages (14 payload elements: [addr, node_index, state[12]]) ---
 
-    /// Linear hash / control block init: full 12-lane sponge state.
+    /// Linear hash / control block init: full 12-lane BlakeG state.
     ///
-    /// Used by: HPERM input, LOGDEFERRED input.
+    /// Used by: BCOMPRESS input, LOGDEFERRED input.
     pub fn linear_hash_init(addr: E, state: SpongeState<E>) -> Self {
         Self {
             kind: BusId::HasherLinearHashInit,
@@ -230,10 +223,12 @@ impl<E: PrimeCharacteristicRing + Clone> HasherMsg<E> {
         }
     }
 
-    /// Control block init: 8 rate lanes + opcode at `capacity[1]`, zeros elsewhere.
+    /// Control block init: 8 rate lanes + BlakeG chaining word initialized from `opcode`.
     ///
-    /// Used by: JOIN, SPLIT, LOOP, SPAN, CALL, SYSCALL, DYN, DYNCALL.
-    pub fn control_block(addr: E, rate: &Rate<E>, opcode: u8) -> Self {
+    /// Used by: JOIN, SPLIT, LOOP, CALL, SYSCALL, DYN, DYNCALL.
+    pub fn control_block(addr: E, rate: &[E; 8], opcode: u8) -> Self {
+        let cv = blakeg::two_to_one_chaining_word(opcode as u32);
+        let cv: [E; 4] = core::array::from_fn(|i| E::from_u64(cv[i].as_canonical_u64()));
         let state = [
             rate[0].clone(),
             rate[1].clone(),
@@ -243,10 +238,10 @@ impl<E: PrimeCharacteristicRing + Clone> HasherMsg<E> {
             rate[5].clone(),
             rate[6].clone(),
             rate[7].clone(),
-            E::ZERO,
-            E::from_u16(opcode as u16),
-            E::ZERO,
-            E::ZERO,
+            cv[0].clone(),
+            cv[1].clone(),
+            cv[2].clone(),
+            cv[3].clone(),
         ];
         Self {
             kind: BusId::HasherLinearHashInit,
@@ -256,12 +251,28 @@ impl<E: PrimeCharacteristicRing + Clone> HasherMsg<E> {
         }
     }
 
-    /// Return full sponge state after permutation.
-    ///
-    /// Used by: HPERM output, LOGDEFERRED output.
-    pub fn return_state(addr: E, state: SpongeState<E>) -> Self {
+    /// Basic-block hash init: 8 rate lanes + BlakeG chaining word initialized from the
+    /// logical number of operation groups in the block.
+    pub fn basic_block_init(addr: E, rate: &[E; 8], num_groups: E) -> Self {
+        let cv = blakeg::init_chaining_word(0, 0);
+        let mut cv: [E; 4] = core::array::from_fn(|i| E::from_u64(cv[i].as_canonical_u64()));
+        cv[3] = cv[3].clone() + num_groups;
+        let state = [
+            rate[0].clone(),
+            rate[1].clone(),
+            rate[2].clone(),
+            rate[3].clone(),
+            rate[4].clone(),
+            rate[5].clone(),
+            rate[6].clone(),
+            rate[7].clone(),
+            cv[0].clone(),
+            cv[1].clone(),
+            cv[2].clone(),
+            cv[3].clone(),
+        ];
         Self {
-            kind: BusId::HasherReturnState,
+            kind: BusId::HasherLinearHashInit,
             addr,
             node_index: E::ZERO,
             payload: HasherPayload::State(state),
@@ -286,7 +297,7 @@ impl<E: PrimeCharacteristicRing + Clone> HasherMsg<E> {
 
     /// Return digest only (node_index = 0).
     ///
-    /// Used by: END, MPVERIFY output, MRUPDATE output.
+    /// Used by: BCOMPRESS output, LOGDEFERRED output, END, MPVERIFY output, MRUPDATE output.
     pub fn return_hash(addr: E, word: WordFields<E>) -> Self {
         Self {
             kind: BusId::HasherReturnHash,
@@ -360,7 +371,7 @@ pub enum MemoryMsg<E> {
     /// 8-element message: `[ctx, addr, clk, word[0..4]]`.
     ///
     /// `#[non_exhaustive]` forces external construction through the typed
-    /// [`MemoryMsg::read_word`] / [`MemoryMsg::write_word`] helpers — see
+    /// [`MemoryMsg::read_word`] / [`MemoryMsg::write_word`] helpers. See
     /// [`MemoryMsg::Element`] for rationale.
     #[non_exhaustive]
     Word {
@@ -460,10 +471,10 @@ impl<E: PrimeCharacteristicRing> BitwiseMsg<E> {
 
 /// Block stack message: `[block_id, parent_id, is_loop, ctx, fmp, depth, fn_hash[4]]`.
 ///
-/// `Simple` — for blocks that don't save context (JOIN/SPLIT/SPAN/DYN/LOOP/RESPAN/END-simple).
+/// `Simple`: for blocks that don't save context (JOIN/SPLIT/SPAN/DYN/LOOP/RESPAN/END-simple).
 /// Context fields are encoded as zeros.
 ///
-/// `Full` — for blocks that save/restore the caller's execution context
+/// `Full`: for blocks that save/restore the caller's execution context
 /// (CALL/SYSCALL/DYNCALL/END-call).
 #[derive(Clone, Debug)]
 pub enum BlockStackMsg<E> {
@@ -486,10 +497,10 @@ pub enum BlockStackMsg<E> {
 /// Block hash queue message (7 elements):
 /// `[child_hash[4], parent, is_first_child, is_loop_body]`.
 ///
-/// `FirstChild` — first child of a JOIN (is_first_child = 1, is_loop_body = 0).
-/// `Child` — non-first, non-loop child (is_first_child = 0, is_loop_body = 0).
-/// `LoopBody` — loop body entry (is_first_child = 0, is_loop_body = 1).
-/// `End` — removal at END; both flags are computed expressions.
+/// `FirstChild`: first child of a JOIN (is_first_child = 1, is_loop_body = 0).
+/// `Child`: non-first, non-loop child (is_first_child = 0, is_loop_body = 0).
+/// `LoopBody`: loop body entry (is_first_child = 0, is_loop_body = 1).
+/// `End`: removal at END; both flags are computed expressions.
 #[derive(Clone, Debug)]
 pub enum BlockHashMsg<E> {
     FirstChild {
@@ -548,32 +559,12 @@ pub struct StackOverflowMsg<E> {
     pub prev: E,
 }
 
-// HASHER PERM-LINK MESSAGE
-// ================================================================================================
-
-/// Beta-power offset at which the Poseidon2 state starts in a perm-link denominator.
-///
-/// Offset 2 aligns the state lanes with full-state hasher messages; beta^1 is unused.
-const HASHER_PERM_LINK_STATE_OFFSET: usize = 2;
-const _: () = assert!(HASHER_PERM_LINK_STATE_OFFSET + STATE_WIDTH <= MIDEN_MAX_MESSAGE_WIDTH);
-
-/// Hasher perm-link message: `perm_id` plus the full Poseidon2 state.
-///
-/// The id ties a controller input/output row pair to the corresponding Poseidon2 permutation
-/// instance. `state` is encoded at `HASHER_PERM_LINK_STATE_OFFSET` to match full-state hasher
-/// messages.
-#[derive(Clone, Debug)]
-pub enum HasherPermLinkMsg<E> {
-    Input { perm_id: E, state: SpongeState<E> },
-    Output { perm_id: E, state: SpongeState<E> },
-}
-
-// BLAKEG AIR MESSAGES
+// HASHER COMPRESSION-LINK MESSAGE
 // ================================================================================================
 
 /// Hasher compression-link message: `[block(8), cv_in(4), cv_out(4)]`.
 ///
-/// Binds one hasher controller row to one BlakeG compression block once the Eidos path is active.
+/// Binds one hasher controller row to one BlakeG compression block.
 #[derive(Clone, Debug)]
 pub struct HasherCompressionLinkMsg<E> {
     pub block: [E; 8],
@@ -581,10 +572,13 @@ pub struct HasherCompressionLinkMsg<E> {
     pub cv_out: [E; 4],
 }
 
+// BYTE-PAIR LOOKUP MESSAGE
+// ================================================================================================
+
 /// Byte-pair lookup message (3 elements): `[a, b, result]`.
 ///
-/// Ordinary AND uses `result = a & b`. BlakeG B/D rotation buses use `result` as the 32-bit
-/// contribution of this byte pair to the rotated word.
+/// Ordinary AND uses `result = a & b`. BlakeG B/D rotation buses use
+/// `result` as the 32-bit contribution of this byte pair to the rotated word.
 #[derive(Clone, Debug)]
 pub struct And8Msg<E> {
     pub bus: BusId,
@@ -630,11 +624,24 @@ pub const fn blakeg_rot7_bus(pos: usize) -> BusId {
     }
 }
 
+// AEAD STREAM MESSAGES
+// ================================================================================================
+
+/// AEAD stream operation request: `[ctx, clk, src_ptr, dst_ptr, lane_base]`.
+#[derive(Clone, Debug)]
+pub struct AeadStreamRequestMsg<E> {
+    pub ctx: E,
+    pub clk: E,
+    pub src_ptr: E,
+    pub dst_ptr: E,
+    pub lane_base: E,
+}
+
 /// AEAD-XOF BlakeG input request: `[clk, state[0..12]]`.
 #[derive(Clone, Debug)]
 pub struct AeadBlakeGInputMsg<E> {
     pub clk: E,
-    pub state: [E; 12],
+    pub state: SpongeState<E>,
 }
 
 /// AEAD-XOF BlakeG output pair: `[clk, first_lane_idx, value0, value1]`.
@@ -690,7 +697,7 @@ pub struct AceInitMsg<E> {
 
 /// Range check message (1 element): `[value]`.
 ///
-/// The denominator is `α + β⁰ · value`.
+/// The denominator is `alpha + beta^0 * value`.
 #[derive(Clone, Debug)]
 pub struct RangeMsg<E> {
     pub value: E,
@@ -810,15 +817,24 @@ where
     }
 }
 
-// --- BlakeG AIR messages ------------------------------------------------------------------------
+// --- AEAD stream messages -----------------------------------------------------------------------
 
-impl<E, EF> LookupMessage<E, EF> for And8Msg<E>
+impl<E, EF> LookupMessage<E, EF> for AeadStreamRequestMsg<E>
 where
     E: PrimeCharacteristicRing + Clone,
     EF: PrimeCharacteristicRing + Clone + Algebra<E>,
 {
     fn encode(&self, challenges: &Challenges<EF>) -> EF {
-        challenges.encode(self.bus as usize, [self.a.clone(), self.b.clone(), self.result.clone()])
+        challenges.encode(
+            BusId::AeadStreamRequest as usize,
+            [
+                self.ctx.clone(),
+                self.clk.clone(),
+                self.src_ptr.clone(),
+                self.dst_ptr.clone(),
+                self.lane_base.clone(),
+            ],
+        )
     }
 }
 
@@ -857,6 +873,17 @@ where
     }
 }
 
+// --- And8Msg -------------------------------------------------------------------------------------
+
+impl<E, EF> LookupMessage<E, EF> for And8Msg<E>
+where
+    E: PrimeCharacteristicRing + Clone,
+    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        challenges.encode(self.bus as usize, [self.a.clone(), self.b.clone(), self.result.clone()])
+    }
+}
 // --- BlockStackMsg -------------------------------------------------------------------------------
 
 impl<E, EF> LookupMessage<E, EF> for BlockStackMsg<E>
@@ -867,7 +894,7 @@ where
     fn encode(&self, challenges: &Challenges<EF>) -> EF {
         let mut acc = challenges.bus_prefix[BusId::BlockStackTable as usize].clone();
         match self {
-            // `Simple` zero-pads to 10 slots; slots `3..10` contribute `β^k · 0 = 0` so
+            // `Simple` zero-pads to 10 slots; slots `3..10` contribute `beta^k * 0 = 0` so
             // they are elided from the loop.
             Self::Simple { block_id, parent_id, is_loop } => {
                 acc += challenges
@@ -1024,24 +1051,7 @@ where
     }
 }
 
-// --- HasherPermLinkMsg ---------------------------------------------------------------------------
-
-impl<E, EF> LookupMessage<E, EF> for HasherPermLinkMsg<E>
-where
-    E: PrimeCharacteristicRing + Clone,
-    EF: PrimeCharacteristicRing + Clone + Algebra<E>,
-{
-    fn encode(&self, challenges: &Challenges<EF>) -> EF {
-        let (bus, perm_id, state) = match self {
-            Self::Input { perm_id, state } => (BusId::HasherPermLinkInput, perm_id, state),
-            Self::Output { perm_id, state } => (BusId::HasherPermLinkOutput, perm_id, state),
-        };
-        let mut acc = challenges.bus_prefix[bus as usize].clone();
-        acc += perm_id.clone();
-        acc += challenges.inner_product_at(HASHER_PERM_LINK_STATE_OFFSET, state.as_slice());
-        acc
-    }
-}
+// --- HasherCompressionLinkMsg --------------------------------------------------------------------
 
 impl<E, EF> LookupMessage<E, EF> for HasherCompressionLinkMsg<E>
 where
@@ -1103,7 +1113,7 @@ where
         let is_element: E = E::ONE - is_word.clone();
 
         // Mux only the bus prefix; the payload (ctx, addr, clk, ...) is shared. Factored
-        // as a read/write select per access width so the four (read/write × element/word)
+        // as a read/write select per access width so the four (read/write x element/word)
         // cases stay audit-visible without blowing the polynomial degree.
         let prefix_element = challenges.bus_prefix[BusId::MemoryReadElement as usize].clone()
             * is_read.clone()
@@ -1128,16 +1138,17 @@ where
 // ================================================================================================
 //
 // [`SiblingMsg<E>`] carries the relevant hasher half alongside a [`SiblingBit`] tag and
-// encodes against sparse β layouts (`[2, 7, 8, 9, 10]` and `[2, 3, 4, 5, 6]`) dictated by
-// the responder-side hasher chiplet algebra. The trait is permissive about which β
+// encodes against sparse beta layouts (`[2, 7, 8, 9, 10]` and `[2, 3, 4, 5, 6]`) dictated by
+// the responder-side hasher chiplet algebra. The trait is permissive about which beta
 // positions an `encode` body touches; contiguity is a convention, not a requirement.
 
 /// Sibling-table message for the Merkle sibling bus.
 ///
 /// The Merkle direction bit picks which half of the hasher rate block holds the sibling:
-/// `bit = 0` → sibling at `h[4..8]`, payload lands in β positions `[1, 2, 7, 8, 9, 10]`
-/// (mrupdate_id at β¹, node_index at β², rate1 at β⁷..β¹⁰); `bit = 1` → sibling at
-/// `h[0..4]`, payload lands in β positions `[1, 2, 3, 4, 5, 6]`.
+/// `bit = 0` puts the sibling at `h[4..8]`, with payload in beta positions
+/// `[1, 2, 7, 8, 9, 10]` (mrupdate_id at beta^1, node_index at beta^2,
+/// rate1 at beta^7..beta^10). `bit = 1` puts the sibling at `h[0..4]`,
+/// with payload in beta positions `[1, 2, 3, 4, 5, 6]`.
 #[derive(Clone, Debug)]
 pub struct SiblingMsg<E> {
     pub bit: SiblingBit,
@@ -1149,9 +1160,9 @@ pub struct SiblingMsg<E> {
 /// Which half of the hasher rate block holds the sibling word for this row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SiblingBit {
-    /// `bit = 0` — sibling lives in the high rate half (`h[4..8]`).
+    /// `bit = 0`: sibling lives in the high rate half (`h[4..8]`).
     Zero,
-    /// `bit = 1` — sibling lives in the low rate half (`h[0..4]`).
+    /// `bit = 1`: sibling lives in the low rate half (`h[0..4]`).
     One,
 }
 
@@ -1169,5 +1180,34 @@ where
         };
         acc += challenges.inner_product_at(base, self.h.as_slice());
         acc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use miden_core::{Felt, field::QuadFelt};
+
+    use super::*;
+    use crate::lookup::LookupMessage;
+
+    #[test]
+    fn blakeg_rotation_positions_are_domain_separated() {
+        let challenges = Challenges::<QuadFelt>::new(
+            QuadFelt::new([Felt::new_unchecked(3), Felt::new_unchecked(5)]),
+            QuadFelt::new([Felt::new_unchecked(7), Felt::new_unchecked(11)]),
+            MIDEN_MAX_MESSAGE_WIDTH,
+            BusId::COUNT,
+        );
+
+        let a = Felt::new_unchecked(19);
+        let b = Felt::new_unchecked(23);
+        let result = Felt::new_unchecked(29);
+
+        let rot12_pos0 = And8Msg::blakeg_rot12(0, a, b, result).encode(&challenges);
+        let rot12_pos1 = And8Msg::blakeg_rot12(1, a, b, result).encode(&challenges);
+        assert_ne!(rot12_pos0, rot12_pos1);
+
+        let rot7_pos0 = And8Msg::blakeg_rot7(0, a, b, result).encode(&challenges);
+        assert_ne!(rot12_pos0, rot7_pos0);
     }
 }

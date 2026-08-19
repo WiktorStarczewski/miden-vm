@@ -3,14 +3,13 @@
 //! Chiplet-side responses from the hasher, bitwise, memory, ACE, and kernel ROM chiplets,
 //! all sharing one LogUp column.
 //!
-//! The 7 hasher response variants are gated on hasher controller rows
-//! (`chiplet_active.controller = 1`) using the controller-internal `(s0, s1, s2, is_boundary)`
-//! columns. Non-hasher variants (bitwise / memory / ACE init / kernel ROM) are gated by the
-//! matching `chiplet_active.{bitwise, memory, ace, kernel_rom}` flag.
+//! Hasher operation-init responses are gated on the single-row controller selector encoding.
+//! Final hasher digest returns live in a dedicated lookup column, because a final controller row
+//! may emit both an init response and a return response.
 //!
 //! Memory uses the runtime-muxed [`MemoryResponseMsg`] encoding (label + is_word mux)
-//! rather than splitting into 4 per-label variants. This keeps the response-column
-//! transition degree at 8. A per-variant split would raise it to 9.
+//! rather than splitting into four per-label variants. This keeps the response-column
+//! transition degree at 8; a per-variant split would bump it to 9.
 
 use core::{array, borrow::Borrow};
 
@@ -18,22 +17,32 @@ use miden_core::field::PrimeCharacteristicRing;
 
 use crate::{
     constraints::{
-        chiplets::columns::{ControllerCols, PeriodicCols},
+        chiplets::columns::PeriodicCols,
         lookup::{
             chiplet_air::{ChipletBusContext, ChipletLookupBuilder},
             messages::{
-                AceInitMsg, BitwiseMsg, BusId, HasherMsg, HasherPayload, KernelRomMsg,
+                AceInitMsg, And8Msg, BitwiseMsg, BusId, HasherMsg, HasherPayload, KernelRomMsg,
                 MemoryResponseMsg,
             },
         },
-        utils::BoolNot,
+        utils::{BoolNot, pack_u32_bytes_le},
     },
     lookup::{Deg, LookupBatch, LookupColumn, LookupGroup},
-    trace::chiplets::hasher::{DIGEST_LEN, RATE_LEN, STATE_WIDTH},
 };
 
 /// Upper bound on fractions this emitter pushes into its column per row.
-pub(in crate::constraints::lookup) const MAX_INTERACTIONS_PER_ROW: usize = 2;
+///
+/// All adds gate on per-chiplet `chiplet_active.*` flags which are mutually exclusive (at
+/// most one chiplet runs per row). Within the hasher branch, init variants are gated by
+/// mutually exclusive selector/start combinations. The kernel-ROM branch
+/// emits two fractions per active row: an INIT-labeled remove (multiplicity 1) plus a
+/// CALL-labeled add with multiplicity equal to the row's `multiplicity` column. Every
+/// other chiplet emits exactly one fraction when active. AEAD stream rows emit four
+/// byte-pair removals. Per-row max: 4.
+pub(in crate::constraints::lookup) const MAX_INTERACTIONS_PER_ROW: usize = 4;
+
+/// Declared degree of the chiplet-responses lookup column.
+pub(in crate::constraints::lookup) const COLUMN_DEG: Deg = Deg { v: 7, u: 8 };
 
 /// Emit the chiplet responses bus.
 pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
@@ -43,36 +52,59 @@ pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
     LB: ChipletLookupBuilder,
 {
     let local = ctx.local;
-    let next = ctx.next;
-
-    // Read the typed periodic column view (used for bitwise k_transition).
-    let k_transition: LB::Expr = {
+    // Read the typed periodic column view used by AEAD stream rows.
+    let aead_phase: [LB::Expr; 8] = {
         let periodic: &PeriodicCols<LB::PeriodicVar> = builder.periodic_values().borrow();
-        periodic.bitwise.k_transition.into()
+        [
+            periodic.aead_stream.r0.into(),
+            periodic.aead_stream.r1.into(),
+            periodic.aead_stream.r2.into(),
+            periodic.aead_stream.r3.into(),
+            periodic.aead_stream.r4.into(),
+            periodic.aead_stream.r5.into(),
+            periodic.aead_stream.r6.into(),
+            periodic.aead_stream.r7.into(),
+        ]
     };
 
     // Typed chiplet-data overlays.
     let ctrl = local.controller();
-    let ctrl_next = next.controller();
     let bw = local.bitwise();
+    let stream = local.aead_stream();
     let mem = local.memory();
     let ace = local.ace();
     let krom = local.kernel_rom();
 
-    let state: [LB::Var; STATE_WIDTH] = ctrl.state;
-    let rate_0: [LB::Var; DIGEST_LEN] = array::from_fn(|i| ctrl.state[i]);
-    let rate_1: [LB::Var; DIGEST_LEN] = array::from_fn(|i| ctrl.state[DIGEST_LEN + i]);
+    // Hasher-internal sub-selectors (valid on controller rows). Used many times below via their
+    // negated siblings, so kept as named expressions.
+    let hs0: LB::Expr = ctrl.s0.into();
+    let hs1: LB::Expr = ctrl.s1.into();
+    let hs2: LB::Expr = ctrl.s2.into();
+    let not_hs0 = hs0.not();
+    let not_hs1 = hs1.not();
+    let not_hs2 = hs2.not();
+    let merkle_or_padding: LB::Expr = local.controller_merkle_or_padding().into();
+    let hash_gate = ctx.chiplet_active.controller.clone() * merkle_or_padding.not();
+    // The controller skeleton makes `merkle_or_padding * s0` zero off controller rows. Keeping
+    // this gate narrow avoids a higher-degree controller-selector factor.
+    let merkle_gate = merkle_or_padding * hs0.clone();
+    let merkle_start: LB::Expr = ctrl.merkle_is_start().into();
+
+    let state: [LB::Var; 12] = ctrl.state;
+    let rate_0: [LB::Var; 4] = array::from_fn(|i| ctrl.state[i]);
+    let rate_1: [LB::Var; 4] = array::from_fn(|i| ctrl.state[4 + i]);
 
     // --- Hasher response flags ---
-    // All gated by `chiplet_active.controller`; the row type is selected by the
-    // controller-internal `(s0, s1, s2, is_boundary)` columns.
-    let controller_flag = ctx.chiplet_active.controller.clone();
-    let hasher_flags = hasher_response_flags(controller_flag, ctrl);
+    let f_sponge_start: LB::Expr = hash_gate.clone() * hs0;
+    let f_sponge_respan: LB::Expr = hash_gate * not_hs0;
+    let f_mp: LB::Expr = merkle_gate.clone() * not_hs1 * hs2.clone() * merkle_start.clone();
+    let f_mv: LB::Expr = merkle_gate.clone() * hs1.clone() * not_hs2 * merkle_start.clone();
+    let f_mu: LB::Expr = merkle_gate * hs1 * hs2 * merkle_start;
 
     // --- Non-hasher flags ---
 
-    // Bitwise: responds only on the last row of the 8-row cycle (k_transition = 0).
-    let is_bitwise_responding: LB::Expr = ctx.chiplet_active.bitwise.clone() * k_transition.not();
+    // Normal bitwise rows use one row per operation.
+    let is_bitwise_responding: LB::Expr = ctx.chiplet_active.bitwise.clone();
 
     // ACE init: responds only on ACE start rows.
     let is_ace_init: LB::Expr = ctx.chiplet_active.ace.clone() * ace.s_start.into();
@@ -81,18 +113,12 @@ pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
 
     // All hasher response variants encode their row at the chiplet-trace row counter
     // (`chip_clk`) so they cancel against the matching request.
-    let clk_plus_one: LB::Expr = local.chip_clk.into();
+    let row_addr: LB::Expr = local.chip_clk.into();
 
     // Local helpers: convert the copied Var arrays into Expr arrays.
-    let full_state = || -> [LB::Expr; STATE_WIDTH] { state.map(Into::into) };
-    let full_rate = || -> [LB::Expr; RATE_LEN] {
-        array::from_fn(|i| {
-            if i < DIGEST_LEN {
-                rate_0[i].into()
-            } else {
-                rate_1[i - DIGEST_LEN].into()
-            }
-        })
+    let full_state = || -> [LB::Expr; 12] { state.map(Into::into) };
+    let full_rate = || -> [LB::Expr; 8] {
+        array::from_fn(|i| if i < 4 { rate_0[i].into() } else { rate_1[i - 4].into() })
     };
 
     builder.next_column(
@@ -103,10 +129,10 @@ pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
                     // Sponge start: full 12-lane state, node_index = 0.
                     g.add(
                         "sponge_start",
-                        hasher_flags.f_sponge_start,
+                        f_sponge_start,
                         || HasherMsg {
                             kind: BusId::HasherLinearHashInit,
-                            addr: clk_plus_one.clone(),
+                            addr: row_addr.clone(),
                             node_index: LB::Expr::ZERO,
                             payload: HasherPayload::State(full_state()),
                         },
@@ -116,10 +142,10 @@ pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
                     // Sponge RESPAN: rate-only 8 lanes, node_index = 0.
                     g.add(
                         "sponge_respan",
-                        hasher_flags.f_sponge_respan,
+                        f_sponge_respan,
                         || HasherMsg {
                             kind: BusId::HasherAbsorption,
-                            addr: clk_plus_one.clone(),
+                            addr: row_addr.clone(),
                             node_index: LB::Expr::ZERO,
                             payload: HasherPayload::Rate(full_rate()),
                         },
@@ -127,22 +153,21 @@ pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
                     );
 
                     // Merkle leaf-word inputs for MP_VERIFY / MR_UPDATE_OLD / MR_UPDATE_NEW.
-                    // Each path has its own controller flag. All three encode
-                    // `leaf = (1-bit)*rate_0 + bit*rate_1` with
-                    // `bit = node_index - 2*node_index_next` (the current Merkle direction bit).
+                    // Each fires only on the first row of the corresponding Merkle path.
                     for (name, flag, kind) in [
-                        ("mp_verify_input", hasher_flags.f_mp, BusId::HasherMerkleVerifyInit),
-                        ("mr_update_old_input", hasher_flags.f_mv, BusId::HasherMerkleOldInit),
-                        ("mr_update_new_input", hasher_flags.f_mu, BusId::HasherMerkleNewInit),
+                        ("mp_verify_input", f_mp, BusId::HasherMerkleVerifyInit),
+                        ("mr_update_old_input", f_mv, BusId::HasherMerkleOldInit),
+                        ("mr_update_new_input", f_mu, BusId::HasherMerkleNewInit),
                     ] {
                         g.add(
                             name,
                             flag,
                             || {
-                                let addr = clk_plus_one.clone();
-                                let node_index: LB::Expr = ctrl.node_index.into();
-                                let bit: LB::Expr =
-                                    node_index.clone() - ctrl_next.node_index.into().double();
+                                let addr = row_addr.clone();
+                                let node_index: LB::Expr = ctrl.merkle_node_index().into();
+                                let bit: LB::Expr = node_index.clone()
+                                    - Into::<LB::Expr>::into(ctrl.merkle_node_index_next())
+                                        .double();
                                 let one_minus_bit = bit.not();
                                 let word: [LB::Expr; 4] = array::from_fn(|i| {
                                     one_minus_bit.clone() * rate_0[i].into()
@@ -159,54 +184,61 @@ pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
                         );
                     }
 
-                    // HOUT: digest = rate_0.
-                    g.add(
-                        "hout",
-                        hasher_flags.f_hout,
-                        || {
-                            let addr = clk_plus_one.clone();
-                            let node_index: LB::Expr = ctrl.node_index.into();
-                            let word: [LB::Expr; 4] = rate_0.map(LB::Expr::from);
-                            HasherMsg {
-                                kind: BusId::HasherReturnHash,
-                                addr,
-                                node_index,
-                                payload: HasherPayload::Word(word),
-                            }
-                        },
-                        Deg { v: 4, u: 5 },
-                    );
-
-                    // SOUT: full 12-lane state (HPERM / LOGPRECOMPILE return), node_index = 0.
-                    g.add(
-                        "sout",
-                        hasher_flags.f_sout,
-                        || HasherMsg {
-                            kind: BusId::HasherReturnState,
-                            addr: clk_plus_one.clone(),
-                            node_index: LB::Expr::ZERO,
-                            payload: HasherPayload::State(full_state()),
-                        },
-                        Deg { v: 5, u: 6 },
-                    );
-
                     // Bitwise: runtime op selector bit.
                     g.add(
                         "bitwise",
                         is_bitwise_responding,
                         || {
                             let bw_op: LB::Expr = bw.op_flag.into();
-                            BitwiseMsg {
-                                op: bw_op,
-                                a: bw.a.into(),
-                                b: bw.b.into(),
-                                result: bw.output.into(),
-                            }
+                            let a = pack_u32_bytes_le::<_, LB::Expr>(bw.a_bytes);
+                            let b = pack_u32_bytes_le::<_, LB::Expr>(bw.b_bytes);
+                            let and = pack_u32_bytes_le::<_, LB::Expr>(bw.and_bytes);
+                            let xor = a.clone() + b.clone() - and.double();
+                            let result = and.clone() + bw_op.clone() * (xor - and);
+                            BitwiseMsg { op: bw_op, a, b, result }
                         },
-                        Deg { v: 3, u: 4 },
+                        Deg { v: 3, u: 5 },
                     );
 
-                    // Memory response.
+                    let mut remove_stream_row = |name: &'static str, phase_idx: usize| {
+                        let gate =
+                            ctx.chiplet_active.aead_stream.clone() * aead_phase[phase_idx].clone();
+                        g.batch(
+                            name,
+                            gate,
+                            |b| {
+                                let bytes = match phase_idx % 4 {
+                                    0 => stream.read().bytes,
+                                    1 => stream.high_first().bytes,
+                                    2 => stream.low_second().bytes,
+                                    3 => stream.high_second().bytes,
+                                    _ => unreachable!(),
+                                };
+                                for idx in 0..4 {
+                                    b.remove(
+                                        "aead_stream_byte",
+                                        And8Msg::new(
+                                            bytes[idx].into(),
+                                            bytes[4 + idx].into(),
+                                            bytes[8 + idx].into(),
+                                        ),
+                                        Deg { v: 2, u: 3 },
+                                    );
+                                }
+                            },
+                            Deg { v: 3, u: 4 },
+                        );
+                    };
+                    remove_stream_row("aead_stream_row0", 0);
+                    remove_stream_row("aead_stream_row1", 1);
+                    remove_stream_row("aead_stream_row2", 2);
+                    remove_stream_row("aead_stream_row3", 3);
+                    remove_stream_row("aead_stream_row4", 4);
+                    remove_stream_row("aead_stream_row5", 5);
+                    remove_stream_row("aead_stream_row6", 6);
+                    remove_stream_row("aead_stream_row7", 7);
+
+                    // Memory response: runtime (is_read, is_word) mux keeps column transition at 8.
                     g.add(
                         "memory",
                         ctx.chiplet_active.memory.clone(),
@@ -283,76 +315,9 @@ pub(in crate::constraints::lookup) fn emit_chiplet_responses<LB>(
                         Deg { v: 7, u: 7 }, // (V, U) = (2 + 5, 2 + 5); kernel_rom flag deg 5
                     );
                 },
-                Deg { v: 7, u: 7 },
+                COLUMN_DEG,
             );
         },
-        Deg { v: 7, u: 7 },
+        COLUMN_DEG,
     );
-}
-
-struct HasherResponseFlags<E> {
-    f_sponge_start: E,
-    f_sponge_respan: E,
-    f_mp: E,
-    f_mv: E,
-    f_mu: E,
-    f_hout: E,
-    f_sout: E,
-}
-
-fn hasher_response_flags<E, V>(
-    controller_flag: E,
-    ctrl: &ControllerCols<V>,
-) -> HasherResponseFlags<E>
-where
-    E: PrimeCharacteristicRing + Clone,
-    V: Copy + Into<E>,
-{
-    let hs0: E = ctrl.s0.into();
-    let hs1: E = ctrl.s1.into();
-    let hs2: E = ctrl.s2.into();
-    let is_boundary: E = ctrl.is_boundary.into();
-    let not_hs0 = hs0.not();
-    let not_hs1 = hs1.not();
-    let not_hs2 = hs2.not();
-
-    // Sponge start: input (hs0=1), hs1=hs2=0, is_boundary=1. Full 12-lane state.
-    let f_sponge_start = controller_flag.clone()
-        * hs0.clone()
-        * not_hs1.clone()
-        * not_hs2.clone()
-        * is_boundary.clone();
-
-    // Sponge RESPAN: input, hs1=hs2=0, is_boundary=0. Rate-only 8 lanes.
-    let f_sponge_respan = controller_flag.clone()
-        * hs0.clone()
-        * not_hs1.clone()
-        * not_hs2.clone()
-        * is_boundary.not();
-
-    // Merkle tree input rows (is_boundary=1):
-    //   f_mp = ctrl * hs0 * (1-hs1) * hs2 * is_boundary
-    //   f_mv = ctrl * hs0 * hs1 * (1-hs2) * is_boundary
-    //   f_mu = ctrl * hs0 * hs1 * hs2 * is_boundary
-    let f_mp =
-        controller_flag.clone() * hs0.clone() * not_hs1.clone() * hs2.clone() * is_boundary.clone();
-    let f_mv =
-        controller_flag.clone() * hs0.clone() * hs1.clone() * not_hs2.clone() * is_boundary.clone();
-    let f_mu = controller_flag.clone() * hs0 * hs1 * hs2.clone() * is_boundary.clone();
-
-    // HOUT output: hs0=hs1=hs2=0 (always responds on digest). Degree 4 (no is_boundary).
-    let f_hout = controller_flag.clone() * not_hs0.clone() * not_hs1.clone() * not_hs2;
-
-    // SOUT output with is_boundary=1 only (HPERM / LOGPRECOMPILE return).
-    let f_sout = controller_flag * not_hs0 * not_hs1 * hs2 * is_boundary;
-
-    HasherResponseFlags {
-        f_sponge_start,
-        f_sponge_respan,
-        f_mp,
-        f_mv,
-        f_mu,
-        f_hout,
-        f_sout,
-    }
 }

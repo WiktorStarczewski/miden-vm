@@ -19,7 +19,7 @@
 //! to "recompute every leaf, check the root", which is the right shape for a registry
 //! small enough to rebuild wholesale.
 
-use miden_core::{Felt, Word, crypto::hash::Poseidon2};
+use miden_core::{Felt, Word, crypto::hash::Eidos};
 use miden_crypto::{
     field::ExtensionField,
     merkle::{MerklePath, MerkleTree, NodeIndex},
@@ -46,7 +46,7 @@ pub const MAX_REGISTRY_AIRS: usize = 12;
 /// leaf being read as a circuit commitment, and a tag bound below the active leaf count
 /// stops padding slots being opened at all.
 pub fn padding_leaf() -> Word {
-    Poseidon2::hash_elements(&[Felt::new_unchecked(PADDING_DOMAIN)])
+    Eidos::hash_elements(&[Felt::new_unchecked(PADDING_DOMAIN)])
 }
 
 /// Compute `n!`.
@@ -254,10 +254,8 @@ fn fold_levels(row: &[Word]) -> Vec<Vec<Word>> {
     levels.push(row.to_vec());
     while levels.last().expect("at least the row").len() > 1 {
         let below = levels.last().expect("level exists");
-        let above: Vec<Word> = below
-            .chunks_exact(2)
-            .map(|pair| Poseidon2::merge(&[pair[0], pair[1]]))
-            .collect();
+        let above: Vec<Word> =
+            below.chunks_exact(2).map(|pair| Eidos::merge(&[pair[0], pair[1]])).collect();
         levels.push(above);
     }
     levels
@@ -411,7 +409,7 @@ mod tests {
         ) {
             let mut leaves: Vec<Word> = (0..layout.order_count())
                 .map(|index| {
-                    Poseidon2::hash_elements(&[
+                    Eidos::hash_elements(&[
                         Felt::new_unchecked(u64::from(salt)),
                         Felt::new_unchecked(index as u64),
                     ])
@@ -509,7 +507,7 @@ mod tests {
     fn assert_spliced_paths_match_a_materialised_tree(num_airs: usize, row_depth: usize) {
         let layout = RegistryLayout::new(num_airs, row_depth).expect("valid layout");
         let mut leaves: Vec<Word> = (0..layout.order_count())
-            .map(|tag| Poseidon2::hash_elements(&[Felt::new_unchecked(0x1000 + tag as u64)]))
+            .map(|tag| Eidos::hash_elements(&[Felt::new_unchecked(0x1000 + tag as u64)]))
             .collect();
         leaves.resize(layout.leaf_count(), padding_leaf());
 

@@ -19,24 +19,33 @@ const FELTS_PER_KERNEL_DIGEST = 4
 # Must match KernelDescriptor::MAX_NUM_PROCEDURES.
 const MAX_NUM_KERNEL_PROCEDURES = 255
 # Number of AIR instances contributing to the proof order.
-const NUM_MIDEN_AIRS = 3
+const NUM_MIDEN_AIRS = 4
+const AND8_LOOKUP_LOG_HEIGHT = 16
 
-# RELATION_DIGEST = hash(PROTOCOL_ID, ACE_REGISTRY_ROOT).
-const RELATION_DIGEST_0 = 6707657866347869898
-const RELATION_DIGEST_1 = 15003255403457090401
-const RELATION_DIGEST_2 = 3161728420253440800
-const RELATION_DIGEST_3 = 3925668149141025919
+# RELATION_DIGEST = Eidos::hash_elements([PROTOCOL_ID, ACE_REGISTRY_ROOT]).
+const RELATION_DIGEST_0 = 1871290895922266387
+const RELATION_DIGEST_1 = 634337142729927587
+const RELATION_DIGEST_2 = 8890966751328635543
+const RELATION_DIGEST_3 = 7074011946822443801
 
 # Root of the accepted ACE circuit registry. Leaves are indexed by ORDER_TAG.
-const ACE_REGISTRY_ROOT_0 = 15494055359749385108
-const ACE_REGISTRY_ROOT_1 = 10378068431877225902
-const ACE_REGISTRY_ROOT_2 = 8906024671689956466
-const ACE_REGISTRY_ROOT_3 = 8201729358988149119
+const ACE_REGISTRY_ROOT_0 = 3377609893138869405
+const ACE_REGISTRY_ROOT_1 = 1440849756497241831
+const ACE_REGISTRY_ROOT_2 = 4379940393380605529
+const ACE_REGISTRY_ROOT_3 = 543272148153382251
+
+# Commitment to the canonical And8 preprocessed table under the Eidos LMCS setup.
+const AND8_PREPROCESSED_TRACE_COM_0 = 8101824786889297799
+const AND8_PREPROCESSED_TRACE_COM_1 = 5557459202643843712
+const AND8_PREPROCESSED_TRACE_COM_2 = 8609469204800341145
+const AND8_PREPROCESSED_TRACE_COM_3 = 5780773595731865481
 
 #! Loads the VM-specific AIR context used by the generic STARK verifier.
 #!
 #! Advice supplies log heights in fixed instance order:
-#!   [log_core, log_chiplets, log_poseidon2_permutation]
+#!   [log_core, log_chiplets, log_blakeg_compression]
+#!
+#! The And8 lookup height is fixed verifier setup.
 #!
 #! Writes the trace shape, proof-order tag, relation commitments, and fixed OOD/query-row
 #! addresses to verifier memory.
@@ -51,12 +60,17 @@ pub proc load_air_context
 
     adv_push
     exec.assert_shape_log
-    exec.layout::set_poseidon2_permutation_trace_length_log
+    exec.layout::set_blakeg_compression_trace_length_log
+
+    push.AND8_LOOKUP_LOG_HEIGHT
+    exec.layout::set_and8_lookup_trace_length_log
 
     exec.layout::get_core_trace_length_log
     exec.layout::get_chiplets_trace_length_log
     u32max
-    exec.layout::get_poseidon2_permutation_trace_length_log
+    exec.layout::get_blakeg_compression_trace_length_log
+    u32max
+    exec.layout::get_and8_lookup_trace_length_log
     u32max
     exec.constants::set_trace_length_log
 
@@ -65,10 +79,15 @@ pub proc load_air_context
 
     exec.store_relation_digest
     exec.store_ace_registry_root
+    exec.store_and8_preprocessed_trace_commitment
     exec.layout::ood_evaluations_ptr
     exec.constants::set_ood_evaluations_address
     exec.layout::current_trace_row_ptr
     exec.constants::set_current_trace_row_address
+    exec.layout::auxiliary_ace_inputs_ptr
+    exec.constants::set_auxiliary_ace_inputs_address
+    exec.layout::aux_rand_elem_ptr
+    exec.constants::set_aux_rand_elem_address
 end
 
 proc assert_shape_log
@@ -94,7 +113,7 @@ end
 #! `pos_k` is always in `0 .. NUM_MIDEN_AIRS - 1` (inv_k <= k and k + after_k <= N - 1), so the
 #! factorial argument never underflows the field.
 #!
-#! This VM-local specialization keeps the three-AIR loop bounds compile-time constants. New
+#! This VM-local specialization keeps the four-AIR loop bounds compile-time constants. New
 #! relations should use `stark::utils::derive_order_tag_from_heights`; tests pin both paths to the
 #! same Rust ranking. Changing the VM AIR set requires updating `NUM_MIDEN_AIRS`, its relation
 #! layout accessors, and the public-input schema; regeneration checks pin those copies.
@@ -189,6 +208,12 @@ proc store_ace_registry_root
     push.ACE_REGISTRY_ROOT_3.ACE_REGISTRY_ROOT_2.ACE_REGISTRY_ROOT_1.ACE_REGISTRY_ROOT_0
     exec.constants::ace_registry_root_ptr mem_storew_le
     # Relation metadata is memory-only; leave the caller stack unchanged.
+    dropw
+end
+
+proc store_and8_preprocessed_trace_commitment
+    push.AND8_PREPROCESSED_TRACE_COM_3.AND8_PREPROCESSED_TRACE_COM_2.AND8_PREPROCESSED_TRACE_COM_1.AND8_PREPROCESSED_TRACE_COM_0
+    exec.constants::preprocessed_trace_com_ptr mem_storew_le
     dropw
 end
 

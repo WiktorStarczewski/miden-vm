@@ -2,20 +2,28 @@
 
 use std::{collections::HashMap, fmt::Debug, format, string::String, vec::Vec};
 
-use miden_air::lookup::{
-    Challenges, LookupAir,
-    debug::{check_trace_balance, trace::DebugTraceBuilder},
+use miden_air::{
+    MidenAir,
+    logup::{BusId as MidenBusId, MIDEN_MAX_MESSAGE_WIDTH},
+    lookup::{
+        Challenges, LookupAir,
+        debug::{check_trace_balance, trace::DebugTraceBuilder},
+    },
 };
 use miden_core::{Felt, field::QuadFelt, utils::RowMajorMatrix};
 use miden_lifted_air::LiftedAir;
 
 use crate::{
+    composite::extract_band,
     ec::{add::EcGroupAddAir, msm::EcMsmAir, point_store_groups::EcPointStoreGroupsAir},
     hash::{chunk_node_sponge::ChunkNodeSpongeAir, keccak::round::KeccakRoundAir},
     logup::LookupMessage,
-    primitives::byte_pair_lut::BytePairLutAir,
+    primitives::byte_pair_lut::{BytePairLutAir, NUM_MAIN_COLS as BPL_MAIN_COLS},
     session::{ChipletAir, NUM_CHIPLETS, fixed_ecgroup_msgs, fixed_uintval_msgs},
-    transcript::{eval::TranscriptEvalAir, poseidon2::Poseidon2Air},
+    transcript::{
+        eidos::{BlakeGInterfaceAir, BlakeGNarrowAir, COL_BLAKEG_END},
+        eval::TranscriptEvalAir,
+    },
     uint::{add::UintAddAir, store_mul::UintStoreMulAir},
 };
 
@@ -35,6 +43,28 @@ pub(crate) fn fold_balance<A>(
     let combined = crate::tests::combined_lookup_main(air, main);
     let lookup_main = combined.as_ref().unwrap_or(main);
     let report = check_trace_balance(air, lookup_main, &periodic, &[], &[], challenges);
+    for u in report.unmatched {
+        let entry = net.entry(u.denom).or_insert((Felt::ZERO, String::new()));
+        entry.0 += u.net_multiplicity;
+        if entry.1.is_empty()
+            && let Some(c) = u.contributions.first()
+        {
+            entry.1 = c.msg_repr.clone();
+        }
+    }
+}
+
+fn fold_balance_with_native_preprocessed<A>(
+    air: &A,
+    main: &RowMajorMatrix<Felt>,
+    challenges: &Challenges<QuadFelt>,
+    net: &mut HashMap<QuadFelt, (Felt, String)>,
+) where
+    A: LiftedAir<Felt, QuadFelt>,
+    for<'a> A: LookupAir<DebugTraceBuilder<'a>>,
+{
+    let periodic = air.periodic_columns();
+    let report = check_trace_balance(air, main, &periodic, &[], &[], challenges);
     for u in report.unmatched {
         let entry = net.entry(u.denom).or_insert((Felt::ZERO, String::new()));
         entry.0 += u.net_multiplicity;
@@ -78,6 +108,12 @@ pub(crate) fn session_stack_residual(
     challenges: &Challenges<QuadFelt>,
 ) -> Vec<(Felt, String)> {
     let mut net = HashMap::new();
+    let miden_challenges = Challenges::new(
+        challenges.alpha,
+        challenges.beta_powers[1],
+        MIDEN_MAX_MESSAGE_WIDTH,
+        MidenBusId::COUNT,
+    );
     for (idx, air) in ChipletAir::all().into_iter().enumerate() {
         let main = replacements
             .iter()
@@ -87,9 +123,28 @@ pub(crate) fn session_stack_residual(
             ChipletAir::ChunkNodeSponge => {
                 fold_balance(&ChunkNodeSpongeAir, main, challenges, &mut net)
             },
-            ChipletAir::Poseidon2 => fold_balance(&Poseidon2Air, main, challenges, &mut net),
+            ChipletAir::BlakeGCompression => {
+                fold_balance(&BlakeGInterfaceAir, main, challenges, &mut net);
+                let blakeg = extract_band(main, 0..COL_BLAKEG_END);
+                fold_balance_with_native_preprocessed(
+                    &BlakeGNarrowAir,
+                    &blakeg,
+                    &miden_challenges,
+                    &mut net,
+                );
+            },
             ChipletAir::KeccakRound => fold_balance(&KeccakRoundAir, main, challenges, &mut net),
-            ChipletAir::BytePairLut => fold_balance(&BytePairLutAir, main, challenges, &mut net),
+            ChipletAir::BytePairAnd8 => {
+                let bpl = extract_band(main, 0..BPL_MAIN_COLS);
+                let and8 = extract_band(main, BPL_MAIN_COLS..main.width);
+                fold_balance(&BytePairLutAir, &bpl, challenges, &mut net);
+                fold_balance_with_native_preprocessed(
+                    &MidenAir::And8Lookup,
+                    &and8,
+                    &miden_challenges,
+                    &mut net,
+                );
+            },
             ChipletAir::TranscriptEval => {
                 fold_balance(&TranscriptEvalAir, main, challenges, &mut net)
             },

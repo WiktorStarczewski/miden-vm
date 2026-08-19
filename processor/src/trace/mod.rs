@@ -38,9 +38,6 @@ pub(crate) use execution_tracer::TraceReplay;
 pub use miden_air::trace::RowIndex;
 pub use miden_core::deferred::PrecompileWitness;
 pub use parallel::{CORE_TRACE_WIDTH, build_trace, build_trace_with_max_len};
-// Re-exported for the streaming trace-build path
-// (`FastProcessor::execute_and_build_trace_sync`), which is std-only; the buffered path
-// uses `build_hasher_chiplet` and `MAX_TRACE_LEN` directly within `parallel`.
 #[cfg(feature = "std")]
 pub(crate) use parallel::{MAX_TRACE_LEN, build_hasher_chiplet, build_trace_with_prebuilt_hasher};
 #[cfg(feature = "std")]
@@ -154,7 +151,7 @@ impl VmWitness {
 /// Execution trace which is generated when a program is executed on the VM.
 ///
 /// The trace consists of the following components:
-/// - Per-AIR trace matrices for Core, Chiplets, and Poseidon2Permutation.
+/// - Per-AIR main traces for Core, Chiplets, BlakeG compression, and byte-pair lookup.
 /// - Information about the program (program hash and the kernel).
 /// - Information about the initial and final stack states and authenticated precompile root.
 /// - Summary of trace lengths of the main trace components.
@@ -278,7 +275,7 @@ impl VmTrace {
         self.get_trace_len()
     }
 
-    /// Returns a summary of the per-component trace lengths.
+    /// Returns a summary of the per-AIR trace lengths.
     pub fn trace_len_summary(&self) -> &TraceLenSummary {
         &self.trace_len_summary
     }
@@ -297,35 +294,44 @@ impl VmTrace {
     ///
     /// Panics if any AIR constraint evaluates to nonzero.
     pub fn check_constraints(&self) {
-        let public_inputs = self.public_inputs();
-        let (core_matrix, chiplets_matrix, poseidon2_matrix) = self.main_trace.to_air_matrices();
+        let (core_matrix, chiplets_matrix, blakeg_compression_matrix, and8_lookup_matrix) =
+            self.main_trace.to_air_matrices();
+        let (public_values, kernel_felts) = self.public_inputs().to_air_inputs();
 
-        let (public_values, aux_inputs) = public_inputs.to_air_inputs();
+        let statement: Statement<Felt, QuadFelt, MidenMultiAir> =
+            Statement::new(MidenMultiAir::new(), public_values, kernel_felts)
+                .expect("statement construction failed");
+        let prover_statement = ProverStatement::new(
+            statement,
+            vec![core_matrix, chiplets_matrix, blakeg_compression_matrix, and8_lookup_matrix],
+        )
+        .expect("prover statement construction failed");
 
-        let statement =
-            Statement::<Felt, QuadFelt, _>::new(MidenMultiAir::new(), public_values, aux_inputs)
-                .expect("valid statement inputs");
-        let prover_statement =
-            ProverStatement::new(statement, vec![core_matrix, chiplets_matrix, poseidon2_matrix])
-                .expect("valid trace shapes");
-
-        // A deterministic challenger seeds the debug constraint check; this is a local
-        // constraint debugger, not a full proof transcript, so any fixed challenge set works.
-        let config = config::poseidon2_config(config::pcs_params(), config::RELATION_DIGEST);
+        let config = config::eidos_config(config::pcs_params(), config::RELATION_DIGEST);
         debug::check_constraints(&prover_statement, config.challenger());
     }
 
-    /// Splits the trace into the per-AIR matrices consumed by the multi-AIR proving path.
+    /// Splits the trace into the per-AIR matrices consumed by the multi-AIR prover.
     pub fn to_air_matrices(
         &self,
-    ) -> (RowMajorMatrix<Felt>, RowMajorMatrix<Felt>, RowMajorMatrix<Felt>) {
+    ) -> (
+        RowMajorMatrix<Felt>,
+        RowMajorMatrix<Felt>,
+        RowMajorMatrix<Felt>,
+        RowMajorMatrix<Felt>,
+    ) {
         self.main_trace.to_air_matrices()
     }
 
-    /// Consuming variant for the proving hot path.
+    /// Consuming variant for the proving hot path: moves the row-major buffers.
     pub fn into_air_matrices(
         self,
-    ) -> (RowMajorMatrix<Felt>, RowMajorMatrix<Felt>, RowMajorMatrix<Felt>) {
+    ) -> (
+        RowMajorMatrix<Felt>,
+        RowMajorMatrix<Felt>,
+        RowMajorMatrix<Felt>,
+        RowMajorMatrix<Felt>,
+    ) {
         self.main_trace.into_air_matrices()
     }
 

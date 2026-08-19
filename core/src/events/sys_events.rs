@@ -279,7 +279,7 @@ pub enum SystemEvent {
     HqwordToMap,
 
     /// Reads three words from the operand stack and inserts the top two words into the advice map
-    /// under the key defined by applying a Poseidon2 permutation to all three words.
+    /// under the key defined by applying `bcompress` to all three words.
     ///
     /// Inputs:
     ///   Operand stack: [A, B, C, ...]
@@ -289,9 +289,10 @@ pub enum SystemEvent {
     ///   Operand stack: [A, B, C, ...]
     ///   Advice map: {KEY: [a0, a1, a2, a3, b0, b1, b2, b3]}
     ///
-    /// Where KEY is computed by extracting the digest elements from hperm([C, A, B]). For example,
-    /// if C is [0, d, 0, 0], KEY will be set as hash(A || B, d).
-    HpermToMap,
+    /// Where KEY is computed by extracting the digest elements from bcompress([A, B, C]). In
+    /// particular, setting `C = Eidos::init_chaining_word(d, 8)` produces
+    /// `Eidos::hash_elements_in_domain(A || B, d)`.
+    BCompressToMap,
 
     // DEFERRED-DAG SYSTEM EVENTS
     // --------------------------------------------------------------------------------------------
@@ -394,9 +395,10 @@ pub enum SystemEvent {
     ///
     /// This event does not push advice or return the node digest. A program that relies on the
     /// registered node must compute its digest with VM instructions from the same `TAG` and ordered
-    /// chunk sequence. The `register_mem` MASM wrapper does this by applying a Poseidon2 linear
-    /// hash to the same range, with one absorption per chunk and `TAG` as the initial capacity
-    /// word. If the event and the VM hash different chunk sequences, the VM-computed digest
+    /// chunk sequence. The `register_mem` MASM wrapper does this with the canonical Eidos deferred
+    /// framing: payload chunks are compressed in order and a precompile-owned tag is bound by the
+    /// final `TAG || 0w` block. If the event and the VM hash different chunk sequences, the
+    /// VM-computed digest
     /// does not identify the host-registered node and cannot bind that registration into a
     /// proof-relevant deferred claim.
     ///
@@ -501,7 +503,7 @@ impl SystemEvent {
             Self::HdwordToMap,
             Self::HdwordToMapWithDomain,
             Self::HqwordToMap,
-            Self::HpermToMap,
+            Self::BCompressToMap,
             Self::DeferredRegister,
             Self::DeferredEvaluate,
             Self::DeferredEvaluateTag,
@@ -647,9 +649,9 @@ impl SystemEvent {
             name: "sys::hqword_to_map",
         },
         SystemEventEntry {
-            id: EventId::from_u64(6190830263511605775),
-            event: SystemEvent::HpermToMap,
-            name: "sys::hperm_to_map",
+            id: EventId::from_u64(454105713963103935),
+            event: SystemEvent::BCompressToMap,
+            name: "sys::bcompress_to_map",
         },
         SystemEventEntry {
             id: EventId::from_u64(3200266522440553751),
@@ -788,7 +790,7 @@ mod test {
                 | SystemEvent::HdwordToMap
                 | SystemEvent::HdwordToMapWithDomain
                 | SystemEvent::HqwordToMap
-                | SystemEvent::HpermToMap
+                | SystemEvent::BCompressToMap
                 | SystemEvent::DeferredRegister
                 | SystemEvent::DeferredEvaluate
                 | SystemEvent::DeferredEvaluateTag

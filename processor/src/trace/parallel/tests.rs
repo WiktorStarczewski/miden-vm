@@ -3,7 +3,7 @@ use alloc::{string::String, sync::Arc};
 use miden_air::{
     MidenAir,
     lookup::build_logup_aux_trace,
-    trace::{RowIndex, chiplets::hasher::HASH_CYCLE_LEN},
+    trace::{RowIndex, blakeg_compression::BLAKEG_COMPRESSION_CYCLE_LEN},
 };
 use miden_core::{
     Felt, Word,
@@ -15,6 +15,7 @@ use miden_core::{
     },
     operations::{Operation, opcodes},
     program::{KernelDescriptor, Program, StackInputs},
+    utils::RowMajorMatrix,
 };
 use miden_utils_testing::{get_column_name, rand::rand_array};
 use pretty_assertions::assert_eq;
@@ -23,7 +24,7 @@ use rstest::{fixture, rstest};
 use super::*;
 use crate::{
     AdviceInputs, DefaultHost, ExecutionOptions, FastProcessor, HostLibrary,
-    trace::trace_state::{HasherOp, MemoryReadsReplay},
+    trace::trace_state::MemoryReadsReplay,
 };
 
 const DEFAULT_STACK: &[Felt] =
@@ -121,44 +122,39 @@ fn external_lib_proc_hash_for_stack() -> &'static [Felt] {
 // Join node. Same execution as case 4, but we want the 2nd fragment to start at the END of the
 // SPLIT node.
 #[case(split_program(), 9, &[ZERO, SENTINEL_VALUE])]
-// Case 7: LOOP start — fragment boundary lands on the LOOP row. The LOOP is do-while: with
-// stack `[ZERO, SENTINEL]` the body runs once (Pad+Drop is net-zero, so the trailing condition
-// at the body's exit is the same `ZERO` that drove entry), then END exits the loop.
+// Case 7: LOOP start
 //  0: JOIN
 //  1:   BLOCK SWAP SWAP END
-//  5:   LOOP                <-- fragment boundary
+//  5:   LOOP END
+//  7: END
+//  8: HALT
+#[case(loop_program(), 5, &[ZERO, SENTINEL_VALUE])]
+// Case 8: LOOP END, when loop was not entered
+//  0: JOIN
+//  1:   BLOCK SWAP SWAP END
+//  5:   LOOP END
+//  7: END
+//  8: HALT
+#[case(loop_program(), 6, &[ZERO, SENTINEL_VALUE])]
+// Case 9: LOOP END, when loop was entered
+//  0: JOIN
+//  1:   BLOCK SWAP SWAP END
+//  5:   LOOP
 //  6:     BLOCK PAD DROP END
 // 10:   END
 // 11: END
 // 12: HALT
-#[case(loop_program(), 5, &[ZERO, SENTINEL_VALUE])]
-// Case 8: fragment boundary one row inside the loop body (SPAN of body) — same execution as
-// Case 7, just a different boundary.
-#[case(loop_program(), 6, &[ZERO, SENTINEL_VALUE])]
-// Case 9: LOOP REPEAT — `[ONE, ZERO, SENTINEL]` makes the body run twice (first iteration
-// trailing condition is ONE, second is ZERO).
+#[case(loop_program(), 10, &[ONE, ZERO, SENTINEL_VALUE])]
+// Case 10: LOOP REPEAT
 //  0: JOIN
 //  1:   BLOCK SWAP SWAP END
 //  5:   LOOP
 //  6:     BLOCK PAD DROP END
-// 10:   REPEAT              <-- fragment boundary
+// 10:   REPEAT
 // 11:     BLOCK PAD DROP END
 // 15:   END
 // 16: END
 // 17: HALT
-#[case(loop_program(), 10, &[ONE, ZERO, SENTINEL_VALUE])]
-// Case 10: LOOP REPEAT (deeper) — `[ONE, ONE, ZERO, SENTINEL]` makes the body run three times.
-//  0: JOIN
-//  1:   BLOCK SWAP SWAP END
-//  5:   LOOP
-//  6:     BLOCK PAD DROP END
-// 10:   REPEAT              <-- fragment boundary
-// 11:     BLOCK PAD DROP END
-// 15:   REPEAT
-// 16:     BLOCK PAD DROP END
-// 20:   END
-// 21: END
-// 22: HALT
 #[case(loop_program(), 10, &[ONE, ONE, ZERO, SENTINEL_VALUE])]
 // Case 11: CALL START
 //  0: JOIN
@@ -408,31 +404,34 @@ fn test_trace_generation_at_fragment_boundaries(
 
     // Verify precompile-backed deferred data match deterministically.
 
-    // Compare deterministic traces as a compact sanity check and to keep the snapshot stable.
-    assert_eq!(
-        format!("{:?}", DeterministicTrace(&trace_from_fragments)),
-        format!("{:?}", DeterministicTrace(&trace_from_single_fragment)),
-        "Deterministic trace mismatch between fragments and single fragment"
-    );
-
     // Build the LogUp aux trace from each main trace under identical random challenges and
     // verify every column matches row-for-row. Catches fragment-boundary nondeterminism in
-    // lookup collection that `DeterministicTrace` (main-trace only) would miss.
+    // lookup collection.
     let raw = rand_array::<Felt, 4>();
     let challenges = [QuadFelt::new([raw[0], raw[1]]), QuadFelt::new([raw[2], raw[3]])];
-    let (core_from_fragments, chip_from_fragments, poseidon2_from_fragments) =
+    let (core_from_fragments, chip_from_fragments, blakeg_from_fragments, and8_from_fragments) =
         trace_from_fragments.main_trace().to_air_matrices();
-    let (core_from_single, chip_from_single, poseidon2_from_single) =
+    let (core_from_single, chip_from_single, blakeg_from_single, and8_from_single) =
         trace_from_single_fragment.main_trace().to_air_matrices();
+
+    // Compare every committed main-trace cell exactly. The column-oriented check above provides
+    // precise diagnostics for the Core and Chiplets matrices; these assertions extend the exact
+    // comparison to the independently committed BlakeG and And8 matrices.
+    assert_eq!(core_from_fragments, core_from_single, "Core main trace mismatch");
+    assert_eq!(chip_from_fragments, chip_from_single, "Chiplets main trace mismatch");
+    assert_eq!(blakeg_from_fragments, blakeg_from_single, "BlakeG main trace mismatch");
+    assert_eq!(and8_from_fragments, and8_from_single, "And8 main trace mismatch");
+
     for (label, air, air_frag, air_single) in [
-        ("Core", MidenAir::Core, &core_from_fragments, &core_from_single),
-        ("Chiplets", MidenAir::Chiplets, &chip_from_fragments, &chip_from_single),
+        ("Core", MidenAir::CORE, &core_from_fragments, &core_from_single),
+        ("Chiplets", MidenAir::CHIPLETS, &chip_from_fragments, &chip_from_single),
         (
-            "Poseidon2Permutation",
-            MidenAir::Poseidon2Permutation,
-            &poseidon2_from_fragments,
-            &poseidon2_from_single,
+            "BlakeGCompression",
+            MidenAir::BLAKEG_COMPRESSION,
+            &blakeg_from_fragments,
+            &blakeg_from_single,
         ),
+        ("And8Lookup", MidenAir::AND8_LOOKUP, &and8_from_fragments, &and8_from_single),
     ] {
         let (aux_frag, committed_frag) = build_logup_aux_trace(&air, air_frag, &challenges);
         let (aux_single, committed_single) = build_logup_aux_trace(&air, air_single, &challenges);
@@ -446,10 +445,16 @@ fn test_trace_generation_at_fragment_boundaries(
         );
     }
 
-    // Snapshot testing to ensure that future changes don't unexpectedly change the trace.
-    // We use DeterministicTrace to produce stable Debug output, since VmTrace contains
-    // a MerkleStore backed by HashMap whose iteration order is non-deterministic.
-    insta::assert_compact_debug_snapshot!(testname, DeterministicTrace(&trace_from_fragments));
+    // Snapshot compact matrix summaries so protocol drift remains reviewable. In particular, do
+    // not serialize the fixed 65,536-row And8 table into every fragment-boundary fixture.
+    let trace_snapshot = DeterministicTrace {
+        trace: &trace_from_fragments,
+        core: &core_from_fragments,
+        chiplets: &chip_from_fragments,
+        blakeg: &blakeg_from_fragments,
+        and8: &and8_from_fragments,
+    };
+    insta::assert_compact_debug_snapshot!(testname, trace_snapshot);
 }
 
 #[test]
@@ -510,11 +515,11 @@ fn test_nested_loop_end_flags_stable_across_fragmentation() {
     );
     assert!(
         end_flags.contains(&[ONE, ONE, ZERO, ZERO].into()),
-        "expected an END row for inner loop node (is_loop_body=1, is_loop=1)"
+        "expected an END row for inner loop node (is_loop_body=1, loop_entered=1)"
     );
     assert!(
         end_flags.contains(&[ZERO, ONE, ZERO, ZERO].into()),
-        "expected an END row for outer loop node (is_loop_body=0, is_loop=1)"
+        "expected an END row for outer loop node (is_loop_body=0, loop_entered=1)"
     );
 }
 
@@ -981,10 +986,13 @@ fn test_build_trace_returns_err_on_bad_node_id_in_hasher_replay() {
     // is well past any node actually in the sparse forest.
     let bogus_node_id = MastNodeId::new_unchecked(u32::MAX);
     let forest_id = MastForestId::from(0u32);
-    vm_witness
-        .trace_replay_mut()
-        .hasher_for_chiplet
-        .record_raw(HasherOp::HashBasicBlock((forest_id, bogus_node_id, [ZERO; 4].into())));
+    vm_witness.trace_replay_mut().hasher_for_chiplet.record_raw(
+        crate::trace::trace_state::HasherOp::HashBasicBlock((
+            forest_id,
+            bogus_node_id,
+            [ZERO; 4].into(),
+        )),
+    );
 
     let result = build_trace(vm_witness);
     assert!(
@@ -1083,35 +1091,6 @@ fn test_build_trace_returns_err_on_invalid_mast_forest_id(
     );
 }
 
-#[test]
-fn chiplet_preflight_caps_combined_trace_len() {
-    let mut bitwise = BitwiseReplay::default();
-    bitwise.record_u32xor(ZERO, ZERO);
-
-    let mut memory_writes = MemoryWritesReplay::default();
-    memory_writes.record_write_element(ZERO, ZERO, ContextId::root(), RowIndex::from(0));
-
-    let kernel = KernelDescriptor::default();
-    let ace = AceReplay::default();
-    let combined_len = OP_CYCLE_LEN + 2;
-
-    assert!(matches!(
-        non_hasher_trace_len(
-            &kernel,
-            &[],
-            &memory_writes,
-            &bitwise,
-            &ace,
-            combined_len - 1,
-        ),
-        Err(ExecutionError::TraceLenExceeded(limit)) if limit == combined_len - 1
-    ));
-    assert_eq!(
-        non_hasher_trace_len(&kernel, &[], &memory_writes, &bitwise, &ace, combined_len).unwrap(),
-        combined_len
-    );
-}
-
 /// Tests `build_trace_with_max_len` behavior at various `max_trace_len` boundaries relative to the
 /// core trace length. `core_trace_len` is the number of core trace rows including the HALT row
 /// appended by `build_trace_with_max_len`.
@@ -1203,10 +1182,10 @@ fn test_build_trace_returns_err_on_fragment_size_overflow() {
     );
 }
 
-/// Verifies that `build_trace_with_max_len` returns `TraceLenExceeded` when the Poseidon2
-/// permutation trace exceeds `max_trace_len`, even though the core trace rows fit.
+/// Verifies that `build_trace_with_max_len` returns `TraceLenExceeded` when the BlakeG
+/// compression trace exceeds `max_trace_len`, even though the core trace rows fit.
 #[test]
-fn test_build_trace_returns_err_when_poseidon2_trace_exceeds_max_len() {
+fn test_build_trace_returns_err_when_blakeg_trace_exceeds_max_len() {
     const MAX_FRAGMENT_SIZE: usize = 1 << 20;
 
     // Use the DYN program because it exercises both hasher and memory chiplets.
@@ -1230,17 +1209,18 @@ fn test_build_trace_returns_err_when_poseidon2_trace_exceeds_max_len() {
     let core_trace_rows = vm_witness.trace_replay().core_trace_contexts.len()
         * vm_witness.trace_replay().fragment_size;
 
-    // Inject enough unique permutation requests so the Poseidon2 permutation trace exceeds
-    // core_trace_rows. Each unique state adds one HASH_CYCLE_LEN cycle.
-    let num_permutations = core_trace_rows / HASH_CYCLE_LEN + 1;
-    for i in 0..num_permutations {
-        let mut state = [ZERO; 12];
-        state[0] = Felt::from_u32(i as u32);
-        vm_witness.trace_replay_mut().hasher_for_chiplet.record_permute_input(state);
+    // Each replayed BCOMPRESS adds a controller row and one BlakeG compression block. Inject
+    // enough requests for the BlakeG AIR to exceed the core bound.
+    let num_compressions = core_trace_rows / BLAKEG_COMPRESSION_CYCLE_LEN + 1;
+    for _ in 0..num_compressions {
+        vm_witness
+            .trace_replay_mut()
+            .hasher_for_chiplet
+            .record_bcompress_input([ZERO; 12]);
     }
 
     // Set max_trace_len equal to core_trace_rows. The core trace check passes (not strictly
-    // greater), but the Poseidon2 permutation trace will exceed it.
+    // greater), but the BlakeG compression trace will exceed it.
     let max_trace_len = core_trace_rows;
 
     let result = build_trace_with_max_len(vm_witness, max_trace_len);
@@ -1332,19 +1312,92 @@ fn read_opcode(main_trace: &MainTrace, row_idx: RowIndex) -> u8 {
     opcode as u8
 }
 
-/// Wrapper around `VmTrace` that produces deterministic `Debug` output.
+/// Compact, deterministic view of a [`VmTrace`] for snapshot testing.
 ///
-/// `VmTrace` contains a `MerkleStore` backed by `HashMap`, whose iteration order is
-/// non-deterministic. This wrapper formats the Merkle store nodes sorted by key, making the
-/// output stable across runs for snapshot testing.
-struct DeterministicTrace<'a>(&'a VmTrace);
+/// Main-trace equality is asserted cell-for-cell before this view is built. The checksums here are
+/// drift markers which keep the snapshots useful without embedding the fixed And8 table in every
+/// fixture.
+struct DeterministicTrace<'a> {
+    trace: &'a VmTrace,
+    core: &'a RowMajorMatrix<Felt>,
+    chiplets: &'a RowMajorMatrix<Felt>,
+    blakeg: &'a RowMajorMatrix<Felt>,
+    and8: &'a RowMajorMatrix<Felt>,
+}
+
+struct AirMatrixSummaries {
+    core: MatrixSummary,
+    chiplets: MatrixSummary,
+    blakeg_compression: MatrixSummary,
+    and8_lookup: MatrixSummary,
+}
+
+struct MatrixSummary {
+    width: usize,
+    height: usize,
+    nonzero_values: usize,
+    fnv1a64: u64,
+}
+
+impl core::fmt::Debug for AirMatrixSummaries {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AirMatrixSummaries")
+            .field("core", &self.core)
+            .field("chiplets", &self.chiplets)
+            .field("blakeg_compression", &self.blakeg_compression)
+            .field("and8_lookup", &self.and8_lookup)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for MatrixSummary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MatrixSummary")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("nonzero_values", &self.nonzero_values)
+            .field("fnv1a64", &self.fnv1a64)
+            .finish()
+    }
+}
+
+impl MatrixSummary {
+    fn new(matrix: &RowMajorMatrix<Felt>) -> Self {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut fnv1a64 = FNV_OFFSET_BASIS;
+        let mut nonzero_values = 0;
+        for &value in &matrix.values {
+            nonzero_values += usize::from(value != ZERO);
+            for byte in value.as_canonical_u64().to_le_bytes() {
+                fnv1a64 ^= u64::from(byte);
+                fnv1a64 = fnv1a64.wrapping_mul(FNV_PRIME);
+            }
+        }
+
+        Self {
+            width: matrix.width,
+            height: matrix.values.len() / matrix.width,
+            nonzero_values,
+            fnv1a64,
+        }
+    }
+}
 
 impl core::fmt::Debug for DeterministicTrace<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let trace = self.0;
+        let trace = self.trace;
+        let air_matrices = AirMatrixSummaries {
+            core: MatrixSummary::new(self.core),
+            chiplets: MatrixSummary::new(self.chiplets),
+            blakeg_compression: MatrixSummary::new(self.blakeg),
+            and8_lookup: MatrixSummary::new(self.and8),
+        };
 
         f.debug_struct("VmTrace")
-            .field("main_trace", trace.main_trace())
+            .field("air_matrices", &air_matrices)
+            .field("last_program_row", &trace.main_trace().last_program_row())
             .field("program_info", &trace.program_info())
             .field("stack_outputs", &trace.stack_outputs())
             .field("trace_len_summary", trace.trace_len_summary())

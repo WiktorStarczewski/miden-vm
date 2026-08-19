@@ -24,6 +24,7 @@ pub(crate) mod ace;
 pub(crate) mod ace_registry;
 #[cfg(feature = "registry-tools")]
 pub mod ace_registry_regen;
+pub(crate) mod composite;
 pub(crate) mod ec;
 pub(crate) mod hash;
 pub(crate) mod logup;
@@ -56,7 +57,7 @@ pub fn prove_deferred_state(
 
 /// Verifies a precompile STARK against an explicit deferred root.
 pub fn verify_deferred(proof: &StarkProof, public_root: DeferredRoot) -> Result<(), VerifyError> {
-    session::verify_stark(proof, transcript::poseidon2::P2Digest::from(public_root))
+    session::verify_stark(proof, transcript::eidos::EidosDigest::from(public_root))
 }
 
 /// Errors produced while proving deferred precompile claims from VM deferred state.

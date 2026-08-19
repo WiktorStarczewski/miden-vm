@@ -374,8 +374,8 @@ fn air_constraints_pin_inner_fused_cycle_id_constancy() {
     let mut trace = two_cycle_trace(1);
 
     // This is the original two-cycle forgery with every per-row ID equality left intact: most of
-    // cycle 0 borrows cycle 1's ID, while row 0, row 27, and the footer retain cycle 0's ID. Only the
-    // cross-row cycle-ID constraint can reject the two discontinuities.
+    // cycle 0 borrows cycle 1's ID, while row 0, row 27, and the footer retain cycle 0's ID. Only
+    // the cross-row cycle-ID constraint can reject the two discontinuities.
     for row in trace.iter_mut().take(FUSED_G_ROWS - 1).skip(1) {
         for g in 0..NUM_G {
             row[g_msg_slot_col(g, 2)] = Felt::ONE;
@@ -789,7 +789,15 @@ fn air_footer_constraints_pin_noncanonical_pair_rejection() {
     let mut block = test_block();
     block[0] = 7;
     block[1] = u32::MAX;
-    let trace = generate_felt_trace_block(block, test_h(), TraceMode::Compression);
+    // Bypass the production writer's canonical-input precondition so this fixture can isolate the
+    // AIR's corresponding constraint. The writer rejection is covered separately in trace tests.
+    let h = test_h();
+    let trace = generate_felt_trace_block_with_initial_state_for_test(
+        block,
+        h,
+        initial_working_state(h),
+        TraceMode::Compression,
+    );
     let evaluations =
         eval_footer_row(&trace.rows[FOOTER_START], &trace.rows[FOOTER_START + 1], FOOTER_START);
 

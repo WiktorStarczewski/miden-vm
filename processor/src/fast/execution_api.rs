@@ -171,7 +171,7 @@ impl FastProcessor {
             let span = tracing::Span::current();
             let hasher = scope.spawn(move || {
                 let _span = span.entered();
-                build_hasher_chiplet(receiver.into_iter().map(Ok), MAX_TRACE_LEN)
+                build_hasher_chiplet(receiver.into_iter().map(Ok), MAX_TRACE_LEN, MAX_TRACE_LEN)
             });
 
             // Liveness invariant: both match arms consume `tracer` by value, so the scope

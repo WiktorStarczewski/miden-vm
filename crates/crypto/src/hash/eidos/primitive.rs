@@ -113,9 +113,9 @@ mod tests {
         0x6a09_e667,
         0x3b67_ae85, // IV[1] with top bit cleared
         0x3c6e_f372,
-        0x254f_f53a, // IV[3] (top bit already 0)
+        0x254f_f53a, // IV[3] with top bit cleared
         0x0000_0000,
-        0x1b05_688c, // IV[5] (top bit already 0)
+        0x1b05_688c, // IV[5] with top bit cleared
         0x0000_0000,
         0x5be0_cd19, // IV[7] (top bit already 0)
     ];

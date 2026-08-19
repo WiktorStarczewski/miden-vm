@@ -18,8 +18,8 @@ use crate::{AdviceProvider, MemoryError, fast::FastProcessor};
 
 // STACK LAYOUT — `DeferredRegister`
 // ================================================================================================
-// `[event_id, PAYLOAD_LO, PAYLOAD_HI, TAG, ...]` — Poseidon2 sponge layout so MASM can feed the
-// 12 felts directly into one `hperm` to compute the node's digest. `TAG` is one word (4 felts).
+// `[event_id, PAYLOAD_LO, PAYLOAD_HI, TAG, ...]` — Eidos node layout so MASM can compress the
+// 8-felt payload block, then bind the 4-felt tag in the final `TAG || 0w` block. `TAG` is one word.
 // The eight payload felts are one 8-felt data chunk, `lhs || rhs` child digests for a join, or
 // one `lhs || rhs` pair for a pair-list node. Exact `Tag::CHUNKS` (`[2, 0, 0, 0]`) is
 // framework-owned opaque data; malformed id-2 tags are rejected.

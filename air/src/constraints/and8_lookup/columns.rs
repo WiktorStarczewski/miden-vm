@@ -118,7 +118,8 @@ impl<T> BorrowMut<And8LookupCols<T>> for [T] {
     fn borrow_mut(&mut self) -> &mut And8LookupCols<T> {
         debug_assert_eq!(self.len(), NUM_AND8_LOOKUP_COLS);
         // SAFETY: as above, the `repr(C)` struct is exactly a contiguous sequence of
-        // `NUM_AND8_LOOKUP_COLS` values of `T`; the exclusive slice borrow preserves aliasing rules.
+        // `NUM_AND8_LOOKUP_COLS` values of `T`; the exclusive slice borrow preserves aliasing
+        // rules.
         let (prefix, cols, suffix) = unsafe { self.align_to_mut::<And8LookupCols<T>>() };
         debug_assert!(prefix.is_empty() && suffix.is_empty() && cols.len() == 1);
         &mut cols[0]

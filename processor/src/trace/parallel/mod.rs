@@ -5,28 +5,30 @@ use itertools::Itertools;
 use miden_air::{
     CoreCols, Felt, StackCols, SystemCols,
     trace::{
-        DECODER_TRACE_WIDTH, MIN_TRACE_LEN, MainTrace, RANGE_CHECK_TRACE_WIDTH, RowIndex,
-        STACK_TRACE_WIDTH, SYS_TRACE_WIDTH, chiplets::bitwise::OP_CYCLE_LEN, decoder::NUM_OP_BITS,
+        DECODER_TRACE_WIDTH, MIN_TRACE_LEN, MainTrace, RowIndex, STACK_TRACE_WIDTH,
+        SYS_TRACE_WIDTH,
+        and8_lookup::{AND8_LOOKUP_TRACE_HEIGHT, NUM_AND8_LOOKUP_COLS},
+        decoder::NUM_OP_BITS,
     },
 };
 use miden_core::{
     ONE, Word, ZERO,
     field::{PrimeCharacteristicRing, batch_inversion_allow_zeros},
-    mast::{MastForestId, OpBatch, SparseMastForest},
+    mast::{MastForestId, SparseMastForest},
     operations::opcodes,
     program::{KernelDescriptor, MIN_STACK_DEPTH},
     utils::Idx,
 };
 use rayon::prelude::*;
-use tracing::{info_span, instrument};
+use tracing::instrument;
 
 use super::{
-    chiplets::Chiplets,
+    chiplets::{self, Chiplets},
     execution_tracer::TraceReplay,
     trace_state::{
-        AceReplay, BitwiseOp, BitwiseReplay, CoreTraceFragmentContext, CoreTraceState,
-        ExecutionReplay, HasherRequestReplay, KernelReplay, MemoryWritesReplay, RangeCheckerReplay,
-        ResolvedBasicBlockGroups, ResolvedHasherOp,
+        AceReplay, BitwiseOp, BitwiseReplay, BitwiseReplayEntry, CoreTraceFragmentContext,
+        CoreTraceState, ExecutionReplay, HasherRequestReplay, KernelReplay, MemoryWritesReplay,
+        RangeCheckerReplay, ResolvedBasicBlockGroups, ResolvedHasherOp,
     },
 };
 use crate::{
@@ -45,11 +47,8 @@ use crate::{
 /// Per-row payload written by the core tracer (system + decoder + stack).
 pub const CORE_TRACE_WIDTH: usize = SYS_TRACE_WIDTH + DECODER_TRACE_WIDTH + STACK_TRACE_WIDTH;
 
-/// Physical row width of the core buffer: the [`CORE_TRACE_WIDTH`] payload plus the two
-/// trailing range-checker columns, which together form the per-AIR Core matrix
-/// (`NUM_CORE_COLS`) consumed directly by proving. The range columns are filled in-place
-/// after padding (see `write_range_into_core`).
-pub const CORE_STORAGE_WIDTH: usize = CORE_TRACE_WIDTH + RANGE_CHECK_TRACE_WIDTH;
+/// Physical row width of the core buffer: the per-AIR Core matrix consumed directly by proving.
+pub const CORE_STORAGE_WIDTH: usize = CORE_TRACE_WIDTH;
 
 /// `build_trace()` uses this as a hard cap on trace rows.
 ///
@@ -76,7 +75,7 @@ mod tests;
 /// use miden_processor::{DefaultHost, FastProcessor, StackInputs};
 ///
 /// let program = Assembler::default()
-///     .assemble_program("prg", "begin push.1 drop end")
+///     .assemble_program("program", "begin push.1 drop end")
 ///     .unwrap()
 ///     .unwrap_program();
 /// let mut host = DefaultHost::default();
@@ -161,79 +160,64 @@ fn build_trace_inner(
         return Err(ExecutionError::Internal("no trace fragments provided in the trace witness"));
     }
 
-    let chiplets = info_span!("initialize_chiplets").in_scope(|| {
-        initialize_chiplets(
-            program_info.kernel().clone(),
-            &core_trace_contexts,
-            memory_writes,
-            bitwise,
-            kernel_replay,
-            hasher_for_chiplet,
-            prebuilt_hasher,
-            ace_replay,
-            &mast_forest_store,
-            max_trace_len,
-        )
-    })?;
+    let chiplets = initialize_chiplets(
+        program_info.kernel().clone(),
+        &core_trace_contexts,
+        memory_writes,
+        bitwise,
+        kernel_replay,
+        hasher_for_chiplet,
+        prebuilt_hasher,
+        ace_replay,
+        &mast_forest_store,
+        max_trace_len,
+    )?;
 
-    let range_checker = info_span!("initialize_range_checker")
-        .in_scope(|| initialize_range_checker(range_checker_replay, &chiplets));
+    let blakeg_compression_trace_len = chiplets.blakeg_compression_trace_len();
+    let blakeg_compression_height = pad_to_trace_length(blakeg_compression_trace_len);
+    let range_checker =
+        initialize_range_checker(range_checker_replay, &chiplets, blakeg_compression_height);
 
-    let mut core_trace_data = info_span!("generate_core_trace").in_scope(|| {
-        generate_core_trace_row_major(
-            core_trace_contexts,
-            program_info.kernel().clone(),
-            fragment_size,
-            &mast_forest_store,
-            max_stack_depth,
-        )
-    })?;
+    let mut core_trace_data = generate_core_trace_row_major(
+        core_trace_contexts,
+        program_info.kernel().clone(),
+        fragment_size,
+        &mast_forest_store,
+        max_stack_depth,
+    )?;
 
     let core_trace_len = core_trace_data.len() / CORE_STORAGE_WIDTH;
 
-    // Get the number of rows for the range checker
-    let range_table_len = range_checker.get_number_range_checker_rows();
-
-    let core_height = pad_to_trace_length(core_trace_len.max(range_table_len));
+    let core_height = pad_to_trace_length(core_trace_len);
     let chiplets_height = pad_to_trace_length(chiplets.trace_len());
-    let poseidon2_permutation_trace_len = chiplets.poseidon2_permutation_trace_len();
-    let poseidon2_permutation_height = pad_to_trace_length(poseidon2_permutation_trace_len);
-    let padded_trace_len = core_height.max(chiplets_height).max(poseidon2_permutation_height);
+    let byte_pair_lookup_rows = AND8_LOOKUP_TRACE_HEIGHT;
+    let max_trace_height = core_height
+        .max(chiplets_height)
+        .max(blakeg_compression_height)
+        .max(byte_pair_lookup_rows);
 
     // Cap check against the padded height: pad-up can push over MAX_TRACE_LEN even
     // when the unpadded check above passed.
-    if padded_trace_len > max_trace_len {
+    if max_trace_height > max_trace_len {
         return Err(ExecutionError::TraceLenExceeded(max_trace_len));
     }
 
-    let trace_len_summary = TraceLenSummary::new_with_padded(
+    let trace_len_summary = TraceLenSummary::new(
         core_trace_len,
-        range_table_len,
         ChipletsLengths::new(&chiplets),
-        poseidon2_permutation_trace_len,
-        padded_trace_len,
+        blakeg_compression_trace_len,
+        byte_pair_lookup_rows,
     );
 
     // Each segment is built at its own per-AIR height (no cross-padding to the unified max).
-    let ((chiplets_trace, poseidon2_permutation_trace), ()) = info_span!("chiplet_traces_core_pad")
-        .in_scope(|| {
-            rayon::join(
-                || chiplets.into_traces(chiplets_height, poseidon2_permutation_height),
-                || pad_core_row_major(&mut core_trace_data, core_height),
-            )
-        });
+    let ((chiplets_trace, blakeg_compression_trace, mut and8_counts), ()) = rayon::join(
+        || chiplets.into_traces(chiplets_height, blakeg_compression_height),
+        || pad_core_row_major(&mut core_trace_data, core_height),
+    );
 
-    // The range checker occupies the two trailing columns of the core buffer.
-    info_span!("write_range_checker_columns").in_scope(|| {
-        range_checker.write_range_into_core(
-            &mut core_trace_data,
-            CORE_STORAGE_WIDTH,
-            CORE_TRACE_WIDTH,
-            CORE_TRACE_WIDTH + 1,
-            range_table_len,
-            core_height,
-        )
-    });
+    range_checker.write_range_counts(&mut and8_counts);
+    let and8_lookup_trace = chiplets::build_and8_lookup_trace(&and8_counts);
+    debug_assert_eq!(and8_lookup_trace.len(), byte_pair_lookup_rows * NUM_AND8_LOOKUP_COLS);
 
     // Create the MainTrace
     let main_trace = {
@@ -241,7 +225,8 @@ fn build_trace_inner(
         MainTrace::from_parts(
             core_trace_data,
             chiplets_trace.trace,
-            poseidon2_permutation_trace.trace,
+            blakeg_compression_trace.trace,
+            and8_lookup_trace,
             last_program_row,
         )
     };
@@ -467,37 +452,27 @@ fn push_halt_opcode_row(
     core_trace_data.extend_from_slice(&row_data);
 }
 
-/// Initializes the ranger checker from the recorded range checks during execution and returns it.
-///
-/// Note that the maximum number of rows that the range checker can produce is 2^16, which is less
-/// than the maximum trace length (2^29). Hence, we can safely generate the entire range checker
-/// trace and then pad it to the final trace length, without worrying about hitting memory limits.
+/// Initializes the range-check multiplicity collector from recorded execution and chiplet requests.
 fn initialize_range_checker(
     range_checker_replay: RangeCheckerReplay,
     chiplets: &Chiplets,
+    blakeg_compression_height: usize,
 ) -> RangeChecker {
     let mut range_checker = RangeChecker::new();
 
-    // Add all u32 range checks recorded during execution
     for values in range_checker_replay {
         range_checker.add_range_checks(&values);
     }
 
-    // Add all memory-related range checks
     chiplets.append_range_checks(&mut range_checker);
+
+    chiplets.append_blakeg_range_checks(blakeg_compression_height, &mut range_checker);
 
     range_checker
 }
 
 /// Replays recorded operations to populate chiplet traces. Results were already used during
 /// execution; this pass only needs the trace-recording side effects.
-///
-/// The five chiplets are populated from disjoint replays, so they build in parallel. Their
-/// non-hasher lengths are known from the replay metadata; checking those up front and giving the
-/// hasher only the remaining rows preserves the hard cap before any builder materializes its
-/// trace on the buffered path. A prebuilt (streamed) hasher was already built during execution
-/// under the full `max_trace_len` budget and is instead validated against the remaining rows
-/// after the fact.
 fn initialize_chiplets(
     kernel: KernelDescriptor,
     core_trace_contexts: &[CoreTraceFragmentContext],
@@ -522,10 +497,10 @@ fn initialize_chiplets(
         .checked_sub(non_hasher_trace_len)
         .ok_or(ExecutionError::TraceLenExceeded(max_trace_len))?;
 
-    if prebuilt_hasher
-        .as_ref()
-        .is_some_and(|hasher| hasher.trace_len() > max_hasher_trace_len)
-    {
+    if prebuilt_hasher.as_ref().is_some_and(|hasher| {
+        hasher.trace_len() > max_hasher_trace_len
+            || hasher.blakeg_compression_trace_len() > max_trace_len
+    }) {
         return Err(ExecutionError::TraceLenExceeded(max_trace_len));
     }
 
@@ -535,10 +510,9 @@ fn initialize_chiplets(
             None => build_hasher_chiplet(
                 hasher_for_chiplet.into_resolved_ops(mast_forest_store),
                 max_hasher_trace_len,
+                max_trace_len,
             )
             .map_err(|err| match err {
-                // The builder reports its internal remainder budget; surface the
-                // configured cap instead, like every other rejection site.
                 ExecutionError::TraceLenExceeded(_) => {
                     ExecutionError::TraceLenExceeded(max_trace_len)
                 },
@@ -575,9 +549,9 @@ fn initialize_chiplets(
         chiplets.trace_len() - chiplets.hasher.trace_len(),
         "chiplet preflight length differs from the materialized trace",
     );
-    // Release-only insurance: in debug builds a preflight undercount trips the
-    // assert above before this check can fire.
-    if chiplets.trace_len() > max_trace_len {
+    if chiplets.trace_len() > max_trace_len
+        || chiplets.blakeg_compression_trace_len() > max_trace_len
+    {
         return Err(ExecutionError::TraceLenExceeded(max_trace_len));
     }
     Ok(chiplets)
@@ -592,7 +566,7 @@ fn non_hasher_trace_len(
     max_trace_len: usize,
 ) -> Result<usize, ExecutionError> {
     let overflow = || ExecutionError::TraceLenExceeded(max_trace_len);
-    let bitwise_len = bitwise.num_operations().checked_mul(OP_CYCLE_LEN).ok_or_else(overflow)?;
+    let bitwise_len = bitwise.trace_len().ok_or_else(overflow)?;
     let memory_reads_len = core_trace_contexts.iter().try_fold(0usize, |len, context| {
         len.checked_add(context.replay.memory_reads.num_accesses()?)
     });
@@ -609,31 +583,30 @@ fn non_hasher_trace_len(
         .ok_or_else(overflow)
 }
 
-/// Builds the hasher chiplet by replaying resolved requests in order.
-///
-/// The iterator abstracts over the two delivery modes: the buffered replay drained against the
-/// finalized forest store, or a live channel fed by a concurrently executing processor (see
-/// `FastProcessor::execute_and_build_trace_sync`).
+/// Builds the hasher chiplet from buffered or streamed, fully resolved requests.
 pub(crate) fn build_hasher_chiplet<'a>(
     ops: impl IntoIterator<Item = Result<ResolvedHasherOp<'a>, ExecutionError>>,
-    max_trace_len: usize,
+    max_controller_trace_len: usize,
+    max_blakeg_trace_len: usize,
 ) -> Result<Hasher, ExecutionError> {
     let mut hasher = Hasher::default();
     for hasher_op in ops {
         match hasher_op? {
-            ResolvedHasherOp::Permute(input_state) => {
-                let _ = hasher.permute(input_state);
+            ResolvedHasherOp::BCompress(input_state) => {
+                let _ = hasher.bcompress(input_state);
+            },
+            ResolvedHasherOp::AeadXof(ctx, clk, input_state) => {
+                let _ = hasher.compress_aead_xof(ctx, clk, input_state);
             },
             ResolvedHasherOp::HashControlBlock((h1, h2, domain, expected_hash)) => {
                 let _ = hasher.hash_control_block(h1, h2, domain, expected_hash);
             },
-            ResolvedHasherOp::HashBasicBlock((batch_groups, expected_hash)) => match batch_groups {
+            ResolvedHasherOp::HashBasicBlock((batches, expected_hash)) => match batches {
                 ResolvedBasicBlockGroups::Borrowed(op_batches) => {
-                    let _ = hasher
-                        .hash_basic_block(op_batches.iter().map(OpBatch::groups), expected_hash);
+                    let _ = hasher.hash_basic_block(op_batches, expected_hash);
                 },
-                ResolvedBasicBlockGroups::Owned(batch_groups) => {
-                    let _ = hasher.hash_basic_block(batch_groups.iter(), expected_hash);
+                ResolvedBasicBlockGroups::Owned(op_batches) => {
+                    let _ = hasher.hash_basic_block(&op_batches, expected_hash);
                 },
             },
             ResolvedHasherOp::BuildMerkleRoot((value, path, index)) => {
@@ -643,26 +616,39 @@ pub(crate) fn build_hasher_chiplet<'a>(
                 hasher.update_merkle_root(old_value, new_value, &path, index);
             },
         }
-        if hasher.trace_len() > max_trace_len {
-            return Err(ExecutionError::TraceLenExceeded(max_trace_len));
+        if hasher.trace_len() > max_controller_trace_len
+            || hasher.blakeg_compression_trace_len() > max_blakeg_trace_len
+        {
+            return Err(ExecutionError::TraceLenExceeded(max_blakeg_trace_len));
         }
     }
     Ok(hasher)
 }
 
-/// Builds the bitwise chiplet by replaying recorded `u32and`/`u32xor` requests in order.
 fn build_bitwise_chiplet(
     bitwise_replay: BitwiseReplay,
     max_trace_len: usize,
 ) -> Result<Bitwise, ExecutionError> {
     let mut bitwise = Bitwise::default();
-    for (bitwise_op, a, b) in bitwise_replay {
-        match bitwise_op {
-            BitwiseOp::U32And => {
+    for entry in bitwise_replay {
+        match entry {
+            BitwiseReplayEntry::U32(BitwiseOp::U32And, a, b) => {
                 bitwise.u32and(a, b).map_exec_err_no_ctx()?;
             },
-            BitwiseOp::U32Xor => {
+            BitwiseReplayEntry::U32(BitwiseOp::U32Xor, a, b) => {
                 bitwise.u32xor(a, b).map_exec_err_no_ctx()?;
+            },
+            BitwiseReplayEntry::AeadStream(entry) => {
+                bitwise.aead_stream(
+                    entry.ctx,
+                    entry.clk,
+                    entry.src_ptr,
+                    entry.dst_ptr,
+                    entry.lane_base,
+                    entry.plaintext,
+                    entry.keystream,
+                    entry.ciphertext,
+                );
             },
         }
         if bitwise.trace_len() > max_trace_len {
@@ -672,7 +658,6 @@ fn build_bitwise_chiplet(
     Ok(bitwise)
 }
 
-/// Builds the memory chiplet by replaying recorded accesses merged in clock-cycle order.
 fn build_memory_chiplet(
     memory_writes: MemoryWritesReplay,
     core_trace_contexts: &[CoreTraceFragmentContext],
@@ -697,10 +682,6 @@ fn build_memory_chiplet(
     }
 
     let mut memory = Memory::default();
-
-    // Note: care is taken to order all the accesses by clock cycle, since the memory chiplet
-    // currently assumes that all memory accesses are issued in the same order as they appear in
-    // the trace.
     let elements_written: Box<dyn Iterator<Item = MemoryAccess>> =
         Box::new(memory_writes.iter_elements_written().map(|(element, addr, ctx, clk)| {
             MemoryAccess::WriteElement(*addr, *element, *ctx, *clk)
@@ -754,10 +735,9 @@ fn build_memory_chiplet(
     Ok(memory)
 }
 
-/// Builds the ACE chiplet by replaying recorded circuit evaluations in order.
 fn build_ace_chiplet(ace_replay: AceReplay, max_trace_len: usize) -> Result<Ace, ExecutionError> {
     let mut ace = Ace::default();
-    for (clk, circuit_eval) in ace_replay.into_iter() {
+    for (clk, circuit_eval) in ace_replay {
         ace.add_circuit_evaluation(clk, circuit_eval);
         if ace.trace_len() > max_trace_len {
             return Err(ExecutionError::TraceLenExceeded(max_trace_len));
@@ -766,14 +746,13 @@ fn build_ace_chiplet(ace_replay: AceReplay, max_trace_len: usize) -> Result<Ace,
     Ok(ace)
 }
 
-/// Builds the kernel ROM chiplet by replaying recorded kernel procedure accesses in order.
 fn build_kernel_rom_chiplet(
     kernel: KernelDescriptor,
     kernel_replay: KernelReplay,
     max_trace_len: usize,
 ) -> Result<KernelRom, ExecutionError> {
     let mut kernel_rom = KernelRom::new(kernel);
-    for proc_hash in kernel_replay.into_iter() {
+    for proc_hash in kernel_replay {
         kernel_rom.access_proc(proc_hash).map_exec_err_no_ctx()?;
         if kernel_rom.trace_len() > max_trace_len {
             return Err(ExecutionError::TraceLenExceeded(max_trace_len));

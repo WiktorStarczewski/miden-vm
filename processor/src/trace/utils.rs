@@ -1,7 +1,7 @@
 #[cfg(test)]
 use alloc::vec::Vec;
 
-use miden_air::trace::MIN_TRACE_LEN;
+use miden_air::trace::{MIN_TRACE_LEN, blakeg_compression::BLAKEG_COMPRESSION_CYCLE_LEN};
 
 use super::chiplets::Chiplets;
 use crate::{Felt, ONE};
@@ -54,7 +54,7 @@ impl<'a, E: Copy> RowMajorTraceWriter<'a, E> {
 ///
 /// A chiplet occupies a contiguous band of rows and a contiguous band of columns
 /// `[col_start, col_start + num_cols)`. [`Self::copy_rows_from`] also writes the per-row
-/// `prefix_one_cols` selectors and, when there is room, the trailing `chip_clk` column.
+/// `prefix_one_cols` selectors and (when there's room) the trailing `chip_clk` column.
 pub struct ChipletTraceFragment<'a> {
     /// Contiguous `num_rows * stride` row-major slice (this chiplet's rows).
     band: &'a mut [Felt],
@@ -64,10 +64,8 @@ pub struct ChipletTraceFragment<'a> {
     num_cols: usize,
     /// Global row offset of `band[0]` in the chiplets trace; used to compute `chip_clk`.
     row_offset: usize,
-    /// Columns to set to ONE on every row in this band.
+    /// Columns `< col_start` to set to ONE on every row in this band.
     prefix_one_cols: &'static [usize],
-    /// Whether to write `chip_clk` to the trailing column.
-    write_chip_clk: bool,
 }
 
 impl<'a> ChipletTraceFragment<'a> {
@@ -78,11 +76,11 @@ impl<'a> ChipletTraceFragment<'a> {
         col_start: usize,
         num_cols: usize,
     ) -> Self {
-        Self::new(band, stride, col_start, num_cols, 0, &[], false)
+        Self::with_overheads(band, stride, col_start, num_cols, 0, &[])
     }
 
     /// Adds the chiplets-trace overheads: per-row ONEs at `prefix_one_cols` and `chip_clk` at
-    /// column `stride - 1` when the fragment leaves a trailing column for it.
+    /// column `stride - 1` (when there's room), using `row_offset` as `band[0]`'s global row.
     pub fn with_overheads(
         band: &'a mut [Felt],
         stride: usize,
@@ -91,30 +89,10 @@ impl<'a> ChipletTraceFragment<'a> {
         row_offset: usize,
         prefix_one_cols: &'static [usize],
     ) -> Self {
-        Self::new(
-            band,
-            stride,
-            col_start,
-            num_cols,
-            row_offset,
-            prefix_one_cols,
-            stride > col_start + num_cols,
-        )
-    }
-
-    fn new(
-        band: &'a mut [Felt],
-        stride: usize,
-        col_start: usize,
-        num_cols: usize,
-        row_offset: usize,
-        prefix_one_cols: &'static [usize],
-        write_chip_clk: bool,
-    ) -> Self {
         debug_assert_eq!(band.len() % stride, 0, "band length must be a multiple of stride");
         debug_assert!(col_start + num_cols <= stride, "column band overruns the row stride");
         debug_assert!(
-            prefix_one_cols.iter().all(|&col| col < col_start),
+            prefix_one_cols.iter().all(|&c| c < col_start),
             "prefix_one_cols must lie before col_start",
         );
         let num_rows = band.len() / stride;
@@ -126,7 +104,6 @@ impl<'a> ChipletTraceFragment<'a> {
             num_cols,
             row_offset,
             prefix_one_cols,
-            write_chip_clk,
         }
     }
 
@@ -143,6 +120,13 @@ impl<'a> ChipletTraceFragment<'a> {
         self.num_rows
     }
 
+    /// Mutable access to columns `[0..col_start)` of `row`, for chiplets whose prefix
+    /// selectors vary per row (e.g. the hasher's `s_ctrl`).
+    pub fn prefix_mut(&mut self, row: usize) -> &mut [Felt] {
+        let row_start = row * self.stride;
+        &mut self.band[row_start..row_start + self.col_start]
+    }
+
     // DATA MUTATORS
     // --------------------------------------------------------------------------------------------
 
@@ -154,7 +138,7 @@ impl<'a> ChipletTraceFragment<'a> {
     }
 
     /// Copies `src.len() / num_cols` rows starting at `row_offset` into this fragment's band,
-    /// fusing the per-row prefix-selector ONEs and the `chip_clk` column when configured.
+    /// fusing the per-row prefix-selector ONEs and trailing `chip_clk` when configured.
     pub fn copy_rows_into(&mut self, row_offset: usize, src: &[Felt]) {
         debug_assert_eq!(src.len() % self.num_cols, 0, "source buffer size not row-aligned");
         let chunk_rows = src.len() / self.num_cols;
@@ -162,6 +146,7 @@ impl<'a> ChipletTraceFragment<'a> {
             row_offset + chunk_rows <= self.num_rows,
             "chunk overruns fragment row range",
         );
+        let write_chip_clk = self.stride > self.col_start + self.num_cols;
         let clk_col = self.stride - 1;
         for r in 0..chunk_rows {
             let dst_row = row_offset + r;
@@ -170,9 +155,9 @@ impl<'a> ChipletTraceFragment<'a> {
             for &col in self.prefix_one_cols {
                 row[col] = ONE;
             }
-            let src_row = &src[r * self.num_cols..(r + 1) * self.num_cols];
-            row[self.col_start..self.col_start + self.num_cols].copy_from_slice(src_row);
-            if self.write_chip_clk {
+            row[self.col_start..self.col_start + self.num_cols]
+                .copy_from_slice(&src[r * self.num_cols..(r + 1) * self.num_cols]);
+            if write_chip_clk {
                 row[clk_col] = Felt::from_u32((self.row_offset + dst_row + 1) as u32);
             }
         }
@@ -182,93 +167,102 @@ impl<'a> ChipletTraceFragment<'a> {
 // TRACE LENGTH SUMMARY
 // ================================================================================================
 
-/// Contains the unpadded lengths of the trace parts.
+/// Row counts for the AIR segments produced by trace generation.
 ///
-/// - `core_trace_len` contains the length of the core trace (system + decoder + stack).
-/// - `range_trace_len` contains the length of the range checker trace.
-/// - `chiplets_trace_len` contains the chiplets-trace component lengths.
-/// - `poseidon2_permutation_trace_len` contains the Poseidon2 permutation AIR length.
+/// Dynamic AIRs store their unpadded row counts. Use the `*_height()` accessors for their padded
+/// power-of-two AIR matrix heights. The byte-pair lookup stores its fixed physical row count.
 #[derive(Debug, Default, Eq, PartialEq, Clone, Copy)]
 pub struct TraceLenSummary {
-    core_trace_len: usize,
-    range_trace_len: usize,
-    chiplets_trace_len: ChipletsLengths,
-    poseidon2_permutation_trace_len: usize,
-    /// Set by the trace builder when known. `None` falls back to deriving from the
-    /// unpadded component lengths via `next_power_of_two`.
-    padded_trace_len: Option<usize>,
+    core_rows: usize,
+    chiplets: ChipletsLengths,
+    blakeg_compression_rows: usize,
+    byte_pair_lookup_rows: usize,
 }
 
 impl TraceLenSummary {
     pub fn new(
-        core_trace_len: usize,
-        range_trace_len: usize,
-        chiplets_trace_len: ChipletsLengths,
+        core_rows: usize,
+        chiplets: ChipletsLengths,
+        blakeg_compression_rows: usize,
+        byte_pair_lookup_rows: usize,
     ) -> Self {
         TraceLenSummary {
-            core_trace_len,
-            range_trace_len,
-            chiplets_trace_len,
-            poseidon2_permutation_trace_len: 0,
-            padded_trace_len: None,
+            core_rows,
+            chiplets,
+            blakeg_compression_rows,
+            byte_pair_lookup_rows,
         }
     }
 
-    /// Builds a summary after the trace builder has computed the padded proof height.
-    pub fn new_with_padded(
-        core_trace_len: usize,
-        range_trace_len: usize,
-        chiplets_trace_len: ChipletsLengths,
-        poseidon2_permutation_trace_len: usize,
-        padded_trace_len: usize,
-    ) -> Self {
-        TraceLenSummary {
-            core_trace_len,
-            range_trace_len,
-            chiplets_trace_len,
-            poseidon2_permutation_trace_len,
-            padded_trace_len: Some(padded_trace_len),
-        }
+    /// Returns the unpadded core AIR rows (system + decoder + stack).
+    pub fn core_rows(&self) -> usize {
+        self.core_rows
     }
 
-    /// Returns length of the core trace (system + decoder + stack).
-    pub fn core_trace_len(&self) -> usize {
-        self.core_trace_len
+    /// Returns the chiplet row-count breakdown.
+    pub fn chiplets(&self) -> ChipletsLengths {
+        self.chiplets
     }
 
-    /// Returns length of the range checker trace.
-    pub fn range_trace_len(&self) -> usize {
-        self.range_trace_len
+    /// Returns the unpadded chiplets AIR rows.
+    pub fn chiplets_rows(&self) -> usize {
+        self.chiplets.trace_len()
     }
 
-    /// Returns the chiplets-trace component lengths.
-    pub fn chiplets_trace_len(&self) -> ChipletsLengths {
-        self.chiplets_trace_len
+    /// Returns the unpadded BlakeG-compression AIR rows.
+    pub fn blakeg_compression_rows(&self) -> usize {
+        self.blakeg_compression_rows
     }
 
-    /// Returns the Poseidon2 permutation AIR trace length.
-    pub fn poseidon2_permutation_trace_len(&self) -> usize {
-        self.poseidon2_permutation_trace_len
+    /// Returns the number of BlakeG compression blocks represented by the BlakeG AIR rows.
+    pub fn blakeg_compression_count(&self) -> usize {
+        debug_assert_eq!(self.blakeg_compression_rows % BLAKEG_COMPRESSION_CYCLE_LEN, 0);
+        self.blakeg_compression_rows / BLAKEG_COMPRESSION_CYCLE_LEN
     }
 
-    /// Returns the maximum of all component lengths.
-    pub fn trace_len(&self) -> usize {
-        self.range_trace_len
-            .max(self.core_trace_len)
-            .max(self.chiplets_trace_len.trace_len())
-            .max(self.poseidon2_permutation_trace_len)
+    /// Returns the fixed byte-pair lookup AIR rows.
+    ///
+    /// This table has one row per byte pair, so its row count is already its physical AIR height.
+    pub fn byte_pair_lookup_rows(&self) -> usize {
+        self.byte_pair_lookup_rows
     }
 
-    /// Returns `trace_len` rounded up to the next power of two, clamped to `MIN_TRACE_LEN`.
-    pub fn padded_trace_len(&self) -> usize {
-        self.padded_trace_len
-            .unwrap_or_else(|| self.trace_len().next_power_of_two().max(MIN_TRACE_LEN))
+    /// Returns the padded height of the core AIR.
+    pub fn core_height(&self) -> usize {
+        padded_height(self.core_rows)
     }
 
-    /// Returns the percent (0 - 100) of rows added by padding.
-    pub fn padding_percentage(&self) -> usize {
-        (self.padded_trace_len() - self.trace_len()) * 100 / self.padded_trace_len()
+    /// Returns the padded height of the chiplets AIR.
+    pub fn chiplets_height(&self) -> usize {
+        padded_height(self.chiplets_rows())
     }
+
+    /// Returns the padded height of the BlakeG-compression AIR.
+    pub fn blakeg_compression_height(&self) -> usize {
+        padded_height(self.blakeg_compression_rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_len_summary_reports_blakeg_compression_count() {
+        let summary = TraceLenSummary::new(
+            0,
+            ChipletsLengths::default(),
+            3 * BLAKEG_COMPRESSION_CYCLE_LEN,
+            0,
+        );
+
+        assert_eq!(summary.blakeg_compression_rows(), 3 * BLAKEG_COMPRESSION_CYCLE_LEN);
+        assert_eq!(summary.blakeg_compression_count(), 3);
+    }
+}
+
+fn padded_height(rows: usize) -> usize {
+    rows.next_power_of_two().max(MIN_TRACE_LEN)
 }
 
 // CHIPLET LENGTHS

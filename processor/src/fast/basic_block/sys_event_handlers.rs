@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use miden_core::{
     Felt, WORD_SIZE, Word, ZERO,
-    crypto::hash::Poseidon2,
+    chiplets::hasher::{Hasher as VmHasher, compress_state},
     deferred::PrecompileError,
     events::SystemEvent,
     field::{BasedVectorSpace, Field, PrimeCharacteristicRing, QuadFelt},
@@ -69,7 +69,7 @@ pub fn handle_system_event(
             insert_hdword_into_adv_map(processor, domain)
         },
         SystemEvent::HqwordToMap => insert_hqword_into_adv_map(processor),
-        SystemEvent::HpermToMap => insert_hperm_into_adv_map(processor),
+        SystemEvent::BCompressToMap => insert_bcompress_into_adv_map(processor),
         SystemEvent::DeferredRegister => handle_deferred_register(processor),
         SystemEvent::DeferredEvaluate => handle_deferred_evaluate(processor),
         SystemEvent::DeferredEvaluateTag => handle_deferred_evaluate_tag(processor),
@@ -159,7 +159,7 @@ fn insert_hdword_into_adv_map(
     let b = processor.stack_get_word(5);
 
     // Hash as [A, B] to match `hmerge` behavior directly.
-    let key = Poseidon2::merge_in_domain(&[a, b], domain);
+    let key = VmHasher::merge_in_domain(&[a, b], domain);
 
     // Store values as [A, B] matching the hash order.
     // Retrieval with `padw adv_loadw padw adv_loadw swapw` produces [A, B] on operand stack.
@@ -193,7 +193,7 @@ fn insert_hqword_into_adv_map(processor: &mut FastProcessor) -> Result<(), Syste
     let d = processor.stack_get_word_safe(13);
 
     // Hash in natural stack order [A, B, C, D].
-    let key = Poseidon2::hash_elements(&[*a, *b, *c, *d].concat());
+    let key = VmHasher::hash_elements(&[*a, *b, *c, *d].concat());
 
     // Store values in [A, B, C, D] order.
     let mut values = Vec::with_capacity(4 * WORD_SIZE);
@@ -207,7 +207,7 @@ fn insert_hqword_into_adv_map(processor: &mut FastProcessor) -> Result<(), Syste
 }
 
 /// Reads three words from the operand stack and inserts the rate portion into the advice map
-/// under the key defined by applying a Poseidon2 permutation to all three words.
+/// under the key defined by applying `bcompress` to all three words.
 ///
 /// ```text
 /// Inputs:
@@ -218,9 +218,9 @@ fn insert_hqword_into_adv_map(processor: &mut FastProcessor) -> Result<(), Syste
 ///   Advice map: {KEY: [RATE1, RATE2]} (8 elements from rate portion)
 /// ```
 ///
-/// Where `KEY` is computed by applying `hperm` to the 12-element state and extracting the digest.
-/// The state is read as `[RATE1, RATE2, CAP]` matching the LE sponge convention.
-fn insert_hperm_into_adv_map(processor: &mut FastProcessor) -> Result<(), SystemEventError> {
+/// Where `KEY` is computed by applying `bcompress` to the 12-element state and extracting the
+/// digest. The state is read as `[RATE1, RATE2, CAP]` matching the LE sponge convention.
+fn insert_bcompress_into_adv_map(processor: &mut FastProcessor) -> Result<(), SystemEventError> {
     // Read the 12-element state from stack positions 1-12.
     // State layout: [RATE1, RATE2, CAP] where RATE1 is at positions 1-4.
     let mut state = [
@@ -239,12 +239,12 @@ fn insert_hperm_into_adv_map(processor: &mut FastProcessor) -> Result<(), System
     ];
 
     // Extract the rate portion (first 8 elements) as values to store.
-    let values = state[Poseidon2::RATE_RANGE].to_vec();
+    let values = state[..VmHasher::RATE_LEN].to_vec();
 
-    // Apply permutation and extract digest as the key.
-    Poseidon2::apply_permutation(&mut state);
+    // Apply the VM hasher and extract the digest as the key.
+    compress_state(&mut state);
     let key = Word::new(
-        state[Poseidon2::DIGEST_RANGE]
+        state[VmHasher::DIGEST_RANGE]
             .try_into()
             .expect("failed to extract digest from state"),
     );
@@ -552,16 +552,15 @@ fn push_transformed_stack_top(
 mod tests {
     use alloc::vec;
 
-    use miden_core::{Felt, ZERO, crypto::hash::Poseidon2};
+    use miden_core::{Felt, ZERO, chiplets::hasher};
 
     use super::*;
     use crate::{ExecutionOptions, StackInputs, fast::FastProcessor};
 
-    /// Tests that `insert_hperm_into_adv_map` produces the same key as applying
-    /// `Poseidon2::apply_permutation` directly to the same state, and stores the rate portion
-    /// (first 8 elements) as the values.
+    /// Tests that `insert_bcompress_into_adv_map` produces the same key as compressing the same
+    /// state directly, and stores the rate portion (first 8 elements) as the values.
     #[test]
-    fn insert_hperm_into_adv_map_consistent_with_permutation() {
+    fn insert_bcompress_into_adv_map_consistent_with_compression() {
         // Build a 12-element state with distinct values.
         let state_felts: [Felt; 12] = core::array::from_fn(|i| Felt::new_unchecked((i + 1) as u64));
 
@@ -574,16 +573,19 @@ mod tests {
         let mut processor = FastProcessor::new(StackInputs::new(&stack_values).unwrap());
 
         // Call the handler under test.
-        insert_hperm_into_adv_map(&mut processor).unwrap();
+        insert_bcompress_into_adv_map(&mut processor).unwrap();
 
-        // Compute expected key by applying the permutation to the same state.
-        let mut expected_state_after_perm = state_felts;
-        Poseidon2::apply_permutation(&mut expected_state_after_perm);
-        let expected_key =
-            Word::new(expected_state_after_perm[Poseidon2::DIGEST_RANGE].try_into().unwrap());
+        // Compute the expected key by compressing the same state.
+        let mut expected_state_after_compression = state_felts;
+        compress_state(&mut expected_state_after_compression);
+        let expected_key = Word::new(
+            expected_state_after_compression[hasher::Hasher::DIGEST_RANGE]
+                .try_into()
+                .unwrap(),
+        );
 
         // The expected values are the rate portion (first 8 elements) of the *input* state.
-        let expected_values = state_felts[Poseidon2::RATE_RANGE].to_vec();
+        let expected_values = state_felts[..hasher::Hasher::RATE_LEN].to_vec();
 
         // Verify the advice map contains the correct entry.
         let stored_values = processor

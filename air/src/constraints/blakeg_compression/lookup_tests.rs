@@ -142,17 +142,6 @@ fn expected_column_counts(row: usize, mode: BlakeGCompressionMode) -> [usize; AU
         counts[LookupPlan::singleton_aux_column(singleton.kind)] += 1;
     }
 
-    // Mode is carried by the multiplicity, not by the lookup flag, so all singleton denominators
-    // are selected at their scheduled rows even when their multiplicity is zero.
-    if matches!(row_kind(row), RowKind::Footer(_)) {
-        counts[AEAD_LOW_OUTPUT_COLUMN] = 1;
-        counts[AEAD_HIGH_OUTPUT_COLUMN] = 1;
-    }
-    if row == BLOCK_PERIOD - 1 {
-        counts[COMPRESSION_LINK_COLUMN] = 1;
-        counts[AEAD_INPUT_COLUMN] = 1;
-    }
-
     counts
 }
 
@@ -160,7 +149,7 @@ fn assert_lookup_fraction_counts(mode: BlakeGCompressionMode, trace_mode: TraceM
     let air = BlakeGCompressionLookupAir;
     let trace = felt_trace_matrix(trace_mode);
     let periodic = get_periodic_column_values();
-    let fractions = build_lookup_fractions(&air, &trace, &periodic, &lookup_challenges());
+    let fractions = build_lookup_fractions(&air, &trace, None, &periodic, &lookup_challenges());
 
     assert_eq!(fractions.shape(), BLAKEG_LOOKUP_COLUMN_SHAPE);
     assert_eq!(fractions.counts().len(), BLOCK_PERIOD * AUX_COLS);
@@ -329,6 +318,7 @@ fn internal_bus_encodings_include_compression_cycle_id() {
     let fractions = build_lookup_fractions(
         &BlakeGCompressionLookupAir,
         &trace,
+        None,
         &get_periodic_column_values(),
         &challenges,
     );
@@ -401,6 +391,7 @@ fn internal_bus_encodings_include_compression_cycle_id() {
 #[cfg(feature = "std")]
 fn lookup_degree_annotations_match_air_expressions() {
     let layout = ValidateLayout {
+        preprocessed_width: 0,
         trace_width: NUM_COLS,
         num_public_values: 0,
         num_periodic_columns: get_periodic_column_values().len(),

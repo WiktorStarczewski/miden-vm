@@ -103,17 +103,21 @@ impl Prover {
         let trace_len_summary = trace.trace_len_summary();
         tracing::event!(
             tracing::Level::INFO,
-            "Generated execution traces: core={}, range={}, chiplets={}, poseidon2={}, padded={}",
-            trace_len_summary.core_trace_len(),
-            trace_len_summary.range_trace_len(),
-            trace_len_summary.chiplets_trace_len().trace_len(),
-            trace_len_summary.poseidon2_permutation_trace_len(),
-            trace_len_summary.padded_trace_len()
+            "Generated execution traces: core={}, chiplets={}, blakeg={}, and8={}, padded={}",
+            trace_len_summary.core_rows(),
+            trace_len_summary.chiplets_rows(),
+            trace_len_summary.blakeg_compression_rows(),
+            trace_len_summary.byte_pair_lookup_rows(),
+            trace_len_summary
+                .core_height()
+                .max(trace_len_summary.chiplets_height())
+                .max(trace_len_summary.blakeg_compression_height())
+                .max(trace_len_summary.byte_pair_lookup_rows())
         );
 
         let precompile_root = trace.precompile_root();
         let (public_values, aux_inputs) = trace.public_inputs().to_air_inputs();
-        let (core_matrix, chiplets_matrix, poseidon2_matrix) = trace.into_air_matrices();
+        let (core_matrix, chiplets_matrix, blakeg_matrix, and8_matrix) = trace.into_air_matrices();
 
         let params = config::pcs_params();
         let proof_bytes = match self.hash_fn {
@@ -123,7 +127,8 @@ impl Prover {
                     &config,
                     core_matrix,
                     chiplets_matrix,
-                    poseidon2_matrix,
+                    blakeg_matrix,
+                    and8_matrix,
                     &public_values,
                     &aux_inputs,
                 )
@@ -134,7 +139,20 @@ impl Prover {
                     &config,
                     core_matrix,
                     chiplets_matrix,
-                    poseidon2_matrix,
+                    blakeg_matrix,
+                    and8_matrix,
+                    &public_values,
+                    &aux_inputs,
+                )
+            },
+            HashFunction::Eidos => {
+                let config = config::eidos_config(params, config::RELATION_DIGEST);
+                prove_stark(
+                    &config,
+                    core_matrix,
+                    chiplets_matrix,
+                    blakeg_matrix,
+                    and8_matrix,
                     &public_values,
                     &aux_inputs,
                 )
@@ -145,7 +163,8 @@ impl Prover {
                     &config,
                     core_matrix,
                     chiplets_matrix,
-                    poseidon2_matrix,
+                    blakeg_matrix,
+                    and8_matrix,
                     &public_values,
                     &aux_inputs,
                 )
@@ -156,7 +175,8 @@ impl Prover {
                     &config,
                     core_matrix,
                     chiplets_matrix,
-                    poseidon2_matrix,
+                    blakeg_matrix,
+                    and8_matrix,
                     &public_values,
                     &aux_inputs,
                 )
@@ -167,7 +187,8 @@ impl Prover {
                     &config,
                     core_matrix,
                     chiplets_matrix,
-                    poseidon2_matrix,
+                    blakeg_matrix,
+                    and8_matrix,
                     &public_values,
                     &aux_inputs,
                 )

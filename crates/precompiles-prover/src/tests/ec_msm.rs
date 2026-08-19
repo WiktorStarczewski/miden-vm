@@ -677,7 +677,7 @@ fn msm_resolve_duplicate_base_rejected() {
 #[should_panic(expected = "constraint not satisfied")]
 fn msm_resolve_run_expr_must_be_constant() {
     let traces = msm_resolve_two_term_traces();
-    let eval = traces.mains()[4]; // the transcript-eval main
+    let eval = crate::tests::transcript_eval_main(&traces);
     let ncols = eval.width();
 
     // The first absorb row of a 2-term run is non-boundary.

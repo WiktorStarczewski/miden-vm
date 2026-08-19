@@ -1,8 +1,8 @@
-use alloc::{collections::VecDeque, string::ToString, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, string::ToString, sync::Arc, vec::Vec};
 
 use miden_air::trace::{
     RowIndex,
-    chiplets::hasher::{HasherState, RATE_LEN, STATE_WIDTH},
+    chiplets::hasher::{HasherState, STATE_WIDTH},
 };
 use miden_core::mast::{BasicBlockNode, ExecutableMastForest, MastNode, MastNodeExt, OpBatch};
 
@@ -16,7 +16,7 @@ use crate::{
     processor::{
         AdviceProviderInterface, HasherInterface, MemoryInterface, Processor, SystemInterface,
     },
-    trace::chiplets::CircuitEvaluation,
+    trace::chiplets::{AEAD_STREAM_CYCLE_LEN, CircuitEvaluation},
     utils::Idx,
 };
 
@@ -752,10 +752,30 @@ pub enum BitwiseOp {
     U32Xor,
 }
 
+/// One 8-row AEAD stream entry to replay into the bitwise chiplet.
+#[derive(Debug)]
+pub struct AeadStreamReplayEntry {
+    pub ctx: Felt,
+    pub clk: Felt,
+    pub src_ptr: Felt,
+    pub dst_ptr: Felt,
+    pub lane_base: Felt,
+    pub plaintext: [Felt; 4],
+    pub keystream: [Felt; 8],
+    pub ciphertext: [Felt; 8],
+}
+
+/// Replay entry for the bitwise chiplet.
+#[derive(Debug)]
+pub enum BitwiseReplayEntry {
+    U32(BitwiseOp, Felt, Felt),
+    AeadStream(Box<AeadStreamReplayEntry>),
+}
+
 /// Replay data for bitwise operations.
 #[derive(Debug, Default)]
 pub struct BitwiseReplay {
-    u32op_with_operands: VecDeque<(BitwiseOp, Felt, Felt)>,
+    entries: VecDeque<BitwiseReplayEntry>,
 }
 
 impl BitwiseReplay {
@@ -764,27 +784,39 @@ impl BitwiseReplay {
 
     /// Records the operands of a u32and operation.
     pub fn record_u32and(&mut self, a: Felt, b: Felt) {
-        self.u32op_with_operands.push_back((BitwiseOp::U32And, a, b));
+        self.entries.push_back(BitwiseReplayEntry::U32(BitwiseOp::U32And, a, b));
     }
 
     /// Records the operands of a u32xor operation.
     pub fn record_u32xor(&mut self, a: Felt, b: Felt) {
-        self.u32op_with_operands.push_back((BitwiseOp::U32Xor, a, b));
+        self.entries.push_back(BitwiseReplayEntry::U32(BitwiseOp::U32Xor, a, b));
     }
 
-    /// Returns the number of recorded operations.
-    pub fn num_operations(&self) -> usize {
-        self.u32op_with_operands.len()
+    /// Records one 8-row AEAD stream entry.
+    pub fn record_aead_stream(&mut self, entry: AeadStreamReplayEntry) {
+        self.entries.push_back(BitwiseReplayEntry::AeadStream(Box::new(entry)));
+    }
+
+    /// Returns the number of trace rows contributed by the recorded operations, or `None` on
+    /// overflow.
+    pub fn trace_len(&self) -> Option<usize> {
+        self.entries.iter().try_fold(0usize, |len, entry| {
+            let entry_len = match entry {
+                BitwiseReplayEntry::U32(..) => 1,
+                BitwiseReplayEntry::AeadStream(..) => AEAD_STREAM_CYCLE_LEN,
+            };
+            len.checked_add(entry_len)
+        })
     }
 }
 
 impl IntoIterator for BitwiseReplay {
-    type Item = (BitwiseOp, Felt, Felt);
-    type IntoIter = <VecDeque<(BitwiseOp, Felt, Felt)> as IntoIterator>::IntoIter;
+    type Item = BitwiseReplayEntry;
+    type IntoIter = <VecDeque<BitwiseReplayEntry> as IntoIterator>::IntoIter;
 
     /// Returns an iterator over all recorded u32 operations with their operands.
     fn into_iter(self) -> Self::IntoIter {
-        self.u32op_with_operands.into_iter()
+        self.entries.into_iter()
     }
 }
 
@@ -921,10 +953,10 @@ impl BlockAddressReplay {
 /// trace generation.
 #[derive(Debug, Default)]
 pub struct HasherResponseReplay {
-    /// Recorded hasher operations from permutation operations (HPerm).
+    /// Recorded hasher operations from BCompress requests.
     ///
     /// Each entry contains (address, output_state)
-    permutation_operations: VecDeque<(Felt, [Felt; 12])>,
+    compression_operations: VecDeque<(Felt, [Felt; 12])>,
 
     /// Recorded hasher operations from Merkle path verification operations.
     ///
@@ -941,10 +973,9 @@ impl HasherResponseReplay {
     // MUTATIONS (populated by the fast processor)
     // --------------------------------------------------------------------------------------------
 
-    /// Records a `Hasher::permute` operation with its address and result (after applying the
-    /// permutation)
-    pub fn record_permute(&mut self, addr: Felt, hashed_state: [Felt; 12]) {
-        self.permutation_operations.push_back((addr, hashed_state));
+    /// Records a `Hasher::bcompress` operation with its address and compressed state.
+    pub fn record_compression(&mut self, addr: Felt, hashed_state: [Felt; 12]) {
+        self.compression_operations.push_back((addr, hashed_state));
     }
 
     /// Records a Merkle path verification with its address and computed root
@@ -960,11 +991,11 @@ impl HasherResponseReplay {
     // ACCESSORS (used by parallel trace generators)
     // --------------------------------------------------------------------------------------------
 
-    /// Replays a `Hasher::permute` operation, returning its address and result
-    pub fn replay_permute(&mut self) -> Result<(Felt, [Felt; 12]), OperationError> {
-        self.permutation_operations
+    /// Replays a `Hasher::bcompress` operation, returning its address and compressed state.
+    pub fn replay_compression(&mut self) -> Result<(Felt, [Felt; 12]), OperationError> {
+        self.compression_operations
             .pop_front()
-            .ok_or(OperationError::Internal("no permutation operations recorded"))
+            .ok_or(OperationError::Internal("no compression operations recorded"))
     }
 
     /// Replays a Merkle path verification, returning the pre-recorded address and computed root
@@ -983,8 +1014,17 @@ impl HasherResponseReplay {
 }
 
 impl HasherInterface for HasherResponseReplay {
-    fn permute(&mut self, _state: HasherState) -> Result<(Felt, HasherState), OperationError> {
-        self.replay_permute()
+    fn bcompress(&mut self, _state: HasherState) -> Result<(Felt, HasherState), OperationError> {
+        self.replay_compression()
+    }
+
+    fn compress_aead_xof(
+        &mut self,
+        _ctx: ContextId,
+        _clk: RowIndex,
+        state: HasherState,
+    ) -> Result<[Felt; 16], OperationError> {
+        Ok(miden_core::chiplets::blakeg::compress_raw_xof_lanes(&state).map(Felt::from_u32))
     }
 
     fn verify_merkle_root(
@@ -1028,7 +1068,8 @@ impl HasherInterface for HasherResponseReplay {
 /// operands.
 #[derive(Debug)]
 pub enum HasherOp {
-    Permute([Felt; STATE_WIDTH]),
+    BCompress([Felt; STATE_WIDTH]),
+    AeadXof(ContextId, RowIndex, [Felt; STATE_WIDTH]),
     HashControlBlock((Word, Word, Felt, Word)),
     /// `(forest_id, node_id, expected_hash)` — `forest_id` is an id into the
     /// `mast_forest_store` of the trace replay that owns this operation.
@@ -1042,7 +1083,8 @@ impl HasherOp {
     /// needs forest access.
     fn resolve_forest_free<'a>(self) -> Option<ResolvedHasherOp<'a>> {
         match self {
-            HasherOp::Permute(s) => Some(ResolvedHasherOp::Permute(s)),
+            HasherOp::BCompress(s) => Some(ResolvedHasherOp::BCompress(s)),
+            HasherOp::AeadXof(ctx, clk, s) => Some(ResolvedHasherOp::AeadXof(ctx, clk, s)),
             HasherOp::HashControlBlock(x) => Some(ResolvedHasherOp::HashControlBlock(x)),
             HasherOp::HashBasicBlock(_) => None,
             HasherOp::BuildMerkleRoot(x) => Some(ResolvedHasherOp::BuildMerkleRoot(x)),
@@ -1057,7 +1099,7 @@ pub enum ResolvedBasicBlockGroups<'a> {
     /// Buffered replay borrows batches from the finalized MAST forest.
     Borrowed(&'a [OpBatch]),
     /// Streamed replay owns the group hashes because it crosses a thread boundary.
-    Owned(Vec<[Felt; RATE_LEN]>),
+    Owned(Vec<OpBatch>),
 }
 
 /// A hasher-chiplet request with all operands resolved, so it can be replayed without further
@@ -1068,7 +1110,8 @@ pub enum ResolvedBasicBlockGroups<'a> {
 /// streaming path resolves at record time and forwards owned data to the concurrent builder.
 #[derive(Debug)]
 pub enum ResolvedHasherOp<'a> {
-    Permute([Felt; STATE_WIDTH]),
+    BCompress([Felt; STATE_WIDTH]),
+    AeadXof(ContextId, RowIndex, [Felt; STATE_WIDTH]),
     HashControlBlock((Word, Word, Felt, Word)),
     HashBasicBlock((ResolvedBasicBlockGroups<'a>, Word)),
     BuildMerkleRoot((Word, MerklePath, Felt)),
@@ -1155,9 +1198,19 @@ impl HasherRequestReplay {
         }
     }
 
-    /// Records a `Hasher::permute()` request.
-    pub fn record_permute_input(&mut self, state: [Felt; STATE_WIDTH]) {
-        self.record(HasherOp::Permute(state));
+    /// Records a `Hasher::bcompress()` request.
+    pub fn record_bcompress_input(&mut self, state: [Felt; STATE_WIDTH]) {
+        self.record(HasherOp::BCompress(state));
+    }
+
+    /// Records an AEAD-XOF compression request.
+    pub fn record_aead_xof_input(
+        &mut self,
+        ctx: ContextId,
+        clk: RowIndex,
+        state: [Felt; STATE_WIDTH],
+    ) {
+        self.record(HasherOp::AeadXof(ctx, clk, state));
     }
 
     /// Records a `Hasher::hash_control_block()` request.
@@ -1185,9 +1238,7 @@ impl HasherRequestReplay {
         let expected_hash = basic_block_node.digest();
         self.record_resolved(HasherOp::HashBasicBlock((forest_id, node_id, expected_hash)), || {
             ResolvedHasherOp::HashBasicBlock((
-                ResolvedBasicBlockGroups::Owned(
-                    basic_block_node.op_batches().iter().map(|batch| *batch.groups()).collect(),
-                ),
+                ResolvedBasicBlockGroups::Owned(basic_block_node.op_batches().to_vec()),
                 expected_hash,
             ))
         });
@@ -1359,6 +1410,31 @@ impl StackOverflowReplay {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitwise_replay_trace_len_accounts_for_aead_stream_rows() {
+        let mut replay = BitwiseReplay::default();
+        replay.record_u32and(ZERO, ZERO);
+        for lane_base in [ZERO, Felt::new_unchecked(8)] {
+            replay.record_aead_stream(AeadStreamReplayEntry {
+                ctx: ZERO,
+                clk: ZERO,
+                src_ptr: ZERO,
+                dst_ptr: ZERO,
+                lane_base,
+                plaintext: [ZERO; 4],
+                keystream: [ZERO; 8],
+                ciphertext: [ZERO; 8],
+            });
+        }
+
+        assert_eq!(replay.trace_len(), Some(1 + 2 * AEAD_STREAM_CYCLE_LEN));
+        assert!(
+            core::mem::size_of::<BitwiseReplayEntry>()
+                < core::mem::size_of::<AeadStreamReplayEntry>(),
+            "ordinary replay entries must not pay for the inline AEAD stream payload",
+        );
+    }
 
     /// A streamed replay reaching the buffered trace-build path is a logic error
     /// and must surface immediately, not as a silently empty hasher chiplet.

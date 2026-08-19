@@ -20,7 +20,7 @@ use miden_ace_codegen::{
     ShuffleEncodeBuffer, fold_row_to_root, order_from_tag, order_tag, render_masm_constraints_eval,
     subtree_leaves,
 };
-use miden_core::{Felt, Word, crypto::hash::Poseidon2};
+use miden_core::{Felt, Word, crypto::hash::Eidos};
 use miden_crypto::merkle::MerkleTree;
 use miden_lifted_air::BaseAir;
 use miden_lifted_stark::{QuotientRecompositionInputs, quotient_recomposition_inputs};
@@ -46,7 +46,9 @@ const PVM_RELATION_MOD_PATH: &str = "../lib/core/asm/sys/pvm/mod.masm";
 /// First felt after the VM relation's fixed ACE stream reservation. The PVM's complete READ
 /// section starts here; its aux-randomness anchor is later because four public EF inputs precede
 /// it.
-const PVM_READ_START: u32 = 3_225_426_416;
+// The wide four-AIR VM evaluator occupies 8,720 felts; place the PVM frame at the next 4-Ki-felt
+// boundary after that stream so the two relation-owned allocations cannot overlap.
+const PVM_READ_START: u32 = 3_225_432_064;
 /// Start of the VM relation's next scratch region; the PVM allocation must end before it.
 const NEXT_VM_REGION_START: u32 = 3_238_002_688;
 
@@ -77,7 +79,7 @@ struct GeneratedArtifacts {
     row: Vec<Word>,
     root: Word,
     digest: [Felt; 4],
-    /// Commitment to the preprocessed (setup) LDE tree under the Poseidon2 config —
+    /// Commitment to the preprocessed (setup) LDE tree under the Eidos config —
     /// the configuration an in-VM verifier targets.
     ///
     /// This is a trusted verifier input rather than proof data: the Rust verifier
@@ -279,9 +281,9 @@ fn compute(mode: Mode) -> Result<GeneratedArtifacts, String> {
         let instructions = circuit.encoded.instructions();
         let scalar_leaf =
             factory.leaf_for_order(&order, &mut scalar_buffer).map_err(|e| format!("{e}"))?;
-        if Poseidon2::hash_elements(&instructions[..circuit.shuffle_prefix_len])
+        if Eidos::hash_elements(&instructions[..circuit.shuffle_prefix_len])
             != circuit.shuffle_commitment
-            || Poseidon2::hash_elements(&instructions[circuit.shuffle_prefix_len..])
+            || Eidos::hash_elements(&instructions[circuit.shuffle_prefix_len..])
                 != circuit.common_commitment
             || scalar_leaf != circuit.commitment
         {
@@ -389,6 +391,13 @@ fn compute(mode: Mode) -> Result<GeneratedArtifacts, String> {
             felt.as_canonical_u64(),
         )?;
     }
+    for (index, felt) in preprocessed_commitment.iter().enumerate() {
+        replace_masm_const(
+            &mut relation_mod_masm,
+            &format!("PREPROCESSED_COMMITMENT_{index}"),
+            felt.as_canonical_u64(),
+        )?;
+    }
 
     Ok(GeneratedArtifacts {
         row,
@@ -402,17 +411,17 @@ fn compute(mode: Mode) -> Result<GeneratedArtifacts, String> {
     })
 }
 
-/// Commitment to the setup (preprocessed) trace tree under the Poseidon2 config.
+/// Commitment to the setup (preprocessed) trace tree under the Eidos config.
 ///
 /// Built through the same cache the prover and Rust verifier use, so the minted
 /// constant is by construction the value they observe into the transcript.
 fn preprocessed_commitment() -> Word {
     let params = crate::stark_config::precompile_pcs_params();
-    let config = crate::stark_config::poseidon2_config(params, [Felt::ZERO; 4]);
+    let config = crate::stark_config::eidos_config(params, [Felt::ZERO; 4]);
     // The LMCS commitment is a 4-felt hash; Word is the MASM-facing representation.
-    let commitment: [Felt; 4] =
-        crate::session::preprocessed_cache::poseidon2(&config).commitment().into();
-    Word::new(commitment)
+    let commitment: [u64; 4] =
+        crate::session::preprocessed_cache::eidos(&config).commitment().into();
+    Word::new(commitment.map(Felt::new_unchecked))
 }
 
 fn render_pvm_layout(layout: &PvmReadLayout, stream_len: usize) -> Result<String, String> {
@@ -618,9 +627,9 @@ fn render(artifacts: &GeneratedArtifacts) -> String {
          the PVM ACE circuit registry (raw canonical u64 limbs).\npub const \
          PVM_ACE_REGISTRY_ROOT: [u64; 4] = [\n{root}];\n\n/// Relation digest binding the \
          registry root into the Fiat-Shamir transcript\n/// (raw canonical u64 limbs): \
-         `Poseidon2(PVM_PROTOCOL_ID || PVM_ACE_REGISTRY_ROOT)`.\npub const \
+         `Eidos(PVM_PROTOCOL_ID || PVM_ACE_REGISTRY_ROOT)`.\npub const \
          PVM_RELATION_DIGEST: [u64; 4] = [\n{digest}];\n\n/// Commitment to the \
-         preprocessed (setup) trace tree under the Poseidon2 config (raw canonical\n/// \
+         preprocessed (setup) trace tree under the Eidos config (raw canonical\n/// \
          u64 limbs). A trusted verifier input, not proof data: an in-VM verifier cannot\n/// \
          rebuild the bundle, so it observes this pinned value into the transcript.\npub \
          const PVM_PREPROCESSED_COMMITMENT: [u64; 4] = [\n{preprocessed}];\n\n/// Encoded \

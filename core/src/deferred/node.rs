@@ -3,21 +3,21 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::mem::size_of;
 
-use miden_crypto::{ONE, ZERO, hash::poseidon2::Poseidon2};
+use miden_crypto::{ONE, ZERO, hash::eidos::Eidos};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use super::DeferredError;
+use super::{DEFERRED_AND_DOMAIN, DEFERRED_CHUNKS_DOMAIN, DEFERRED_NODE_DOMAIN, DeferredError};
 use crate::{
     Felt, Word,
     serde::{ByteReader, ByteWriter, Deserializable, DeserializationError, Serializable},
     utils::bytes_to_packed_u32_elements,
 };
 
-/// Stable address of a deferred [`Node`], computed as a 4-felt Poseidon2 digest.
+/// Stable address of a deferred [`Node`], computed as a 4-felt Eidos digest.
 pub type Digest = Word;
 
-/// One Poseidon2 rate block, used as the unit of deferred data payloads.
+/// One Eidos felt-mode block, used as the unit of deferred data payloads.
 pub type DataChunk = [Felt; 8];
 
 /// Digest of [`Node::TRUE`], root for an empty deferred state, and terminal of the AND-chain.
@@ -490,14 +490,43 @@ impl Node {
             return TRUE_DIGEST;
         }
 
-        let mut state = [ZERO; 12];
-        state[Self::DATA_CHUNK_FELT_LEN..Self::DATA_CHUNK_FELT_LEN + Tag::FELT_LEN]
-            .copy_from_slice(&self.tag.as_word());
-        for chunk in self.payload.as_chunks() {
-            state[0..Self::DATA_CHUNK_FELT_LEN].copy_from_slice(chunk);
-            Poseidon2::apply_permutation(&mut state);
+        let chunks = self.payload.as_chunks();
+        if self.tag == Tag::AND {
+            let [chunk] = chunks else {
+                unreachable!("AND nodes always contain exactly one digest pair")
+            };
+            return Eidos::hash_elements_in_domain(chunk, DEFERRED_AND_DOMAIN);
         }
-        Word::new([state[0], state[1], state[2], state[3]])
+        if self.tag == Tag::CHUNKS {
+            let logical_len = u32::try_from(Self::DATA_CHUNK_FELT_LEN * chunks.len())
+                .expect("deferred CHUNKS felt length must fit in u32");
+            let mut cv = Eidos::init_chaining_word(
+                DEFERRED_CHUNKS_DOMAIN.as_canonical_u64() as u32,
+                logical_len,
+            );
+            for chunk in chunks {
+                cv = Eidos::compress_block(cv, *chunk);
+            }
+            return cv;
+        }
+
+        // Precompile-owned nodes use a streaming construction which leaves each 8-felt payload
+        // chunk aligned for the VM's `mem_stream; bcompress` path. The logical length binds the
+        // four tag felts plus every payload felt; after the payload, a final `tag || 0w` block
+        // binds the complete (potentially full-field) tag without trying to encode it as a
+        // 31-bit Eidos domain selector.
+        let logical_len = Tag::FELT_LEN
+            .checked_add(Self::DATA_CHUNK_FELT_LEN * chunks.len())
+            .and_then(|len| u32::try_from(len).ok())
+            .expect("deferred node felt length must fit in u32");
+        let mut cv =
+            Eidos::init_chaining_word(DEFERRED_NODE_DOMAIN.as_canonical_u64() as u32, logical_len);
+        for chunk in chunks {
+            cv = Eidos::compress_block(cv, *chunk);
+        }
+        let mut tag_block = [ZERO; Self::DATA_CHUNK_FELT_LEN];
+        tag_block[..Tag::FELT_LEN].copy_from_slice(&self.tag.as_word());
+        Eidos::compress_block(cv, tag_block)
     }
 }
 

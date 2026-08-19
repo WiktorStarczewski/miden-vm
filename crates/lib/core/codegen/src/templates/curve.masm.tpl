@@ -62,19 +62,11 @@ end
 #! Output: [POINT_DIGEST, ptr+8, ...]
 #! Memory layout: ptr[0..4] = X_DIGEST, ptr[4..8] = Y_DIGEST.
 pub proc load_digest_pair_mem_stream
-    push.VALUE_TAG
-    # => [TAG(VALUE), ptr, ...]
-    push.1 movdn.5
-    # => [TAG(VALUE), ptr, n_chunks=1, ...]
-    adv.register_deferred_data
-    # => [TAG(VALUE), ptr, n_chunks=1, ...]
-    movup.5 drop
-    # => [TAG(VALUE), ptr, ...]
-    padw padw
-    # => [R0=0w, R1=0w, C=TAG(VALUE), ptr, ...]
-    mem_stream hperm
-    # => [R0'=POINT_DIGEST, R1', C', ptr+8, ...]
-    swapw.2 dropw dropw
+    dup push.1 swap push.VALUE_TAG
+    # => [TAG(VALUE), ptr, n_chunks=1, original_ptr, ...]
+    exec.precompiles::register_mem
+    # => [POINT_DIGEST, original_ptr, ...]
+    movup.4 add.8 movdn.4
     # => [POINT_DIGEST, ptr+8, ...]
 end
 

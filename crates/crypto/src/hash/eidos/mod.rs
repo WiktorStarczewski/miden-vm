@@ -9,6 +9,12 @@ mod framing;
 mod lmcs;
 mod primitive;
 
+/// Reference helpers for the Eidos-based AEAD construction.
+///
+/// These functions support protocol-vector generation and cross-language conformance tests. They
+/// do not manage nonces; callers are responsible for enforcing nonce uniqueness.
+pub mod aead_ref;
+
 #[cfg(test)]
 mod tests;
 

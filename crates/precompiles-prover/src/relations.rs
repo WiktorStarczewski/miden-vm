@@ -19,10 +19,10 @@
 //! | 1     | `Range16`       | `byte_pair_lut::BytePairLutAir` | `(w,)`, where `w ∈ [0, 2^16)`                               |
 //! | 4     | `Memory64`      | external (sponge / miniVM)      | `(addr, lo, hi)`, 64-bit cell — multiset, see `memory64`    |
 //! | 5     | `KeccakSponge`  | external (transcript chiplet)   | `(sponge_seq_id, chunk_ptr, len_bytes)`, per-invocation request — see `keccak::sponge` |
-//! | 6     | `Poseidon2In`   | `poseidon2::Poseidon2Air`       | `(perm_seq_id, tag, c0, c1, c2, c3)`, `tag ∈ {0, 1, 2}` for rate0/rate1/cap |
-//! | 7     | `Poseidon2Out`  | `poseidon2::Poseidon2Air`       | `(perm_seq_id, d0, d1, d2, d3)` — digest = first 4 lanes of post-perm state |
+//! | 6     | `EidosIn`   | native `BlakeGCompressionAir` | `(absorption_id, tag, c0, c1, c2, c3)`, typed Eidos rate/cap message |
+//! | 7     | `EidosOut`  | native `BlakeGCompressionAir` | `(absorption_id, d0, d1, d2, d3)` — terminal Eidos chaining word |
 //! | 8     | `Binding`       | transcript eval chips           | `(h0, h1, h2, h3, value_tag, ptr)` — node hash ↦ typed value (self-referential) |
-//! | 9     | `ChunkChain`    | `hash::chunk_node_sponge::ChunkNodeSpongeAir` (chunk band) | `(chunk_seq_id_head, perm_seq_id_head)` — per-invocation chain head, in chunk's native namespace |
+//! | 9     | `ChunkChain`    | `hash::chunk_node_sponge::ChunkNodeSpongeAir` (chunk band) | `(chunk_seq_id_head, absorption_id_head)` — per-invocation chain head, in chunk's native namespace |
 //! | 10    | `UintVal`      | `uint::store_mul::UintStoreMulAir` (store band) | `(ptr, bound_ptr, c0..c7)` — complete 256-bit value as 8×32-bit recombined limbs |
 //! | 11    | `UintAdd`      | `uint::add::UintAddAir`       | `(bound_ptr, a_ptr, b_ptr, c_ptr)` — asserts `a + b ≡ c (mod p)` for uints sharing `bound_ptr` |
 //! | 12    | `UintMul`      | `uint::mul::UintMulAir`       | `(kappa_a, kappa_c, a_ptr, b_ptr, c_ptr, r_ptr, bound_ptr)` — asserts `κₐ·a·b + κ_c·c ≡ r (mod p)` for uints sharing `bound_ptr` |
@@ -54,8 +54,8 @@ pub enum BusId {
     Range16 = 1,
     Memory64 = 4,
     KeccakSponge = 5,
-    Poseidon2In = 6,
-    Poseidon2Out = 7,
+    EidosIn = 6,
+    EidosOut = 7,
     Binding = 8,
     ChunkChain = 9,
     UintVal = 10,

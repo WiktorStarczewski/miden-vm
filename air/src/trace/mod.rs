@@ -10,15 +10,15 @@ pub use main_trace::{MainTrace, MainTraceRow};
 // CONSTANTS
 // ================================================================================================
 
-/// The minimum length of the execution trace. This is the minimum required to support range checks.
+/// The minimum length of the execution trace.
 pub const MIN_TRACE_LEN: usize = 64;
 
 // MAIN TRACE LAYOUT
 // ------------------------------------------------------------------------------------------------
 
-//      system          decoder           stack      range checks       chiplets
-//    (6 columns)     (24 columns)    (19 columns)    (2 columns)    (22 columns)
-// ├───────────────┴───────────────┴───────────────┴───────────────┴─────────────────┤
+//      system          decoder           stack          chiplets
+//    (6 columns)     (24 columns)    (19 columns)    (24 columns)
+// ├───────────────┴───────────────┴───────────────┴─────────────────┤
 
 pub const SYS_TRACE_WIDTH: usize = 6;
 
@@ -45,54 +45,77 @@ pub mod log_deferred {
     // STACK LAYOUT (TOP OF STACK)
     // --------------------------------------------------------------------------------------------
     //
-    // The opcode identity-maps the 12-lane Poseidon2 output to `stack_next[0..12]` and reads
-    // STMNT from `stack[4..8]`. So stack-side and lane-side ranges coincide; we alias to
-    // `Hasher::{RATE0,RATE1}_RANGE` rather than redefine.
+    // The opcode reads STMNT from `stack[4..8]` and writes the new transcript state to
+    // `stack_next[0..4]`.
     //
     //   Input  (current row): `[_, STMNT, _, ...]`
-    //     - stack[4..8] = STMNT — the per-call statement word.
-    //     - capacity is fixed by the opcode to the deferred-root folding domain `[1, 0, 0, 0]`.
-    //   Output (next row):    `[STATE_NEW, OUT_RATE1, OUT_CAP, ...]`
-    //     - stack[0..4] = STATE_NEW (rate0 output, kept by the wrapper);
-    //     - stack[4..12] hold output rate1 / capacity (discarded).
+    //     - stack[4..8] = STMNT, the per-call statement word.
+    //   Output (next row):    `[STATE_NEW, STMNT, ...]`
+    //     - stack[0..4] = STATE_NEW.
     //
-    // STMNT sits at stack[4..8] so the chiplet bus's β⁶..β⁹ products coincide with HPERM's
-    // rate1 products — `β^k · stack[4..7]` is computed once and reused.
+    // STMNT sits at stack[4..8] so the chiplet bus's beta^6..beta^9 products
+    // coincide with BCOMPRESS's rate1 products. `beta^k * stack[4..7]` is
+    // computed once and reused.
 
     /// Stack range containing the precomputed statement word on opcode entry.
     pub const STACK_STMNT_RANGE: Range<usize> = Hasher::RATE1_RANGE;
-    /// Stack range that receives the new deferred-root state (output rate0) on opcode exit.
+    /// Stack range that receives the new transcript state on opcode exit.
     pub const STACK_STATE_NEW_RANGE: Range<usize> = Hasher::RATE0_RANGE;
 }
 
-// Range check trace
-pub const RANGE_CHECK_TRACE_WIDTH: usize = 2;
-
 // Chiplets trace
+// 23 shared chiplet cells + chip_clk = 24.
 // `chip_clk` is the chiplet-trace row counter (value `row_index + 1`); it sources the
 // hasher responder address on the chiplet side.
-pub const CHIPLET_CONTROLLER_OFFSET: usize = 1;
-pub const CHIPLET_CLK_WIDTH: usize = 1;
-pub const CHIPLET_PAYLOAD_WIDTH: usize = CHIPLET_CONTROLLER_OFFSET + chiplets::hasher::TRACE_WIDTH;
-pub const CHIPLETS_WIDTH: usize = CHIPLET_PAYLOAD_WIDTH + CHIPLET_CLK_WIDTH;
+pub const CHIPLETS_DATA_WIDTH: usize = 23;
+pub const CHIPLETS_MODE_COL: usize = CHIPLETS_DATA_WIDTH - 1;
+pub const CHIPLETS_STREAM_MODE_COL: usize = CHIPLETS_MODE_COL;
+pub const CHIPLETS_CLK_COL: usize = CHIPLETS_MODE_COL + 1;
+pub const CHIPLETS_WIDTH: usize = CHIPLETS_CLK_COL + 1;
 
-pub mod poseidon2_permutation {
-    pub use crate::constraints::poseidon2_permutation::columns::NUM_POSEIDON2_PERMUTATION_COLS;
+pub mod blakeg_compression {
+    pub use crate::constraints::blakeg_compression::{
+        layout::{
+            BLOCK_PERIOD as BLAKEG_COMPRESSION_CYCLE_LEN, BYTES_PER_WORD, F_C_BASE_COL,
+            F_COMPRESSION_MULTIPLICITY_COL, F_D_BASE_COL, F_MODE_COL, F_R_BASE_COL,
+            F_TOP_BIT_SLOT_BASE_COL, FOOTER_ROWS, FOOTER_START, FUSED_G_ROWS,
+            NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS, NUM_G, RowKind, footer_xor_slot_col,
+            g_ac_byte_slot_col, g_bd_rot_slot_col, row_kind,
+        },
+        trace::{
+            BlakeGByteLookup, BlakeGFeltRow, ByteLookupRecorder, TraceMode,
+            generate_felt_trace_block, retag_felt_trace_block_cycle_id, write_felt_trace_block,
+            write_felt_trace_block_into_zeroed_with_lookups,
+        },
+    };
 }
 
-pub const TRACE_WIDTH: usize = SYS_TRACE_WIDTH
-    + DECODER_TRACE_WIDTH
-    + STACK_TRACE_WIDTH
-    + RANGE_CHECK_TRACE_WIDTH
-    + CHIPLETS_WIDTH;
+pub mod and8_lookup {
+    pub use crate::constraints::and8_lookup::columns::{
+        AND8_LOOKUP_TRACE_HEIGHT, AND8_TABLE_ROWS, BYTE_LOOKUP_COLUMN_COUNT, BYTE_LOOKUP_COUNT_LEN,
+        BYTE_LOOKUP_KIND_AND8, BYTE_LOOKUP_KIND_BLAKEG_ROT7, BYTE_LOOKUP_KIND_BLAKEG_ROT12,
+        BYTE_LOOKUP_KIND_COUNT, BYTE_PAIR_ROWS, LOG_AND8_LOOKUP_TRACE_HEIGHT, NUM_AND8_LOOKUP_COLS,
+        RANGE_CHECK_COUNT_OFFSET, RANGE_CHECK_LOOKUP_COL, byte_lookup_result,
+    };
+}
+
+pub const TRACE_WIDTH: usize =
+    SYS_TRACE_WIDTH + DECODER_TRACE_WIDTH + STACK_TRACE_WIDTH + CHIPLETS_WIDTH;
 
 // AUXILIARY COLUMNS LAYOUT
 // ------------------------------------------------------------------------------------------------
 //
-// Auxiliary columns materialize the per-AIR LogUp lookup arguments:
-// 4 columns for Core, 3 for Chiplets, and 1 for Poseidon2Permutation.
+// The auxiliary trace is the LogUp lookup-argument segment built per-AIR by `CoreAir`'s
+// and `ChipletsAir`'s `AuxBuilder` impls: 4 main-trace LogUp columns for Core and 3
+// chiplet-trace LogUp columns for Chiplets. See
+// [`crate::constraints::lookup::main_air::MainLookupAir`] and
+// [`crate::constraints::lookup::chiplet_air::emit_chiplet_lookup_columns`] for the
+// per-column contents.
 
-/// Auxiliary trace segment width — see the LogUp aux trace layout above.
+/// Compatibility width reserved by the combined VM trace layout.
+///
+/// Each AIR reports its actual LogUp width through `MidenAir::aux_width`; this value is not the
+/// sum of the four independent AIR widths.
 pub const AUX_TRACE_WIDTH: usize = crate::LOGUP_AUX_TRACE_WIDTH;
 
 /// Number of random challenges used for auxiliary trace constraints.
@@ -124,7 +147,7 @@ pub mod bus_message {
 
     /// Node index coefficient index: `beta_powers[2] = beta^2`.
     ///
-    /// Used for Merkle path position. Set to 0 for non-Merkle operations (SPAN, RESPAN, HPERM,
+    /// Used for Merkle path position. Set to 0 for non-Merkle operations (SPAN, RESPAN, BCOMPRESS,
     /// etc.).
     pub const NODE_INDEX_IDX: usize = 2;
 

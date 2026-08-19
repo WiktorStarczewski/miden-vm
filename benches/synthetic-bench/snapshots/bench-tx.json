@@ -1,5 +1,6 @@
 {
   "consume single P2ID note": {
+    "provenance": "derived_pending_producer_port",
     "prologue": 3491,
     "notes_processing": 1761,
     "note_execution": {
@@ -13,10 +14,11 @@
     },
     "trace": {
       "core_rows": 77683,
-      "chiplets_rows": 123159,
-      "range_rows": 20179,
+      "chiplets_rows": 6537,
+      "blakeg_compression_rows": 120384,
+      "byte_pair_lookup_rows": 65536,
       "chiplets_shape": {
-        "hasher_rows": 120384,
+        "hasher_rows": 3762,
         "bitwise_rows": 416,
         "memory_rows": 2294,
         "kernel_rom_rows": 64,
@@ -25,6 +27,7 @@
     }
   },
   "consume two P2ID notes": {
+    "provenance": "derived_pending_producer_port",
     "prologue": 4527,
     "notes_processing": 3600,
     "note_execution": {
@@ -39,10 +42,11 @@
     },
     "trace": {
       "core_rows": 80506,
-      "chiplets_rows": 141290,
-      "range_rows": 20129,
+      "chiplets_rows": 7370,
+      "blakeg_compression_rows": 138240,
+      "byte_pair_lookup_rows": 65536,
       "chiplets_shape": {
-        "hasher_rows": 138240,
+        "hasher_rows": 4320,
         "bitwise_rows": 592,
         "memory_rows": 2389,
         "kernel_rom_rows": 68,
@@ -51,6 +55,7 @@
     }
   },
   "create single P2ID note": {
+    "provenance": "derived_pending_producer_port",
     "prologue": 1756,
     "notes_processing": 32,
     "note_execution": {},
@@ -62,10 +67,11 @@
     },
     "trace": {
       "core_rows": 76728,
-      "chiplets_rows": 118595,
-      "range_rows": 20011,
+      "chiplets_rows": 6251,
+      "blakeg_compression_rows": 115968,
+      "byte_pair_lookup_rows": 65536,
       "chiplets_shape": {
-        "hasher_rows": 115968,
+        "hasher_rows": 3624,
         "bitwise_rows": 328,
         "memory_rows": 2235,
         "kernel_rom_rows": 63,
@@ -74,6 +80,7 @@
     }
   },
   "consume CLAIM note (L1 to Miden)": {
+    "provenance": "derived_pending_producer_port",
     "prologue": 2887,
     "notes_processing": 28554,
     "note_execution": {
@@ -87,10 +94,11 @@
     },
     "trace": {
       "core_rows": 35617,
-      "chiplets_rows": 147222,
-      "range_rows": 2407,
+      "chiplets_rows": 10388,
+      "blakeg_compression_rows": 141248,
+      "byte_pair_lookup_rows": 65536,
       "chiplets_shape": {
-        "hasher_rows": 141248,
+        "hasher_rows": 4414,
         "bitwise_rows": 2624,
         "memory_rows": 3277,
         "kernel_rom_rows": 72,
@@ -99,6 +107,7 @@
     }
   },
   "consume CLAIM note (L2 to Miden)": {
+    "provenance": "derived_pending_producer_port",
     "prologue": 2887,
     "notes_processing": 40804,
     "note_execution": {
@@ -112,10 +121,11 @@
     },
     "trace": {
       "core_rows": 47867,
-      "chiplets_rows": 189924,
-      "range_rows": 2649,
+      "chiplets_rows": 13162,
+      "blakeg_compression_rows": 182464,
+      "byte_pair_lookup_rows": 65536,
       "chiplets_shape": {
-        "hasher_rows": 182464,
+        "hasher_rows": 5702,
         "bitwise_rows": 2880,
         "memory_rows": 4507,
         "kernel_rom_rows": 72,
@@ -124,6 +134,7 @@
     }
   },
   "consume B2AGG note (bridge-out)": {
+    "provenance": "derived_pending_producer_port",
     "prologue": 3708,
     "notes_processing": 145469,
     "note_execution": {
@@ -137,10 +148,11 @@
     },
     "trace": {
       "core_rows": 163016,
-      "chiplets_rows": 911692,
-      "range_rows": 4111,
+      "chiplets_rows": 42886,
+      "blakeg_compression_rows": 896832,
+      "byte_pair_lookup_rows": 65536,
       "chiplets_shape": {
-        "hasher_rows": 896832,
+        "hasher_rows": 28026,
         "bitwise_rows": 2608,
         "memory_rows": 12042,
         "kernel_rom_rows": 209,

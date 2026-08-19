@@ -3,25 +3,26 @@
 //! Decoder-side requests into the hasher, bitwise, memory, ACE init, and kernel ROM chiplets.
 //!
 //! Every interaction is folded into a single [`super::super::LookupColumn::group`] call.
-//! The cached-encoding optimization can be reintroduced later if symbolic expression growth
-//! becomes a bottleneck.
+//! The emitter uses ordinary lookup batches; cached encoding is unnecessary for this column today.
 
 use core::array;
 
-use miden_core::{
-    FMP_ADDR, FMP_INIT_VALUE, deferred::DEFERRED_ROOT_DOMAIN, field::PrimeCharacteristicRing,
-    operations::opcodes,
-};
+use miden_core::{FMP_ADDR, FMP_INIT_VALUE, field::PrimeCharacteristicRing, operations::opcodes};
 
 use crate::{
     constraints::lookup::{
         main_air::{MainBusContext, MainLookupBuilder},
-        messages::{AceInitMsg, BitwiseMsg, HasherMsg, KernelRomMsg, MemoryMsg},
+        messages::{
+            AceInitMsg, AeadBlakeGInputMsg, AeadStreamRequestMsg, BitwiseMsg, HasherMsg,
+            KernelRomMsg, MemoryMsg,
+        },
     },
     lookup::{Deg, LookupBatch, LookupColumn, LookupGroup},
     trace::{
-        chiplets::hasher::{CAPACITY_LEN, CONTROLLER_ROWS_PER_PERMUTATION, RATE_LEN, STATE_WIDTH},
-        log_deferred::{HELPER_ADDR_IDX, HELPER_STATE_PREV_RANGE, STACK_STMNT_RANGE},
+        chiplets::hasher::{CAPACITY_LEN, CONTROLLER_ROWS_PER_HASHER_OP, RATE_LEN},
+        log_deferred::{
+            HELPER_ADDR_IDX, HELPER_STATE_PREV_RANGE, STACK_STATE_NEW_RANGE, STACK_STMNT_RANGE,
+        },
     },
 };
 
@@ -51,6 +52,7 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
     let addr = dec.addr;
     let addr_next = next.decoder.addr;
     let h = dec.hasher_state;
+    let group_count = dec.group_count;
     let helper0 = user_helpers[0];
     let clk = local.system.clk;
     let sys_ctx = local.system.ctx;
@@ -60,11 +62,10 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
     let stk_next_0 = stk_next.get(0);
     let log_addr = user_helpers[HELPER_ADDR_IDX];
 
-    // Hasher return addresses are controller-row addresses. The final row of a permutation is
-    // `addr + CONTROLLER_ROWS_PER_PERMUTATION - 1`; each following permutation advances by
-    // `CONTROLLER_ROWS_PER_PERMUTATION`.
-    let last_off: LB::Expr = LB::Expr::from_u16((CONTROLLER_ROWS_PER_PERMUTATION - 1) as u16);
-    let cycle_len: LB::Expr = LB::Expr::from_u16(CONTROLLER_ROWS_PER_PERMUTATION as u16);
+    // Constants reused across BCOMPRESS / MPVERIFY / MRUPDATE / END / LOGPRECOMPILE.
+    // Strides are measured in controller-trace rows.
+    let last_off: LB::Expr = LB::Expr::from_u16((CONTROLLER_ROWS_PER_HASHER_OP - 1) as u16);
+    let cycle_len: LB::Expr = LB::Expr::from_u16(CONTROLLER_ROWS_PER_HASHER_OP as u16);
 
     // Shared (ctx, addr, clk) triple for MLOAD / MSTORE / MLOADW / MSTOREW: all read from
     // `s0` with the current system context and clock.
@@ -79,7 +80,7 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
                 |g| {
                     // --- Control-block removes (JOIN / SPLIT / LOOP / SPAN; CALL / SYSCALL
                     // share the payload but live in batches below). SPAN encodes opcode 0
-                    // at the β¹² slot.
+                    // at the beta^12 slot.
                     let mut control_remove = |name, flag, opcode: u8| {
                         g.remove(
                             name,
@@ -95,7 +96,16 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
                     control_remove("join", op_flags.join(), opcodes::JOIN);
                     control_remove("split", op_flags.split(), opcodes::SPLIT);
                     control_remove("loop", op_flags.loop_op(), opcodes::LOOP);
-                    control_remove("span", op_flags.span(), 0);
+                    g.remove(
+                        "span",
+                        op_flags.span(),
+                        move || {
+                            let parent = addr_next.into();
+                            let h = h.map(LB::Expr::from);
+                            HasherMsg::basic_block_init(parent, &h, group_count.into())
+                        },
+                        Deg { v: 5, u: 6 },
+                    );
 
                     // CALL: control-block remove + FMP write under a fresh header (ctx_next /
                     // FMP_ADDR / clk).
@@ -240,25 +250,25 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
                         );
                     }
 
-                    // --- HPERM ---
+                    // --- BCOMPRESS ---
                     {
                         let last_off = last_off.clone();
                         g.batch(
-                            "hperm",
-                            op_flags.hperm(),
+                            "bcompress",
+                            op_flags.bcompress(),
                             move |b| {
                                 let helper0: LB::Expr = helper0.into();
                                 let stk_state = array::from_fn(|i| stk.get(i).into());
-                                let stk_next_state = array::from_fn(|i| stk_next.get(i).into());
+                                let cv_next = array::from_fn(|i| stk_next.get(8 + i).into());
                                 b.remove(
-                                    "hperm_init",
+                                    "bcompress_init",
                                     HasherMsg::linear_hash_init(helper0.clone(), stk_state),
                                     Deg { v: 5, u: 6 },
                                 );
                                 let return_addr = helper0 + last_off;
                                 b.remove(
-                                    "hperm_return",
-                                    HasherMsg::return_state(return_addr, stk_next_state),
+                                    "bcompress_return",
+                                    HasherMsg::return_hash(return_addr, cv_next),
                                     Deg { v: 5, u: 6 },
                                 );
                             },
@@ -450,61 +460,48 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
                         Deg { v: 6, u: 7 }, // (V, U) = (1 + 5, 2 + 5)
                     );
 
-                    // --- CRYPTOSTREAM ---
-                    // Two word reads (plaintext from src_ptr, src_ptr + 4) followed by two word
-                    // writes (ciphertext to dst_ptr, dst_ptr + 4). The rate lives on
-                    // `local.stack[0..8]`, and the ciphertext on `next.stack[0..8]`; the
-                    // plaintext is recovered algebraically as `cipher - rate`.
-                    let src_ptr = stk.get(12);
-                    let dst_ptr = stk.get(13);
+                    // --- AEAD STREAM ---
+                    let src_ptr = stk.get(5);
+                    let dst_ptr = stk.get(6);
                     g.batch(
-                        "cryptostream",
+                        "aead_stream",
                         op_flags.cryptostream(),
                         move |b| {
-                            let src0: LB::Expr = src_ptr.into();
-                            let src1: LB::Expr = src0.clone() + LB::Expr::from_u16(4);
-                            let dst0: LB::Expr = dst_ptr.into();
-                            let dst1: LB::Expr = dst0.clone() + LB::Expr::from_u16(4);
-                            let rate: [LB::Expr; 8] = array::from_fn(|i| stk.get(i).into());
-                            let cipher: [LB::Expr; 8] = array::from_fn(|i| stk_next.get(i).into());
-                            let plain: [LB::Expr; 8] =
-                                array::from_fn(|i| cipher[i].clone() - rate[i].clone());
-                            let plain_word0: [LB::Expr; 4] = array::from_fn(|i| plain[i].clone());
-                            let plain_word1: [LB::Expr; 4] =
-                                array::from_fn(|i| plain[4 + i].clone());
-                            let cipher_word0: [LB::Expr; 4] = array::from_fn(|i| cipher[i].clone());
-                            let cipher_word1: [LB::Expr; 4] =
-                                array::from_fn(|i| cipher[4 + i].clone());
-                            b.remove(
-                                "cryptostream_read0",
-                                MemoryMsg::read_word(sys_ctx.into(), src0, clk.into(), plain_word0),
+                            let state = array::from_fn(|i| {
+                                if i == 0 {
+                                    stk.get(4).into()
+                                } else if i < 8 {
+                                    LB::Expr::ZERO
+                                } else {
+                                    stk.get(i - 8).into()
+                                }
+                            });
+                            b.insert(
+                                "aead_blakeg_input",
+                                LB::Expr::ONE,
+                                AeadBlakeGInputMsg { clk: clk.into(), state },
                                 Deg { v: 4, u: 5 },
                             );
-                            b.remove(
-                                "cryptostream_read1",
-                                MemoryMsg::read_word(sys_ctx.into(), src1, clk.into(), plain_word1),
-                                Deg { v: 4, u: 5 },
-                            );
-                            b.remove(
-                                "cryptostream_write0",
-                                MemoryMsg::write_word(
-                                    sys_ctx.into(),
-                                    dst0,
-                                    clk.into(),
-                                    cipher_word0,
-                                ),
-                                Deg { v: 4, u: 5 },
-                            );
-                            b.remove(
-                                "cryptostream_write1",
-                                MemoryMsg::write_word(
-                                    sys_ctx.into(),
-                                    dst1,
-                                    clk.into(),
-                                    cipher_word1,
-                                ),
-                                Deg { v: 4, u: 5 },
-                            );
+                            for (name, src_offset, dst_offset, lane_base) in
+                                [("aead_stream_low", 0, 0, 0), ("aead_stream_high", 4, 8, 8)]
+                            {
+                                // The stream side emits the same request from both 4-row halves
+                                // of one 8-row entry, so Core supplies multiplicity -2.
+                                b.insert(
+                                    name,
+                                    -LB::Expr::from_u16(2),
+                                    AeadStreamRequestMsg {
+                                        ctx: sys_ctx.into(),
+                                        clk: clk.into(),
+                                        src_ptr: Into::<LB::Expr>::into(src_ptr)
+                                            + LB::Expr::from_u16(src_offset),
+                                        dst_ptr: Into::<LB::Expr>::into(dst_ptr)
+                                            + LB::Expr::from_u16(dst_offset),
+                                        lane_base: LB::Expr::from_u16(lane_base),
+                                    },
+                                    Deg { v: 4, u: 5 },
+                                );
+                            }
                         },
                         Deg { v: 7, u: 8 }, // (V, U) = (3 + 4, 4 + 4)
                     );
@@ -569,26 +566,26 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
 
                     // --- LOGDEFERRED ---
                     //
-                    // Hasher input: `[STATE_PREV (helpers), STMNT (stack[4..8]), domain]`.
-                    // STMNT lives at stack[4..8] (rate1 lanes) so the bus's β⁶..β⁹ products
-                    // share with HPERM's rate1 reads. Output is identity-mapped onto
-                    // `stack_next[0..12]`, matching HPERM exactly.
+                    // Hasher input: `[STATE_PREV (helpers), STMNT (stack[4..8]), CV]`.
+                    // The response returns only the new transcript state.
                     g.batch(
                         "logdeferred",
                         op_flags.log_deferred(),
                         move |b| {
                             let log_addr: LB::Expr = log_addr.into();
-                            let logpre_in: [LB::Expr; STATE_WIDTH] = array::from_fn(|i| {
-                                if i < CAPACITY_LEN {
+                            let logpre_cv = miden_core::deferred::DEFERRED_ROOT_DOMAIN;
+                            let logpre_in: [LB::Expr; 12] = array::from_fn(|i| {
+                                if i < 4 {
                                     user_helpers[HELPER_STATE_PREV_RANGE.start + i].into()
                                 } else if i < RATE_LEN {
                                     stk.get(STACK_STMNT_RANGE.start + (i - CAPACITY_LEN)).into()
                                 } else {
-                                    LB::Expr::from(DEFERRED_ROOT_DOMAIN[i - 8])
+                                    LB::Expr::from(logpre_cv[i - 8])
                                 }
                             });
-                            let logpre_out: [LB::Expr; STATE_WIDTH] =
-                                array::from_fn(|i| stk_next.get(i).into());
+                            let state_new: [LB::Expr; 4] = array::from_fn(|i| {
+                                stk_next.get(STACK_STATE_NEW_RANGE.start + i).into()
+                            });
                             b.remove(
                                 "logdeferred_init",
                                 HasherMsg::linear_hash_init(log_addr.clone(), logpre_in),
@@ -597,7 +594,7 @@ pub(in crate::constraints::lookup) fn emit_chiplet_requests<LB>(
                             let return_addr = log_addr + last_off;
                             b.remove(
                                 "logdeferred_return",
-                                HasherMsg::return_state(return_addr, logpre_out),
+                                HasherMsg::return_hash(return_addr, state_new),
                                 Deg { v: 5, u: 6 },
                             );
                         },

@@ -1,19 +1,16 @@
 //! Behavioral oracle for the PVM out-of-domain row hook.
 
 use miden_core::{
-    Felt,
+    Felt, Word,
     advice::AdviceStack,
+    crypto::hash::Eidos,
     field::{BasedVectorSpace, QuadFelt},
 };
-use miden_crypto::{
-    hash::poseidon2::Poseidon2Permutation256,
-    stark::challenger::{CanObserve, DuplexChallenger},
-};
 
+use super::pvm_layout_const;
 use crate::helpers::read_memory_felt;
 
-const OOD_ROW_FELTS: usize = 1_536;
-const OOD_PTR: u32 = 3_225_426_432;
+const OOD_ROW_FELTS: usize = 1_920;
 const ALPHA_PTR: u32 = 1_000;
 const RESULT_PTR: u32 = 2_000;
 
@@ -23,6 +20,7 @@ const INITIAL_ACC: [u64; 2] = [7, 9];
 
 fn source() -> String {
     let s = INITIAL_SPONGE;
+    let ood_ptr = pvm_layout_const("PREPROCESSED_CURRENT_PTR");
     format!(
         r#"
         use miden::core::sys::pvm::ood_frames
@@ -57,7 +55,7 @@ fn source() -> String {
         result_ptr_plus_15 = RESULT_PTR + 15,
         acc0 = INITIAL_ACC[0],
         acc1 = INITIAL_ACC[1],
-        ood_ptr = OOD_PTR,
+        ood_ptr = ood_ptr,
         r0_0 = s[0],
         r0_1 = s[1],
         r0_2 = s[2],
@@ -82,6 +80,7 @@ fn row() -> Vec<Felt> {
 #[test]
 fn pvm_ood_hook_matches_memory_horner_and_transcript_oracles() {
     let row = row();
+    let ood_ptr = pvm_layout_const("PREPROCESSED_CURRENT_PTR");
     let mut advice = AdviceStack::new();
     advice.append_for_adv_pipe(&row);
 
@@ -91,14 +90,14 @@ fn pvm_ood_hook_matches_memory_horner_and_transcript_oracles() {
 
     for (i, expected) in row.iter().enumerate() {
         assert_eq!(
-            read_memory_felt(&output, OOD_PTR + i as u32),
+            read_memory_felt(&output, ood_ptr + i as u32),
             *expected,
             "OOD felt {i} was not stored in wire order"
         );
     }
     assert_eq!(
         read_memory_felt(&output, RESULT_PTR + 12),
-        Felt::from_u32(OOD_PTR + OOD_ROW_FELTS as u32),
+        Felt::from_u32(ood_ptr + OOD_ROW_FELTS as u32),
         "OOD pointer did not advance by exactly one row"
     );
 
@@ -113,17 +112,16 @@ fn pvm_ood_hook_matches_memory_horner_and_transcript_oracles() {
     assert_eq!(read_memory_felt(&output, RESULT_PTR + 14), expected_acc[0]);
     assert_eq!(read_memory_felt(&output, RESULT_PTR + 15), expected_acc[1]);
 
-    let mut challenger =
-        DuplexChallenger::<Felt, Poseidon2Permutation256, 12, 8>::new(Poseidon2Permutation256);
-    challenger.sponge_state = INITIAL_SPONGE.map(Felt::new_unchecked);
-    for block in row.chunks_exact(8) {
-        challenger.observe_slice(block);
-    }
-    for (i, expected) in challenger.sponge_state.iter().enumerate() {
+    let initial_cv_limbs: [u64; 4] = INITIAL_SPONGE[8..].try_into().expect("four-felt CV");
+    let initial_cv = Word::new(initial_cv_limbs.map(Felt::new_unchecked));
+    let expected_cv = row.chunks_exact(8).fold(initial_cv, |cv, block| {
+        Eidos::compress_block(cv, block.try_into().expect("eight-felt OOD block"))
+    });
+    for (i, expected) in expected_cv.iter().enumerate() {
         assert_eq!(
-            read_memory_felt(&output, RESULT_PTR + i as u32),
+            read_memory_felt(&output, RESULT_PTR + 8 + i as u32),
             *expected,
-            "transcript state differs at index {i}"
+            "Eidos transcript CV differs at index {i}"
         );
     }
 }

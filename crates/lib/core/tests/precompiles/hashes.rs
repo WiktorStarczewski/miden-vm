@@ -1,5 +1,6 @@
-use miden_core::{Felt, utils::bytes_to_packed_u32_elements};
+use miden_core::{Felt, deferred::Node, utils::bytes_to_packed_u32_elements};
 use miden_crypto::hash::keccak::Keccak256;
+use miden_precompiles::{Keccak256Precompile, UintDomain, UintPrecompile};
 use miden_processor::ExecutionError;
 
 use super::helpers::{
@@ -11,6 +12,99 @@ const IN_PTR: u32 = 128;
 const OUT_PTR: u32 = 256;
 const DIGEST_FELTS: usize = 8;
 const BYTES_PER_FELT: usize = 4;
+
+#[test]
+fn deferred_chunks_digest_matches_host() {
+    let chunk = core::array::from_fn(|i| Felt::from_u32((i + 1) as u32));
+    let stores = masm_store_felts(&chunk, IN_PTR);
+    let source = format!(
+        r#"
+        begin
+            {stores}
+            push.{IN_PTR}
+            exec.::miden::precompiles::register_chunks_mem_1
+            swapw dropw
+        end
+        "#,
+    );
+
+    let output = run_precompile_program(&source).expect("CHUNKS registration must execute");
+    let expected = Node::chunks(vec![chunk]).expect("non-empty CHUNKS node").digest();
+    assert_eq!(read_stack_felts(&output, 4), expected.as_elements());
+}
+
+#[test]
+fn deferred_expression_digest_matches_host() {
+    let input: Vec<u8> = (0u8..32).collect();
+    let input_chunk: [Felt; 8] = bytes_to_packed_u32_elements(&input).try_into().unwrap();
+    let output_chunk: [Felt; 8] = bytes_to_packed_u32_elements(Keccak256::hash(&input).as_ref())
+        .try_into()
+        .unwrap();
+    let stores = format!(
+        "{}\n{}",
+        masm_store_felts(&input_chunk, IN_PTR),
+        masm_store_felts(&output_chunk, OUT_PTR),
+    );
+    let tag = Keccak256Precompile::assert_tag(input.len() as u32).as_word();
+    let tag = tag
+        .iter()
+        .rev()
+        .map(Felt::as_canonical_u64)
+        .map(|felt| felt.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    let source = format!(
+        r#"
+        begin
+            {stores}
+            push.{IN_PTR}
+            exec.::miden::precompiles::register_chunks_mem_1
+            push.{OUT_PTR}
+            exec.::miden::precompiles::register_chunks_mem_1
+            swapw
+            push.{tag}
+            exec.::miden::precompiles::register_expr
+            swapw dropw
+        end
+        "#,
+    );
+
+    let output = run_precompile_program(&source).expect("expression registration must execute");
+    let input_digest = Node::chunks(vec![input_chunk]).unwrap().digest();
+    let output_digest = Node::chunks(vec![output_chunk]).unwrap().digest();
+    let expected =
+        Keccak256Precompile::assert_node(input.len() as u32, input_digest, output_digest).digest();
+    assert_eq!(read_stack_felts(&output, 4), expected.as_elements());
+}
+
+#[test]
+fn deferred_memory_value_digest_matches_host() {
+    let limbs = core::array::from_fn(|i| (i + 1) as u32);
+    let chunk = limbs.map(Felt::from_u32);
+    let stores = masm_store_felts(&chunk, IN_PTR);
+    let tag = UintPrecompile::value_tag(UintDomain::U256).as_word();
+    let tag = tag
+        .iter()
+        .rev()
+        .map(Felt::as_canonical_u64)
+        .map(|felt| felt.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    let source = format!(
+        r#"
+        begin
+            {stores}
+            push.1 push.{IN_PTR} push.{tag}
+            exec.::miden::precompiles::register_mem
+            swapw dropw
+        end
+        "#,
+    );
+
+    let output = run_precompile_program(&source).expect("memory registration must execute");
+    let expected = UintPrecompile::value_node(UintDomain::U256, limbs).digest();
+    assert_eq!(read_stack_felts(&output, 4), expected.as_elements());
+}
 
 #[test]
 fn keccak_hash_1_chunk_mem_writes_expected_digest() {
@@ -114,17 +208,17 @@ fn hash_precompile_cycle_baselines() {
         (
             "keccak_hash_1_chunk_mem",
             cycle_hash_mem_source("keccak256", "hash_1_chunk_mem", &input),
-            153,
+            289,
         ),
         (
             "keccak_hash_2_chunks_mem",
             cycle_hash_mem_source("keccak256", "hash_2_chunks_mem", &bytes64),
-            153,
+            295,
         ),
         (
             "keccak_hash_bytes_mem_short",
             cycle_hash_mem_source("keccak256", "hash_bytes_mem", short),
-            200,
+            292,
         ),
     ] {
         let output =

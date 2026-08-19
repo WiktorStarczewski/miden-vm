@@ -365,13 +365,12 @@ fn advice_insert_hdword() {
         adv.insert_hdword_d
 
         # manually compute the hash of the two words with domain
-        # Set up state for hperm: [W0, W1, CAP] where CAP = [0, domain, 0, 0]
-        # (domain goes in state[9], not state[8])
-        push.0 push.0 movup.10 push.0 movdnw.2
-        # => [W0, W1, [0, domain, 0, 0], ...]
-        hperm
-        # Extract hash from R0 (state[0..4]) after permutation
-        swapw.2 dropw dropw
+        # Eidos init chaining word for domain 9 and 8 input felts.
+        movup.8 drop
+        push.6620516959492505608.1947077364412317705.2688637133034287986.4280581858871862887
+        movdnw.2
+        bcompress
+        dropw dropw
         # => [KEY, ...]
 
         # load the advice stack with values from the advice map and drop the key
@@ -398,27 +397,14 @@ fn advice_insert_hqword() {
         # hash and insert top four words into the advice map
         adv.insert_hqword
 
-        # manually compute the hash of the four words
-        # hash_elements([A || B || C || D]) absorbs in two rounds:
-        # Round 1: absorb A, B with zero capacity
-        # Round 2: absorb C, D with capacity from round 1
-
-        # First absorption: [A, B, cap=0]
-        # Stack: [A, B, C, D, ...]
-        padw movdnw.2
-
-        hperm
-        # => [RATE1', RATE2', CAP', C, D, ...]
-
-        # Second absorption: use CAP' as new capacity, absorb C, D
-        dropw dropw
-        # => [CAP', C, D, ...]
+        # Hash the four words with Eidos length binding for 16 input felts.
+        push.6620516959492505616.1947077364412317696.2688637133034287986.4280581858871862887
         movdnw.2
-        hperm
-        # => [RATE1'', RATE2'', CAP'', ...]
-
-        # Extract hash
-        swapw.2 dropw dropw
+        bcompress
+        dropw dropw
+        movdnw.2
+        bcompress
+        dropw dropw
         # => [KEY]
 
         # load the advice stack with values from the advice map and drop the key

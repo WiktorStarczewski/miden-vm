@@ -107,9 +107,8 @@ impl KernelDescriptor {
     /// This is the fixed-size identifier observed by the recursive verifier in place of the raw
     /// digest list. The encoding is normative:
     /// - element order is this descriptor's canonical procedure order (fixed at construction);
-    /// - the Sponge2 padding rule (<https://eprint.iacr.org/2024/911>) places `len % rate` in the
-    ///   first capacity element, preventing ambiguity between a partial block and its zero-padded
-    ///   form.
+    /// - Eidos initializes its chaining word from the registered domain and exact logical length,
+    ///   preventing ambiguity between a partial block and its zero-padded form.
     pub fn commitment(&self) -> Word {
         hasher::hash_elements_in_domain(Word::words_as_elements(&self.0), KERNEL_DOMAIN_TAG)
     }
@@ -168,10 +167,10 @@ mod tests {
     fn empty_kernel_commitment_matches_known_vector() {
         let expected = Word::from(
             [
-                10_678_183_036_892_554_090,
-                6_699_253_321_301_458_898,
-                8_322_157_849_099_770_532,
-                10_578_726_887_207_403_211,
+                6_685_482_250_859_961_072,
+                9_124_140_948_469_026_179,
+                3_119_678_820_162_010_749,
+                1_020_592_981_988_439_317,
             ]
             .map(Felt::new_unchecked),
         );

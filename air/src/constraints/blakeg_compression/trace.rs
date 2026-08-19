@@ -237,6 +237,38 @@ where
     write_trace_rows(rows, block, h, compression_cycle_id, mode, recorder)
 }
 
+/// Reassigns the physical cycle ID of an already-written field-valued BlakeG block.
+///
+/// This is intended for padding blocks: callers may construct the identical zero-state
+/// compression once, copy it, and then give every physical copy its canonical cycle identity
+/// without recomputing the BlakeG rounds or byte lookups.
+///
+/// # Panics
+///
+/// Panics if `rows` contains fewer than 32 rows or the packed cycle/pair key would not be a
+/// canonical field element.
+pub fn retag_felt_trace_block_cycle_id(rows: &mut [BlakeGFeltRow], compression_cycle_id: u64) {
+    assert!(rows.len() >= BLOCK_PERIOD, "32-row BlakeG retag needs at least one full block");
+    validate_compression_cycle_id(compression_cycle_id);
+    let cycle_id = Felt::new_unchecked(compression_cycle_id);
+
+    for row in &mut rows[..FUSED_G_ROWS] {
+        for g in 0..NUM_G {
+            row[g_msg_slot_col(g, 2)] = cycle_id;
+        }
+    }
+
+    for footer in 0..FOOTER_ROWS {
+        let row = &mut rows[FOOTER_START + footer];
+        row[F_HIN_SLOT_BASE_COL] =
+            Felt::new_unchecked(compression_cycle_pair_index(compression_cycle_id, footer));
+        for word_slot in 0..F_MSG_WORD_SLOTS {
+            row[footer_msg_word_slot_col(word_slot, 2)] = cycle_id;
+        }
+        row[F_COMPRESSION_CYCLE_ID_COL] = cycle_id;
+    }
+}
+
 fn write_trace_rows<T, R>(
     rows: &mut [T],
     block: [u32; 16],
@@ -251,6 +283,7 @@ where
 {
     debug_assert!(rows.len() >= BLOCK_PERIOD);
     validate_trace_metadata(compression_cycle_id, mode);
+    validate_packed_inputs(&block, &h);
     write_trace_rows_from_state(
         rows,
         block,
@@ -260,6 +293,15 @@ where
         mode,
         recorder,
     )
+}
+
+fn validate_packed_inputs(block: &[u32; 16], h: &[u32; 8]) {
+    for pair in block.as_slice().chunks_exact(2).chain(h.as_slice().chunks_exact(2)) {
+        assert!(
+            pair[1] != u32::MAX || pair[0] == 0,
+            "packed BlakeG input must be a canonical field element",
+        );
+    }
 }
 
 fn write_trace_rows_from_state<T, R>(
@@ -286,11 +328,7 @@ where
 }
 
 fn validate_trace_metadata(compression_cycle_id: u64, mode: TraceMode) {
-    let max_cycle_id = (Felt::ORDER_U64 - FOOTER_ROWS as u64) / FOOTER_ROWS as u64;
-    assert!(
-        compression_cycle_id <= max_cycle_id,
-        "BlakeG compression-cycle pair key must be a canonical field element",
-    );
+    validate_compression_cycle_id(compression_cycle_id);
 
     let metadata = match mode {
         TraceMode::Compression => None,
@@ -300,6 +338,14 @@ fn validate_trace_metadata(compression_cycle_id: u64, mode: TraceMode) {
     assert!(
         metadata.is_none_or(|value| value < Felt::ORDER_U64),
         "BlakeG trace metadata must be a canonical field element",
+    );
+}
+
+fn validate_compression_cycle_id(compression_cycle_id: u64) {
+    let max_cycle_id = (Felt::ORDER_U64 - FOOTER_ROWS as u64) / FOOTER_ROWS as u64;
+    assert!(
+        compression_cycle_id <= max_cycle_id,
+        "BlakeG compression-cycle pair key must be a canonical field element",
     );
 }
 

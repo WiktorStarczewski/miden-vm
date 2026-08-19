@@ -3,7 +3,7 @@
 //!
 //! The narrow, central hasher + binder for the transcript DAG. Each
 //! active row evaluates one node: it hashes the node's preimage on
-//! Poseidon2 and settles the node's `Binding`-bus tuple. The eval chip
+//! Eidos and settles the node's `Binding`-bus tuple. The eval chip
 //! is the sole provider of the `Binding` bus, except the Keccak-node
 //! band of `ChunkNodeSpongeAir`, which fuses its own terminal keccak
 //! `True` (there is no transient Keccak — see the design notes). Domain
@@ -13,7 +13,7 @@
 //!
 //! Node kinds are dispatched by a uniform one-hot `is_and + is_zero +
 //! is_uint_leaf + Σ op-flags = act`: the **Transcript AND-combinator**
-//! `h = Poseidon2(lhs || rhs || Tag::AND)[0..4]` folding two child
+//! `h = Eidos(lhs || rhs || Tag::AND)[0..4]` folding two child
 //! `True` bindings; the **uint leaf / pin-claim row**, which hashes a stored uint's
 //! value under either `[UintPrecompile::id(), VALUE_OP_ID, bound_ptr, 0]`
 //! or `[UINT_PIN_CLAIM_TAG, bound_ptr, pin_ptr, 0]`; and the **uint ops**
@@ -87,8 +87,8 @@ use crate::{
     relations::{MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
     transcript::{
         binding::{BindingMsg, ValueTag},
+        eidos::{EidosInMsg, EidosOutMsg},
         nodes::UintOpId,
-        poseidon2::{Poseidon2InMsg, Poseidon2OutMsg},
     },
     uint::{UintValMsg, add::UintAddMsg, mul::UintMulMsg},
     utils::{current_main, next_main},
@@ -99,7 +99,7 @@ use crate::{
 //
 // 42 main witness columns:
 //
-// - Structural (2): act, perm_seq_id.
+// - Structural (2): act, absorption_id.
 // - Hashes (12): lhs[4], rhs[4], h[4].
 // - Node-family and op flags.
 // - Reused pointer/context cells for uint leaves/ops, EC points, and MSM runs.
@@ -108,14 +108,14 @@ use crate::{
 /// Sticky-downward activity flag. Gates the consume / unhash mults; the
 /// `out_mult`-pin keeps padding-row provides at zero.
 pub const COL_ACT: usize = 0;
-/// Foreign key into the Poseidon2 chiplet's cycle namespace for this
+/// Foreign key into the Eidos chiplet's cycle namespace for this
 /// node's unhash perm. Unused on ZERO_HASH-leaf rows (no perm).
-pub const COL_PERM_SEQ_ID: usize = 1;
+pub const COL_ABSORPTION_ID: usize = 1;
 
 /// First felt of the left child hash. Bus-pinned by the
 /// `Binding(lhs, True)` consume and fed as `rate0` of the unhash perm.
 pub const COL_LHS_BEGIN: usize = 2;
-/// Number of field elements in each Poseidon2 digest / transcript node hash.
+/// Number of field elements in each Eidos digest / transcript node hash.
 pub const DIGEST_WIDTH: usize = 4;
 pub const COL_LHS_END: usize = COL_LHS_BEGIN + DIGEST_WIDTH;
 
@@ -124,7 +124,7 @@ pub const COL_LHS_END: usize = COL_LHS_BEGIN + DIGEST_WIDTH;
 pub const COL_RHS_BEGIN: usize = COL_LHS_END;
 pub const COL_RHS_END: usize = COL_RHS_BEGIN + DIGEST_WIDTH;
 
-/// First felt of this node's hash. Bus-pinned by `Poseidon2Out` on
+/// First felt of this node's hash. Bus-pinned by `EidosOut` on
 /// internal / root rows; pinned to `0` on ZERO_HASH leaves; pinned to
 /// `public_root` on the first (root) row.
 pub const COL_H_BEGIN: usize = COL_RHS_END;
@@ -269,9 +269,9 @@ pub const COL_EC_CREATE_Y_PTR: usize = COL_B_PTR;
 // EcMsm node (tag 8) — the chip's only *multi-row* node: a run of
 // `is_ec_msm` absorb rows (one per claim term), the last marked
 // `is_msm_last` (the boundary). Reuses lhs/rhs = (Pᵢ.hash, sᵢ.hash),
-// h = this term's Poseidon2 rate0 output, a_ptr/b_ptr = (Pᵢ_ptr, sᵢ_ptr),
+// h = this term's Eidos rate0 output, a_ptr/b_ptr = (Pᵢ_ptr, sᵢ_ptr),
 // ptr = val_ptr (the claim's value point), group_ptr = the group, bound_ptr =
-// the scalar bound. The run is one contiguous VM-style Poseidon2 absorption span
+// the scalar bound. The run is one contiguous VM-style Eidos absorption span
 // (the design notes): see [`COL_MSM_IS_HEAD`].
 // ================================================================
 
@@ -298,7 +298,7 @@ pub const COL_MSM_IDX: usize = COL_IS_MSM_LAST + 1;
 /// value to — see the run-constancy constraints below.
 pub const COL_MSM_EXPR: usize = COL_MSM_IDX + 1;
 /// Head selector for an EcMsm absorption run. The head row consumes the VM
-/// curve MSM IV; continuation rows inherit capacity inside Poseidon2.
+/// curve MSM IV; continuation rows inherit capacity inside Eidos.
 pub const COL_MSM_IS_HEAD: usize = COL_MSM_EXPR + 1;
 
 /// Total number of main witness columns.
@@ -329,8 +329,8 @@ pub const NUM_PUBLIC_VALUES: usize = PUBLIC_ROOT_END;
 //
 // - col 0:  Binding bus, True path — `consume-lhs`, alone (the gated running-sum anchor).
 // - col 1:  `consume-rhs` + `provide-h` (the True-binding provide, heavy — a degree-2 message).
-// - col 2:  unhash Poseidon2 perm — `p2in-rate0` + `p2in-rate1`.
-// - col 3:  unhash Poseidon2 perm — `p2in-cap` + `p2out`.
+// - col 2:  unhash Eidos perm — `p2in-rate0` + `p2in-rate1`.
+// - col 3:  unhash Eidos perm — `p2in-cap` + `p2out`.
 // - col 4:  Binding bus, value path — `consume-uint`, alone (one full-value `UintVal` message).
 // - col 5:  `provide-binding`, alone (heavy — a transient-scaled degree-2 message).
 // - col 6:  Binding bus, op-children path — `consume-lhs-uint` + `consume-rhs-uint`.
@@ -340,7 +340,7 @@ pub const NUM_PUBLIC_VALUES: usize = PUBLIC_ROOT_END;
 // - col 10: `provide-group`, alone (heavy).
 // - col 11: `consume-ecpoint`, alone (no partner left to pair).
 // - col 12: `consume-ecgroupadd`, alone (heavy — a role-mixed degree-2 message).
-// - col 13: the EcMsm head Poseidon2 cap fraction, alone (sole fraction in its pool).
+// - col 13: the EcMsm head Eidos cap fraction, alone (sole fraction in its pool).
 // - col 14: EcMsm absorb — `consume-base-group` + `consume-scalar-uint`.
 // - col 15: EcMsm absorb — `consume-msmclaimterm` + `consume-msmexpr`.
 pub const NUM_AUX_COLS: usize = 16;
@@ -537,7 +537,7 @@ impl LiftedAir<Felt, QuadFelt> for TranscriptEvalAir {
             (not_uint_leaf - is_uint_op.clone() - is_ec_create.clone() - is_ec_msm.clone())
                 * bound_ptr.clone(),
         );
-        // Materialize tag arg[1] without a deg-2 Poseidon2 cap component:
+        // Materialize tag arg[1] without a deg-2 Eidos cap component:
         // VM uint value rows use `bound_ptr`, explicit pin rows use `ptr`, and
         // EcCreate / PAI rows use this physical cell as the VALUE tag's `group_ptr`.
         // On create rows the `EcPoint` consume reads the same cell, tying the
@@ -590,7 +590,7 @@ impl LiftedAir<Felt, QuadFelt> for TranscriptEvalAir {
         );
 
         // ---- EcMsm absorption run: head consumes IV cap, continuations are
-        //      private Poseidon2 `is_absorb` cycles, tail consumes `OutRate0`.
+        //      private Eidos `is_absorb` cycles, tail consumes `OutRate0`.
         let is_ec_msm_next: AB::Expr = next[COL_IS_EC_MSM].into();
         let is_msm_head: AB::Expr = local[COL_MSM_IS_HEAD].into();
         let is_msm_head_next: AB::Expr = next[COL_MSM_IS_HEAD].into();
@@ -612,11 +612,11 @@ impl LiftedAir<Felt, QuadFelt> for TranscriptEvalAir {
             .when_transition()
             .assert_zero(starts.clone() * (is_msm_head_next - AB::Expr::ONE));
 
-        let perm_seq_id_local_for_msm: AB::Expr = local[COL_PERM_SEQ_ID].into();
-        let perm_seq_id_next_for_msm: AB::Expr = next[COL_PERM_SEQ_ID].into();
+        let absorption_id_local_for_msm: AB::Expr = local[COL_ABSORPTION_ID].into();
+        let absorption_id_next_for_msm: AB::Expr = next[COL_ABSORPTION_ID].into();
         builder.when_transition().assert_zero(
             continues.clone()
-                * (perm_seq_id_next_for_msm - perm_seq_id_local_for_msm - AB::Expr::ONE),
+                * (absorption_id_next_for_msm - absorption_id_local_for_msm - AB::Expr::ONE),
         );
 
         // `msm_idx` is a pure **position counter** within an absorb run (0 at
@@ -695,7 +695,7 @@ where
         let is_sub: LB::Expr = local[COL_IS_SUB].into();
         let is_mul: LB::Expr = local[COL_IS_MUL].into();
         let is_is: LB::Expr = local[COL_IS_IS].into();
-        let perm_seq_id: LB::Expr = local[COL_PERM_SEQ_ID].into();
+        let absorption_id: LB::Expr = local[COL_ABSORPTION_ID].into();
         let out_mult: LB::Expr = local[COL_OUT_MULT].into();
         let ptr: LB::Expr = local[COL_PTR].into();
         let bound_ptr: LB::Expr = local[COL_BOUND_PTR].into();
@@ -803,36 +803,46 @@ where
             ("provide-h", and_provide, BindingMsg::truth(h.clone()), two_deg),
         );
 
-        // col 2 (paired, lqd-1): unhash Poseidon2 perm — rate0 + rate1,
+        // col 2 (paired, lqd-1): unhash Eidos perm — rate0 + rate1,
         // shared by every hashing kind.
         frac_col!(
             builder,
-            "unhash-p2",
+            "unhash-eidos",
             pair_deg,
             (
                 "p2in-rate0",
                 node.clone(),
-                Poseidon2InMsg::rate0(perm_seq_id.clone(), lhs.clone()),
+                EidosInMsg::rate0(absorption_id.clone(), lhs.clone()),
                 one_deg
             ),
             (
                 "p2in-rate1",
                 node.clone(),
-                Poseidon2InMsg::rate1(perm_seq_id.clone(), rhs.clone()),
+                EidosInMsg::rate1(absorption_id.clone(), rhs.clone()),
                 one_deg
             ),
         );
-        // col 3 (paired, lqd-1): unhash Poseidon2 perm — the cap (forks on
+        // col 3 (paired, lqd-1): unhash Eidos perm — the cap (forks on
         // the tag) + the perm output.
         frac_col!(
             builder,
-            "unhash-p2",
+            "unhash-eidos",
             pair_deg,
-            ("p2in-cap", static_node, Poseidon2InMsg::cap(perm_seq_id.clone(), cap), one_deg),
+            (
+                "p2in-cap",
+                static_node,
+                EidosInMsg {
+                    absorption_id: absorption_id.clone(),
+                    // Generic tagged nodes use cap kind 2; AND uses kind 3.
+                    tag: LB::Expr::from(Felt::from_u8(2)) + LB::Expr::from(local[COL_IS_AND]),
+                    c: cap,
+                },
+                one_deg
+            ),
             (
                 "p2out",
                 node.clone() - is_ec_msm.clone() + local[COL_IS_MSM_LAST].into(),
-                Poseidon2OutMsg { perm_seq_id, digest: h.clone() },
+                EidosOutMsg { absorption_id, digest: h.clone() },
                 one_deg
             ),
         );
@@ -1070,10 +1080,10 @@ where
             ),
         );
 
-        // col 13: EcMsm head Poseidon2 cap, alone (sole fraction in its
-        // pool). Continuation capacity is private to the P2 chiplet's
+        // col 13: EcMsm head Eidos cap, alone (sole fraction in its
+        // pool). Continuation capacity is private to the Eidos chiplet's
         // absorption chain.
-        let d_perm_seq_id: LB::Expr = local[COL_PERM_SEQ_ID].into();
+        let d_absorption_id: LB::Expr = local[COL_ABSORPTION_ID].into();
         let d_is_msm_head: LB::Expr = local[COL_MSM_IS_HEAD].into();
         let d_msm_iv = [
             LB::Expr::from(CurvePrecompile::id()),
@@ -1088,7 +1098,7 @@ where
             (
                 "p2in-cap-msm-head",
                 d_is_msm_head,
-                Poseidon2InMsg::cap(d_perm_seq_id, d_msm_iv),
+                EidosInMsg::cap_node(d_absorption_id, d_msm_iv),
                 one_deg
             ),
         );

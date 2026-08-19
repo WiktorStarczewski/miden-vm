@@ -10,9 +10,9 @@
 //! before proving or verifying.
 
 pub use miden_air::config::{
-    Blake3Config, KeccakConfig, Poseidon2Config, RelationDigest, RpoConfig, RpxConfig,
-    blake3_256_config, keccak_config, observe_protocol_params, poseidon2_config, rpo_config,
-    rpx_config,
+    Blake3Config, EidosConfig, KeccakConfig, Poseidon2Config, RelationDigest, RpoConfig, RpxConfig,
+    blake3_256_config, eidos_config, keccak_config, observe_protocol_params, poseidon2_config,
+    rpo_config, rpx_config,
 };
 use miden_core::Felt;
 use miden_crypto::{
@@ -54,7 +54,7 @@ pub const PRECOMPILE_RELATION_DIGEST: RelationDigest = {
 /// Default hash function for compatibility APIs such as
 /// [`SessionTraces::prove`](crate::session::SessionTraces::prove).
 pub const DEFAULT_HASH_FUNCTION: miden_core::proof::HashFunction =
-    miden_core::proof::HashFunction::Poseidon2;
+    miden_core::proof::HashFunction::Eidos;
 
 // PRECOMPILE PCS PARAMETERS
 // ================================================================================================

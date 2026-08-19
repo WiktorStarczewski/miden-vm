@@ -12,9 +12,9 @@ use super::{RecursionCase, config::ProofComposition, recursive_host};
 
 pub(super) struct TraceShape {
     core_rows: usize,
-    range_rows: usize,
+    byte_pair_lookup_rows: usize,
     chiplets_rows: usize,
-    poseidon2_permutation_rows: usize,
+    blakeg_compression_rows: usize,
     hash_chiplet_rows: usize,
     bitwise_rows: usize,
     memory_rows: usize,
@@ -40,20 +40,30 @@ struct ProveSummary {
 }
 
 pub(super) fn trace_shape_summary_for(summary: &TraceLenSummary) -> TraceShape {
-    let chiplets = summary.chiplets_trace_len();
+    let chiplets = summary.chiplets();
+    let max_trace_rows = summary
+        .core_rows()
+        .max(summary.chiplets_rows())
+        .max(summary.blakeg_compression_rows())
+        .max(summary.byte_pair_lookup_rows());
+    let max_padded_rows = summary
+        .core_height()
+        .max(summary.chiplets_height())
+        .max(summary.blakeg_compression_height())
+        .max(summary.byte_pair_lookup_rows());
 
     TraceShape {
-        core_rows: summary.core_trace_len(),
-        range_rows: summary.range_trace_len(),
-        chiplets_rows: chiplets.trace_len(),
-        poseidon2_permutation_rows: summary.poseidon2_permutation_trace_len(),
+        core_rows: summary.core_rows(),
+        byte_pair_lookup_rows: summary.byte_pair_lookup_rows(),
+        chiplets_rows: summary.chiplets_rows(),
+        blakeg_compression_rows: summary.blakeg_compression_rows(),
         hash_chiplet_rows: chiplets.hash_chiplet_len(),
         bitwise_rows: chiplets.bitwise_chiplet_len(),
         memory_rows: chiplets.memory_chiplet_len(),
         ace_rows: chiplets.ace_chiplet_len(),
         kernel_rows: chiplets.kernel_rom_len(),
-        max_trace_rows: summary.trace_len(),
-        max_padded_rows: summary.padded_trace_len(),
+        max_trace_rows,
+        max_padded_rows,
     }
 }
 
@@ -237,12 +247,12 @@ pub(super) fn print_case_shape(case: &RecursionCase) -> CaseTraceShape {
     let trace = trace_shape_summary(case);
 
     println!(
-        "    {} core={} range={} chiplets={} poseidon2_perm={} hash_ctrl={} max_trace={} max_padded={}",
+        "    {} core={} and8={} chiplets={} blakeg={} hash_ctrl={} max_trace={} max_padded={}",
         case.composition.label(),
         trace.core_rows,
-        trace.range_rows,
+        trace.byte_pair_lookup_rows,
         trace.chiplets_rows,
-        trace.poseidon2_permutation_rows,
+        trace.blakeg_compression_rows,
         trace.hash_chiplet_rows,
         trace.max_trace_rows,
         trace.max_padded_rows,
@@ -257,20 +267,22 @@ pub(super) fn print_bench_shape(record: &str, shape: &TraceShape) {
     println!(
         concat!(
             "{} ",
-            "core_rows={} range_rows={} chiplets_rows={} poseidon2_permutation_rows={} ",
+            "core_rows={} byte_pair_lookup_rows={} chiplets_rows={} blakeg_compression_rows={} ",
             "hash_chiplet_rows={} bitwise_rows={} memory_rows={} ace_rows={} kernel_rows={} ",
-            "native_hash_rows=0 and8_lookup_rows=0 max_trace_rows={} max_padded_rows={}"
+            "native_hash_rows={} and8_lookup_rows={} max_trace_rows={} max_padded_rows={}"
         ),
         record,
         shape.core_rows,
-        shape.range_rows,
+        shape.byte_pair_lookup_rows,
         shape.chiplets_rows,
-        shape.poseidon2_permutation_rows,
+        shape.blakeg_compression_rows,
         shape.hash_chiplet_rows,
         shape.bitwise_rows,
         shape.memory_rows,
         shape.ace_rows,
         shape.kernel_rows,
+        shape.blakeg_compression_rows,
+        shape.byte_pair_lookup_rows,
         shape.max_trace_rows,
         shape.max_padded_rows,
     );
@@ -279,7 +291,7 @@ pub(super) fn print_bench_shape(record: &str, shape: &TraceShape) {
 pub(super) fn print_trace_shape_summary(shapes: &[CaseTraceShape]) {
     println!("\n=== recursive trace summary");
     println!(
-        "| MVM proofs | PVM proofs | core | range | chiplets | poseidon2_perm | hash | bitwise | memory | ace | kernel | max_trace | padded |"
+        "| MVM proofs | PVM proofs | core | and8 | chiplets | BlakeG | hash | bitwise | memory | ace | kernel | max_trace | padded |"
     );
     println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for case in shapes {
@@ -289,9 +301,9 @@ pub(super) fn print_trace_shape_summary(shapes: &[CaseTraceShape]) {
             case.composition.mvm_count(),
             case.composition.pvm_count(),
             shape.core_rows,
-            shape.range_rows,
+            shape.byte_pair_lookup_rows,
             shape.chiplets_rows,
-            shape.poseidon2_permutation_rows,
+            shape.blakeg_compression_rows,
             shape.hash_chiplet_rows,
             shape.bitwise_rows,
             shape.memory_rows,

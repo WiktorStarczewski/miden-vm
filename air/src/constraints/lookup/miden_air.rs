@@ -37,13 +37,13 @@ pub(crate) fn emit_core_boundary<B: BoundaryBuilder>(boundary: &mut B) {
     // Block-hash seed: +1 / encode(BLOCK_HASH_TABLE, [ph, 0, 0, 0]).
     //
     // The boundary correction emits a `Child` payload while the in-trace removal at the
-    // root END row (in `block_hash_and_op_group.rs`) emits an `End` payload — the two
+    // root END row (in `block_hash_and_op_group.rs`) emits an `End` payload. The two
     // collapse to the same denominator by the algebra below, so a single `Child` here
     // cancels the root END's `-1/d`:
     //
     //   - At the root END row, the next op is HALT, so the decoder forces `addr_next = 0`, hence
     //     `parent = addr_next = 0`.
-    //   - `halt_next() = 1` ⇒ `is_first_child = 1 - end_next - repeat_next - halt_next = 0`.
+    //   - `halt_next() = 1`, so `is_first_child = 1 - end_next - repeat_next - halt_next = 0`.
     //   - The root block is not a loop body, so `is_loop_body = 0`.
     //   - `child_hash = h_0 = program_hash` by the decoder's program-hash boundary.
     //
@@ -92,8 +92,10 @@ mod tests {
     };
 
     use crate::{
-        ChipletsAir, Felt, MidenAir, NUM_PUBLIC_VALUES,
+        BlakeGCompressionAir, ChipletsAir, Felt, MidenAir, NUM_BLAKEG_COMPRESSION_COLS,
+        NUM_PUBLIC_VALUES,
         constraints::{
+            blakeg_compression::lookup::BLAKEG_LOOKUP_COLUMN_SHAPE,
             columns::{NUM_CHIPLETS_COLS, NUM_CORE_COLS},
             lookup::{
                 BusId, MIDEN_MAX_MESSAGE_WIDTH, chiplet_air::CHIPLET_COLUMN_SHAPE,
@@ -139,8 +141,8 @@ mod tests {
         };
 
         // In-trace side: the root END row's removal, with the four conditions documented in
-        // `emit_core_boundary` (addr_next=0 via HALT; halt_next=1 ⇒ is_first_child=0; root
-        // not a loop ⇒ is_loop_body=0; child_hash = h_0 = program_hash).
+        // `emit_core_boundary` (addr_next=0 via HALT; halt_next=1 so is_first_child=0; root
+        // not a loop so is_loop_body=0; child_hash = h_0 = program_hash).
         let root_end = BlockHashMsg::End {
             parent: Felt::ZERO,
             child_hash: program_hash,
@@ -159,6 +161,7 @@ mod tests {
     #[test]
     fn core_air_lookup_validates() {
         let layout = ValidateLayout {
+            preprocessed_width: 0,
             trace_width: NUM_CORE_COLS,
             num_public_values: NUM_PUBLIC_VALUES,
             num_periodic_columns: 0,
@@ -175,6 +178,7 @@ mod tests {
     fn chiplets_air_lookup_validates() {
         let num_periodic = ChipletsAir.periodic_columns().len();
         let layout = ValidateLayout {
+            preprocessed_width: 0,
             trace_width: NUM_CHIPLETS_COLS,
             num_public_values: NUM_PUBLIC_VALUES,
             num_periodic_columns: num_periodic,
@@ -184,6 +188,40 @@ mod tests {
         };
         ValidateLookupAir::validate(&MidenAir::Chiplets, layout)
             .unwrap_or_else(|err| panic!("ChipletsAir LookupAir validation failed: {err}"));
+    }
+
+    #[test]
+    fn blakeg_compression_air_lookup_validates() {
+        let num_periodic = BlakeGCompressionAir.periodic_columns().len();
+        let layout = ValidateLayout {
+            preprocessed_width: 0,
+            trace_width: NUM_BLAKEG_COMPRESSION_COLS,
+            num_public_values: NUM_PUBLIC_VALUES,
+            num_periodic_columns: num_periodic,
+            permutation_width: BLAKEG_LOOKUP_COLUMN_SHAPE.len(),
+            num_permutation_challenges: AUX_TRACE_RAND_CHALLENGES,
+            num_permutation_values: 1,
+        };
+        ValidateLookupAir::validate(&MidenAir::BLAKEG_COMPRESSION, layout).unwrap_or_else(|err| {
+            panic!("BlakeGCompressionAir LookupAir validation failed: {err}")
+        });
+    }
+
+    #[test]
+    fn and8_lookup_air_lookup_validates() {
+        let layout = ValidateLayout {
+            preprocessed_width:
+                crate::constraints::and8_lookup::columns::NUM_AND8_LOOKUP_PREPROCESSED_COLS,
+            trace_width: crate::constraints::and8_lookup::columns::NUM_AND8_LOOKUP_COLS,
+            num_public_values: NUM_PUBLIC_VALUES,
+            num_periodic_columns: 0,
+            permutation_width:
+                crate::constraints::lookup::and8_lookup_air::AND8_LOOKUP_COLUMN_SHAPE.len(),
+            num_permutation_challenges: AUX_TRACE_RAND_CHALLENGES,
+            num_permutation_values: 1,
+        };
+        ValidateLookupAir::validate(&MidenAir::AND8_LOOKUP, layout)
+            .unwrap_or_else(|err| panic!("And8LookupAir LookupAir validation failed: {err}"));
     }
 
     /// Smoke test: the trace-balance checker runs to completion on a tiny zero-valued
