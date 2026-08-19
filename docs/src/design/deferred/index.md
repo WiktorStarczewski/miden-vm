@@ -51,7 +51,7 @@ proofs, completion, and verification.
 
 ## The model
 
-A **node** is a `(tag, payload)` pair, addressed by its 4-felt Poseidon2 **digest**. Identical
+A **node** is a `(tag, payload)` pair, addressed by its 4-felt Eidos **digest**. Identical
 content yields an identical digest, so equal subterms are shared automatically (hash-consing).
 
 - A **tag** is a node's identity and constructor: externally, precompile tags are built with
@@ -77,9 +77,10 @@ content yields an identical digest, so equal subterms are shared automatically (
     constraints are semantic and enforced by the owning precompile. Budget accounting treats each
     pair as one ordinary 8-felt payload block, in addition to the tag word.
 
-The digest binds the tag in the Poseidon2 capacity, so a node's address commits to *both* its
-identity and its body. Every non-empty payload is absorbed as one or more 8-felt blocks under the
-node tag.
+The digest commits to both the node identity and body. Framework AND and CHUNKS nodes use their
+registered Eidos domains. A precompile-owned node absorbs every 8-felt payload chunk under the
+deferred-node domain, then compresses a final `tag || 0w` block so the complete tag is bound without
+restricting it to a small domain selector.
 
 ## Precompiles
 
@@ -137,7 +138,7 @@ memory chunk sequence in a precompile-specific assembly procedure.
 
 | Event (`adv.*`)            | Operand stack in                 | Effect |
 | -------------------------- | -------------------------------- | ------ |
-| `register_deferred`        | `[PAYLOAD_LO, PAYLOAD_HI, TAG, …]` | Decodes `TAG` and registers an operand-stack node, then evaluates it immediately. `TAG` is one 4-felt word. `PAYLOAD_LO || PAYLOAD_HI` is exactly 8 felts: one data chunk, two 4-felt child digests for a join, or one `lhs_digest || rhs_digest` pair for a pair-list node. If the tag arguments define a different required data or pair-list arity, precompile evaluation rejects the node. Structural child digests may reference only already-registered children, except for the implicit `TRUE_DIGEST`. No advice/stack output; code that needs `NODE_DIGEST` computes it inside the VM with one `hperm` over `[PAYLOAD_LO, PAYLOAD_HI, TAG]`. |
+| `register_deferred`        | `[PAYLOAD_LO, PAYLOAD_HI, TAG, …]` | Decodes `TAG` and registers an operand-stack node, then evaluates it immediately. `TAG` is one 4-felt word. `PAYLOAD_LO || PAYLOAD_HI` is exactly 8 felts: one data chunk, two 4-felt child digests for a join, or one `lhs_digest || rhs_digest` pair for a pair-list node. If the tag arguments define a different required data or pair-list arity, precompile evaluation rejects the node. Structural child digests may reference only already-registered children, except for the implicit `TRUE_DIGEST`. No advice/stack output; code that needs `NODE_DIGEST` computes it inside the VM with the registered Eidos node framing (payload compression followed by `TAG || 0w`). |
 | `register_deferred_data`   | `[TAG, ptr, n_chunks, …]`        | Decodes `TAG` and registers a memory-backed node, then evaluates it immediately. For data and pair-list tags, `n_chunks` determines the non-empty payload length; when tag arguments define an exact arity, precompile evaluation checks it. Pair-list chunks are interpreted as `lhs_digest || rhs_digest` pairs. Join tags require `n_chunks == 1` and interpret the single chunk as `lhs_digest || rhs_digest`; `TRUE` is rejected. No advice/stack output; code that needs `NODE_DIGEST` computes it inside the VM from the same `TAG` and ordered chunk sequence. |
 | `evaluate_deferred`        | `[NODE_DIGEST, …]`               | Looks the node up, evaluates it to canonical form, and pushes the canonical tag plus canonical payload felts onto the **advice stack**. The tag is first in advice-pop order; for a single 8-felt payload, `adv_pushw adv_pushw adv_pushw` leaves `[PAYLOAD_LO, PAYLOAD_HI, TAG, …]` on the operand stack. `TRUE` emits only `Tag::TRUE`. |
 | `evaluate_deferred_tag`    | `[NODE_DIGEST, …]`               | Looks the node up, evaluates it to canonical form, and pushes only the canonical tag onto the **advice stack**. `TRUE` emits `Tag::TRUE`. |
@@ -154,8 +155,8 @@ A system event is a host hook. Its stack arguments are visible in the VM executi
 host-side state changes are not constrained by the AIR. In particular, a memory-backed register
 event reads `n_chunks` chunks at `ptr` without adding AIR memory accesses that bind the registered
 contents to those cells. A proof-relevant digest must therefore be derived with VM instructions:
-`hperm` for a stack payload, or `mem_stream` plus `hperm` for the same tag and ordered memory chunk
-sequence.
+`bcompress` for a stack payload, or `mem_stream` plus `bcompress` for the same tag and ordered
+memory chunk sequence, using the registered Eidos length and domain framing.
 
 This composes with the verifier:
 

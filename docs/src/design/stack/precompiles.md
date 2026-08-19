@@ -47,9 +47,10 @@ modules are currently internal implementation detail used by core-library facade
    relate that advice to values established independently of it, then log a statement digest that
    bundled hydration can re-evaluate before precompile proving.
 4. **`log_deferred` folds a statement** – The opcode expects `STMNT` at stack offsets `4..8`.
-   `STMNT` must already be registered in `DeferredState` and evaluate to `TRUE`. The constrained
-   Poseidon2 permutation computes `ROOT_NEW = rate0(Poseidon2([ROOT_PREV, STMNT, Tag::AND]))`, and
-   host-side deferred state records the corresponding `AND` node.
+   `STMNT` must already be registered in `DeferredState` and evaluate to `TRUE`. One constrained
+   BlakeG compression computes
+   `ROOT_NEW = Eidos::compress_block(DEFERRED_ROOT_DOMAIN, ROOT_PREV || STMNT)`, and host-side
+   deferred state records the corresponding `AND` node.
 
 ## Responsibilities
 
@@ -77,9 +78,9 @@ Proving, verification, transport, and resource policy are specified in the
   - `NodeType::Join` reads `lhs_digest || rhs_digest`.
   - `NodeType::PairList` accepts one or more `lhs_digest || rhs_digest` chunks. Precompiles that
     encode a pair count in tag arguments must check the actual payload length during evaluation.
-- `log_deferred` stack effect: `[_, STMNT, _, ...] -> [ROOT_NEW, OUT_RATE1, OUT_CAP, ...]` where
-  `STMNT` occupies stack offsets `4..8`. Wrappers usually drop the three output words after the root
-  transition has been constrained.
+- `log_deferred` stack effect: `[_, STMNT, _, ...] -> [ROOT_NEW, STMNT, _, ...]` where `STMNT`
+  occupies stack offsets `4..8`. Only the top word is replaced; wrappers usually drop all three
+  temporary words after the root transition has been constrained.
 - Input and memory layouts are precompile-specific. Core-library wrappers define the native formats
   for hash facades and for arithmetic/curve support used by signature verification.
 

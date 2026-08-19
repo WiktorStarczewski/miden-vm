@@ -7,6 +7,19 @@
 
 #### Changes
 
+- [BREAKING] Replaced the VM-native Poseidon2 permutation with Eidos, using one 32-row BlakeG
+  compression cycle per native hash-controller row. Native program, MAST, Merkle, advice-map,
+  Falcon, AEAD, deferred, and recursive-verifier digests are not compatible with earlier releases.
+  The optional Poseidon2 STARK proof-hash configuration remains supported.
+- [BREAKING] Replaced `HPERM` with `BCOMPRESS`, re-specified `CRYPTOSTREAM` and `LOG_DEFERRED`
+  for the Eidos-native protocol, renamed `adv.insert_hperm` to `adv.insert_bcompress`, renamed
+  Falcon-Poseidon2 APIs to Falcon-Eidos, and replaced the legacy AEAD library with
+  `aead_blakeg`. MAST serialization is now version 5 so forests containing the former opcode
+  encoding are rejected instead of being reinterpreted.
+- [BREAKING] Changed the Miden proof statement from three AIRs to four: Core, Chiplets, the
+  standalone BlakeG compression AIR, and the fixed And8 lookup AIR. The former range-checker AIR
+  was removed; 16-bit range checks now use the fixed byte-pair table in the And8 AIR. The
+  precompile VM remains a ten-AIR statement and now uses its own 32-row BlakeG compression AIR.
 - [BREAKING] `UniqueNodes` entries are now keyed by tree position, and missing nodes mean canonical empty subtree roots. The `NodeValue` enum was removed ([#3620](https://github.com/0xMiden/miden-vm/pull/3620)).
 - [BREAKING] Hardened and documented Falcon math. `Polynomial::karatsuba` now requires equal, nonempty coefficient vectors with supported recursive lengths. Also fixed field canonicalization and polynomial division edge cases, enforced FFT size limits, and added reference and oracle tests for SamplerZ, FFT, and NTRU ([#3629](https://github.com/0xMiden/miden-vm/pull/3629)).
 - [BREAKING] Hardened Merkle APIs and deserialization against malformed inputs: `SparseMerklePath` validates depth before narrowing and validates both binary and serde input, `MerklePath` and `NodeIndex` validate serde input, `MerklePath` mutable dereferencing now exposes a slice to preserve its length bound, `InOrderIndex` rejects zero during deserialization, the `Forest` root and rightmost in-order index accessors return `Option` with `_unchecked` variants for non-empty callers, and `MerkleStore::get_leaf_depth` handles depth-zero trees without overflowing a shift ([#3635](https://github.com/0xMiden/miden-vm/pull/3635)).
