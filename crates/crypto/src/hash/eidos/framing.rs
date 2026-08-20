@@ -297,8 +297,113 @@ pub(super) fn compress_packed_u64_block(
     block: [[u64; PACKED_LANES]; RATE],
 ) -> [[u64; PACKED_LANES]; DIGEST_WIDTH] {
     let cv = array::from_fn(|word| [FELT_RATE_CV[word]; PACKED_LANES]);
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    let block = avx512_u64_adapter::unpack_block(block);
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
     let block = encode_packed_u64_block(block);
-    pack_cv_to_packed_u64s(BlakeG::compress_packed_native(cv, block))
+
+    let output = BlakeG::compress_packed_native(cv, block);
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    {
+        avx512_u64_adapter::pack_cv(output)
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+    {
+        pack_cv_to_packed_u64s(output)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+mod avx512_u64_adapter {
+    use core::arch::x86_64::*;
+
+    use super::{DIGEST_WIDTH, PACKED_LANES, RATE};
+
+    const LANES: usize = PACKED_LANES;
+    const HALF_LANES: usize = LANES / 2;
+    const _: () = assert!(LANES == 16, "the AVX-512 adapter requires sixteen packed lanes");
+
+    #[inline]
+    pub(super) fn unpack_block(block: [[u64; LANES]; RATE]) -> [[u32; LANES]; 16] {
+        let mut output = [[0u32; LANES]; 16];
+
+        for (element, values) in block.iter().enumerate() {
+            for half in 0..2 {
+                let lane_offset = half * HALF_LANES;
+                // SAFETY: this module is compiled only with AVX-512F enabled. `lane_offset` is
+                // either 0 or 8, so the unaligned eight-u64 load remains within `values`.
+                let packed = unsafe {
+                    _mm512_loadu_si512(values.as_ptr().add(lane_offset).cast::<__m512i>())
+                };
+                // SAFETY: these AVX-512F operations only transform the loaded register. Signed
+                // narrowing is intentional: both conversions retain the low 32 bits.
+                let (lo, hi) = unsafe {
+                    (
+                        _mm512_cvtepi64_epi32(packed),
+                        _mm512_cvtepi64_epi32(_mm512_srli_epi64::<32>(packed)),
+                    )
+                };
+
+                // SAFETY: `lane_offset` is either 0 or 8, so each unaligned eight-u32 store
+                // remains within its sixteen-element output row.
+                unsafe {
+                    _mm256_storeu_si256(
+                        output[2 * element].as_mut_ptr().add(lane_offset).cast::<__m256i>(),
+                        lo,
+                    );
+                    _mm256_storeu_si256(
+                        output[2 * element + 1].as_mut_ptr().add(lane_offset).cast::<__m256i>(),
+                        hi,
+                    );
+                }
+            }
+        }
+
+        output
+    }
+
+    #[inline]
+    pub(super) fn pack_cv(cv: [[u32; LANES]; 8]) -> [[u64; LANES]; DIGEST_WIDTH] {
+        let mut output = [[0u64; LANES]; DIGEST_WIDTH];
+        // SAFETY: this module is compiled only with AVX-512F enabled.
+        let high_mask = unsafe { _mm512_set1_epi64(0x7fff_ffff) };
+
+        for word in 0..DIGEST_WIDTH {
+            for half in 0..2 {
+                let lane_offset = half * HALF_LANES;
+                // SAFETY: `lane_offset` is either 0 or 8, so both unaligned eight-u32 loads
+                // remain within their sixteen-element CV rows.
+                let lo32 = unsafe {
+                    _mm256_loadu_si256(cv[2 * word].as_ptr().add(lane_offset).cast::<__m256i>())
+                };
+                let hi32 = unsafe {
+                    _mm256_loadu_si256(cv[2 * word + 1].as_ptr().add(lane_offset).cast::<__m256i>())
+                };
+                // SAFETY: these AVX-512F operations only transform registers. The high word is
+                // masked to preserve the canonical 63-bit field-element encoding.
+                let packed = unsafe {
+                    let lo64 = _mm512_cvtepu32_epi64(lo32);
+                    let hi64 = _mm512_and_si512(_mm512_cvtepu32_epi64(hi32), high_mask);
+                    _mm512_or_si512(lo64, _mm512_slli_epi64::<32>(hi64))
+                };
+
+                // SAFETY: `lane_offset` is either 0 or 8, so the unaligned eight-u64 store
+                // remains within its sixteen-element output row.
+                unsafe {
+                    _mm512_storeu_si512(
+                        output[word].as_mut_ptr().add(lane_offset).cast::<__m512i>(),
+                        packed,
+                    );
+                }
+            }
+        }
+
+        output
+    }
 }
 
 /// Compress one full felt-mode block under a packed Eidos chaining word.
@@ -923,6 +1028,77 @@ mod tests {
             let packed_lane: [u64; DIGEST_WIDTH] = array::from_fn(|word| packed[word][lane]);
             assert_eq!(packed_lane, scalar);
         }
+    }
+
+    #[test]
+    fn packed_u64_block_compression_matches_scalar_lanes_for_mixed_bits() {
+        for batch in 0..32 {
+            let block = mixed_packed_u64_block(batch);
+            let packed = compress_packed_u64_block(block);
+
+            for lane in 0..PACKED_LANES {
+                let scalar_block = array::from_fn(|element| block[element][lane]);
+                let scalar = compress_u64_block(scalar_block);
+                let packed_lane = array::from_fn(|word| packed[word][lane]);
+                assert_eq!(packed_lane, scalar, "packed lane {lane} diverged in batch {batch}");
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    #[test]
+    fn avx512_u64_adapter_matches_generic_layout() {
+        for batch in 0..32 {
+            let block = mixed_packed_u64_block(batch);
+            assert_eq!(
+                avx512_u64_adapter::unpack_block(block),
+                encode_packed_u64_block(block),
+                "AVX-512 input adapter diverged in batch {batch}",
+            );
+
+            let cv =
+                array::from_fn(|word| array::from_fn(|lane| mixed_u64(batch, word, lane) as u32));
+            assert_eq!(
+                avx512_u64_adapter::pack_cv(cv),
+                pack_cv_to_packed_u64s(cv),
+                "AVX-512 output adapter diverged in batch {batch}",
+            );
+        }
+    }
+
+    fn mixed_packed_u64_block(batch: usize) -> [[u64; PACKED_LANES]; RATE] {
+        const BOUNDARIES: [u64; 8] = [
+            0,
+            1,
+            u32::MAX as u64,
+            1u64 << 32,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            0xffff_ffff_0000_0001,
+            u64::MAX,
+        ];
+
+        array::from_fn(|element| {
+            array::from_fn(|lane| {
+                if batch == 0 {
+                    BOUNDARIES[(element * PACKED_LANES + lane) % BOUNDARIES.len()]
+                } else {
+                    mixed_u64(batch, element, lane)
+                }
+            })
+        })
+    }
+
+    fn mixed_u64(batch: usize, element: usize, lane: usize) -> u64 {
+        let mut value = (batch as u64)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add((element as u64) << 32)
+            .wrapping_add(lane as u64);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
     }
 
     #[test]
