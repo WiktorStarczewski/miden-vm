@@ -298,7 +298,13 @@ impl Package {
             .collect::<Vec<_>>();
         // The digest must not depend on the order in which the sections were attached, so the
         // sections go into the preimage in a canonical order. The on-disk order does not change.
-        semantic_sections.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        // The data breaks a tie on the ID: a malformed package can carry two sections with the
+        // same ID, and the digest of such a package must still not depend on the attach order.
+        semantic_sections.sort_by(|a, b| {
+            a.id.as_str()
+                .cmp(b.id.as_str())
+                .then_with(|| a.data.as_ref().cmp(b.data.as_ref()))
+        });
         target.write_usize(semantic_sections.len());
         for section in semantic_sections {
             section.write_into(target);
@@ -1198,8 +1204,9 @@ impl Package {
     ///
     /// # Errors
     /// Returns an error when the package contains more than one `event_handlers` section, when
-    /// the section payload fails to decode (including size-cap violations), or when bytes
-    /// follow the encoded section.
+    /// the section payload fails to decode (including size-cap violations), when bytes follow
+    /// the encoded section, or when the decoded section fails
+    /// [`EventHandlerSection::validate`].
     pub fn event_handlers(&self) -> Result<Option<EventHandlerSection>, EventHandlerSectionError> {
         let mut sections =
             self.sections.iter().filter(|section| section.id == SectionId::EVENT_HANDLERS);
@@ -1216,6 +1223,7 @@ impl Package {
         if reader.has_more_bytes() {
             return Err(EventHandlerSectionError::TrailingBytes);
         }
+        decoded.validate()?;
         Ok(Some(decoded))
     }
 
@@ -1225,8 +1233,8 @@ impl Package {
     /// [`Self::content_digest`], and the manifest order inside the section is canonical.
     ///
     /// # Errors
-    /// Returns an error when the package already has an `event_handlers` section, or when a
-    /// field of the section goes over its size cap.
+    /// Returns an error when the package already has an `event_handlers` section, or when the
+    /// section fails [`EventHandlerSection::validate`].
     pub fn with_event_handlers(
         mut self,
         section: &EventHandlerSection,
@@ -1234,33 +1242,7 @@ impl Package {
         if self.sections.iter().any(|existing| existing.id == SectionId::EVENT_HANDLERS) {
             return Err(EventHandlerSectionError::AlreadyPresent);
         }
-        if section.module.len() > MAX_MODULE_BYTES {
-            return Err(EventHandlerSectionError::OverSizeCap {
-                field: "module",
-                actual: section.module.len(),
-                max: MAX_MODULE_BYTES,
-            });
-        }
-        if section.handlers.len() > MAX_HANDLERS {
-            return Err(EventHandlerSectionError::OverSizeCap {
-                field: "handler count",
-                actual: section.handlers.len(),
-                max: MAX_HANDLERS,
-            });
-        }
-        for entry in &section.handlers {
-            for (field, name) in
-                [("event name", entry.event.as_str()), ("export name", entry.export.as_str())]
-            {
-                if name.len() > MAX_NAME_BYTES {
-                    return Err(EventHandlerSectionError::OverSizeCap {
-                        field,
-                        actual: name.len(),
-                        max: MAX_NAME_BYTES,
-                    });
-                }
-            }
-        }
+        section.validate()?;
         self.sections.push(Section::new(SectionId::EVENT_HANDLERS, section.to_bytes()));
         Ok(self)
     }
@@ -1821,6 +1803,93 @@ mod tests {
             build_kernel_package("kernel").with_event_handlers(&section),
             Err(EventHandlerSectionError::OverSizeCap { field: "handler count", .. })
         ));
+    }
+
+    #[test]
+    fn invalid_event_handler_section_is_rejected_on_attach() {
+        use miden_core::events::EventName;
+
+        let with_handlers = |handlers| {
+            let mut section = sample_event_handlers();
+            section.handlers = handlers;
+            build_kernel_package("kernel").with_event_handlers(&section)
+        };
+
+        // An empty export name names no export.
+        assert!(matches!(
+            with_handlers(vec![EventHandlerManifestEntry::new(
+                EventName::new("test::wasm::handler"),
+                "",
+            )]),
+            Err(EventHandlerSectionError::EmptyName { field: "export name" })
+        ));
+
+        // An empty event name names no event.
+        assert!(matches!(
+            with_handlers(vec![EventHandlerManifestEntry::new(
+                EventName::from_string(String::new()),
+                "handler",
+            )]),
+            Err(EventHandlerSectionError::EmptyName { field: "event name" })
+        ));
+
+        // Two handlers for one event cannot both register.
+        assert!(matches!(
+            with_handlers(vec![
+                EventHandlerManifestEntry::new(EventName::new("test::wasm::handler"), "a"),
+                EventHandlerManifestEntry::new(EventName::new("test::wasm::handler"), "b"),
+            ]),
+            Err(EventHandlerSectionError::DuplicateEvent { .. })
+        ));
+
+        // The reserved namespace belongs to the VM.
+        assert!(matches!(
+            with_handlers(vec![EventHandlerManifestEntry::new(
+                EventName::new("sys::handler"),
+                "handler",
+            )]),
+            Err(EventHandlerSectionError::ReservedEventName { .. })
+        ));
+
+        // Version 0 names no ABI contract.
+        let mut section = sample_event_handlers();
+        section.abi_version = 0;
+        assert!(matches!(
+            build_kernel_package("kernel").with_event_handlers(&section),
+            Err(EventHandlerSectionError::UnsupportedAbiVersion { version: 0 })
+        ));
+    }
+
+    #[test]
+    fn invalid_event_handler_section_is_rejected_on_access() {
+        // A section can reach a package without the attach path, for example over the wire.
+        let mut section = sample_event_handlers();
+        section.abi_version = 0;
+        let mut package = build_kernel_package("kernel");
+        package
+            .sections
+            .push(Section::new(SectionId::EVENT_HANDLERS, section.to_bytes()));
+
+        assert!(matches!(
+            package.event_handlers(),
+            Err(EventHandlerSectionError::UnsupportedAbiVersion { version: 0 })
+        ));
+    }
+
+    #[test]
+    fn content_digest_does_not_depend_on_the_order_of_same_id_sections() {
+        let first = Section::new(SectionId::ACCOUNT_COMPONENT_METADATA, vec![1, 2, 3]);
+        let second = Section::new(SectionId::ACCOUNT_COMPONENT_METADATA, vec![4, 5, 6]);
+
+        let mut first_package = build_kernel_package("kernel");
+        first_package.sections.push(first.clone());
+        first_package.sections.push(second.clone());
+
+        let mut second_package = build_kernel_package("kernel");
+        second_package.sections.push(second);
+        second_package.sections.push(first);
+
+        assert_eq!(first_package.content_digest(), second_package.content_digest());
     }
 
     fn build_debug_package(name: &str, kind: TargetType, export: &str, context: &str) -> Package {
