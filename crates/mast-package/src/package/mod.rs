@@ -33,7 +33,7 @@ use miden_core::{
     crypto::hash::Poseidon2,
     mast::{MastForest, MastNode, MastNodeExt, MastNodeId},
     program::KernelDescriptor,
-    serde::{ByteReader, ByteWriter, Deserializable, Serializable, SliceReader},
+    serde::{BudgetedReader, ByteReader, ByteWriter, Deserializable, Serializable, SliceReader},
 };
 
 pub use self::{
@@ -288,7 +288,7 @@ impl Package {
     fn write_content_digest_sections<W: ByteWriter>(&self, target: &mut W) {
         // Event-handler code decides the advice a program receives, so the section is semantic
         // content: two packages that differ only in handler code must not share an identity.
-        let semantic_sections = self
+        let mut semantic_sections = self
             .sections
             .iter()
             .filter(|section| {
@@ -296,6 +296,9 @@ impl Package {
                     || section.id == SectionId::EVENT_HANDLERS
             })
             .collect::<Vec<_>>();
+        // The digest must not depend on the order in which the sections were attached, so the
+        // sections go into the preimage in a canonical order. The on-disk order does not change.
+        semantic_sections.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         target.write_usize(semantic_sections.len());
         for section in semantic_sections {
             section.write_into(target);
@@ -1194,8 +1197,9 @@ impl Package {
     /// Returns `Ok(None)` when the package has no `event_handlers` section.
     ///
     /// # Errors
-    /// Returns an error when the package contains more than one `event_handlers` section, or
-    /// when the section payload fails to decode (including size-cap violations).
+    /// Returns an error when the package contains more than one `event_handlers` section, when
+    /// the section payload fails to decode (including size-cap violations), or when bytes
+    /// follow the encoded section.
     pub fn event_handlers(&self) -> Result<Option<EventHandlerSection>, EventHandlerSectionError> {
         let mut sections =
             self.sections.iter().filter(|section| section.id == SectionId::EVENT_HANDLERS);
@@ -1205,7 +1209,13 @@ impl Package {
         if sections.next().is_some() {
             return Err(EventHandlerSectionError::DuplicateSection);
         }
-        let decoded = EventHandlerSection::read_from_bytes(section.data.as_ref())?;
+        // The section is untrusted input, so the reader gets a budget of the payload size.
+        let bytes = section.data.as_ref();
+        let mut reader = BudgetedReader::new(SliceReader::new(bytes), bytes.len());
+        let decoded = EventHandlerSection::read_from(&mut reader)?;
+        if reader.has_more_bytes() {
+            return Err(EventHandlerSectionError::TrailingBytes);
+        }
         Ok(Some(decoded))
     }
 
@@ -1746,6 +1756,32 @@ mod tests {
         // The identity is stable across serialization roundtrips.
         let decoded = Package::read_from_bytes(&with_handlers.to_bytes()).unwrap();
         assert_eq!(with_digest, decoded.content_digest());
+    }
+
+    #[test]
+    fn content_digest_does_not_depend_on_the_semantic_section_order() {
+        let metadata = Section::new(SectionId::ACCOUNT_COMPONENT_METADATA, vec![7, 8, 9]);
+        let handlers = Section::new(SectionId::EVENT_HANDLERS, sample_event_handlers().to_bytes());
+
+        let mut metadata_first = build_kernel_package("kernel");
+        metadata_first.sections.push(metadata.clone());
+        metadata_first.sections.push(handlers.clone());
+
+        let mut handlers_first = build_kernel_package("kernel");
+        handlers_first.sections.push(handlers);
+        handlers_first.sections.push(metadata);
+
+        assert_eq!(metadata_first.content_digest(), handlers_first.content_digest());
+    }
+
+    #[test]
+    fn event_handler_section_with_trailing_bytes_is_rejected() {
+        let mut package = build_kernel_package("kernel");
+        let mut data = sample_event_handlers().to_bytes();
+        data.extend_from_slice(&[0xde, 0xad]);
+        package.sections.push(Section::new(SectionId::EVENT_HANDLERS, data));
+
+        assert!(matches!(package.event_handlers(), Err(EventHandlerSectionError::TrailingBytes)));
     }
 
     #[test]
