@@ -3,9 +3,10 @@ use core::ops::Range;
 
 use miden_air::trace::{
     blakeg_compression::{
-        BLAKEG_COMPRESSION_CYCLE_LEN, F_C_BASE_COL, F_COMPRESSION_MULTIPLICITY_COL, F_D_BASE_COL,
-        F_R_BASE_COL, FOOTER_START, NUM_BLAKEG_COMPRESSION_COLS,
-        TraceMode as BlakeGCompressionTraceMode,
+        BLAKEG_COMPRESSION_CYCLE_LEN, F_COMPRESSION_MULTIPLICITY_COL, F_HIGH_EVEN_SLOT_BASE,
+        F_HIGH_ODD_SLOT_BASE, FOOTER_START, NUM_BLAKEG_COMPRESSION_COLS,
+        TraceMode as BlakeGCompressionTraceMode, footer_interface_tail_col, footer_msg_word_col,
+        footer_r_col, footer_xor_slot_col,
         generate_felt_trace_block as generate_blakeg_felt_trace_block,
         write_felt_trace_block as write_blakeg_felt_trace_block,
     },
@@ -692,25 +693,46 @@ fn compression_multiplicity(trace: &[Vec<Felt>], start_row: usize) -> Felt {
 }
 
 fn compression_input_state(trace: &[Vec<Felt>], start_row: usize) -> HasherState {
-    let row = start_row + FOOTER_START + 3;
+    let footer3 = start_row + FOOTER_START + 3;
     core::array::from_fn(|i| {
-        if i < RATE_LEN {
-            trace[F_R_BASE_COL + i][row]
+        if i < 6 {
+            trace[footer_r_col(3, i)][footer3]
+        } else if i < RATE_LEN {
+            let pair = i - 6;
+            let lo = trace[footer_msg_word_col(2 * pair)][footer3];
+            let hi = trace[footer_msg_word_col(2 * pair + 1)][footer3];
+            lo + Felt::new_unchecked(1 << 32) * hi
         } else {
-            trace[F_C_BASE_COL + i - RATE_LEN][row]
+            let footer = i - RATE_LEN;
+            footer_cv_pair(trace, start_row + FOOTER_START + footer)
         }
     })
 }
 
 fn compression_output_state(trace: &[Vec<Felt>], start_row: usize) -> HasherState {
-    let row = start_row + FOOTER_START + 3;
+    let footer3 = start_row + FOOTER_START + 3;
     core::array::from_fn(|i| {
-        if i < RATE_LEN {
-            trace[F_R_BASE_COL + i][row]
+        if i < 6 {
+            trace[footer_r_col(3, i)][footer3]
+        } else if i < RATE_LEN {
+            let pair = i - 6;
+            let lo = trace[footer_msg_word_col(2 * pair)][footer3];
+            let hi = trace[footer_msg_word_col(2 * pair + 1)][footer3];
+            lo + Felt::new_unchecked(1 << 32) * hi
         } else {
-            trace[F_D_BASE_COL + i - RATE_LEN][row]
+            trace[footer_interface_tail_col(i - RATE_LEN)][footer3]
         }
     })
+}
+
+fn footer_cv_pair(trace: &[Vec<Felt>], row: usize) -> Felt {
+    let word = |slot_base| {
+        (0..4).fold(Felt::ZERO, |acc, byte| {
+            acc + Felt::new_unchecked(1 << (8 * byte))
+                * trace[footer_xor_slot_col(slot_base + byte, 1)][row]
+        })
+    };
+    word(F_HIGH_EVEN_SLOT_BASE) + Felt::new_unchecked(1 << 32) * word(F_HIGH_ODD_SLOT_BASE)
 }
 
 fn compress_state(mut state: HasherState) -> HasherState {

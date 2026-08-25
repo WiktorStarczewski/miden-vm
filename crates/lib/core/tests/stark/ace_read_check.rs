@@ -12,6 +12,7 @@ use miden_core::{
 use miden_crypto::field::Field;
 use miden_processor::ExecutionOutput;
 
+use super::vm_layout_const;
 use crate::helpers::read_memory_felt;
 
 // MASM MEMORY LAYOUT
@@ -29,12 +30,6 @@ const COMPOSITION_POLY_COM_PTR: u32 = 3223322648;
 const COMPOSITION_COEF_PTR: u32 = 3223322704;
 const Z_PTR: u32 = 3223322652;
 const AIR_TRACE_LENGTH_LOGS_PTR: u32 = 3223322744;
-const AUX_RAND_ELEM_PTR: u32 = 3225419776;
-const OOD_EVALUATIONS_PTR: u32 = 3225419784;
-const AUX_BUS_BOUNDARY_PTR: u32 = 3225421160;
-const AUXILIARY_ACE_INPUTS_PTR: u32 = 3225421168;
-const ACE_CIRCUIT_STREAM_PTR: u32 = 3225421216;
-
 pub fn assert_proof_stream_read_sections(
     output: &ExecutionOutput,
     proof_stream: &[u64],
@@ -45,7 +40,10 @@ pub fn assert_proof_stream_read_sections(
     const AUX_VALUES_OFFSET: usize = 19;
     const QUOTIENT_COMMIT_OFFSET: usize = 27;
     const OOD_OFFSET: usize = 33;
-    const OOD_FELTS: usize = 1_376;
+    let ood_evaluations_ptr = vm_layout_const("OOD_EVALUATIONS_PTR");
+    let aux_bus_boundary_ptr = vm_layout_const("AUX_BUS_BOUNDARY_PTR");
+    let ood_felts = usize::try_from(aux_bus_boundary_ptr - ood_evaluations_ptr)
+        .expect("OOD frame size fits usize");
 
     let public_ptr = read_memory_felt(output, PUBLIC_INPUTS_ADDRESS_PTR).as_canonical_u64() as u32;
     for i in 0..32 {
@@ -76,14 +74,14 @@ pub fn assert_proof_stream_read_sections(
     }
     for i in 0..8 {
         assert_eq!(
-            read_memory_felt(output, AUX_BUS_BOUNDARY_PTR + i as u32),
+            read_memory_felt(output, aux_bus_boundary_ptr + i as u32),
             Felt::new_unchecked(proof_stream[AUX_VALUES_OFFSET + i]),
             "aux-boundary stream mismatch at felt {i}"
         );
     }
-    for i in 0..OOD_FELTS {
+    for i in 0..ood_felts {
         assert_eq!(
-            read_memory_felt(output, OOD_EVALUATIONS_PTR + i as u32),
+            read_memory_felt(output, ood_evaluations_ptr + i as u32),
             Felt::new_unchecked(proof_stream[OOD_OFFSET + i]),
             "OOD stream mismatch at felt {i}"
         );
@@ -92,6 +90,11 @@ pub fn assert_proof_stream_read_sections(
 
 #[test]
 fn ace_read_pointers_match_masm_layout() {
+    let aux_rand_elem_ptr = vm_layout_const("AUX_RAND_ELEM_PTR");
+    let ood_evaluations_ptr = vm_layout_const("OOD_EVALUATIONS_PTR");
+    let aux_bus_boundary_ptr = vm_layout_const("AUX_BUS_BOUNDARY_PTR");
+    let auxiliary_ace_inputs_ptr = vm_layout_const("AUXILIARY_ACE_INPUTS_PTR");
+    let ace_circuit_stream_ptr = vm_layout_const("ACE_CIRCUIT_STREAM_PTR");
     let config = AceConfig {
         num_quotient_chunks: 8,
         layout: LayoutKind::Masm,
@@ -110,17 +113,17 @@ fn ace_read_pointers_match_masm_layout() {
     let stark_vars = layout.index(InputKey::Alpha).expect("stark vars");
 
     assert_eq!(alpha, beta + 1);
-    assert_eq!(OOD_EVALUATIONS_PTR - AUX_RAND_ELEM_PTR, 2 * (preprocessed_curr - beta) as u32);
+    assert_eq!(ood_evaluations_ptr - aux_rand_elem_ptr, 2 * (preprocessed_curr - beta) as u32);
     assert_eq!(
-        AUX_BUS_BOUNDARY_PTR - OOD_EVALUATIONS_PTR,
+        aux_bus_boundary_ptr - ood_evaluations_ptr,
         2 * (aux_bus - preprocessed_curr) as u32
     );
     assert_eq!(
-        AUXILIARY_ACE_INPUTS_PTR - AUX_BUS_BOUNDARY_PTR,
+        auxiliary_ace_inputs_ptr - aux_bus_boundary_ptr,
         2 * (stark_vars - aux_bus) as u32
     );
     assert_eq!(
-        ACE_CIRCUIT_STREAM_PTR - AUXILIARY_ACE_INPUTS_PTR,
+        ace_circuit_stream_ptr - auxiliary_ace_inputs_ptr,
         2 * (layout.total_inputs - stark_vars) as u32,
         "ACE inputs and circuit constants must be contiguous"
     );
@@ -135,10 +138,11 @@ fn ace_read_pointers_match_masm_layout() {
 /// The returned vector has `layout.total_inputs` entries.
 fn extract_ace_inputs(output: &ExecutionOutput, layout: &InputLayout) -> Vec<QuadFelt> {
     let pi_ptr = read_memory_felt(output, PUBLIC_INPUTS_ADDRESS_PTR).as_canonical_u64() as u32;
+    let aux_rand_elem_ptr = vm_layout_const("AUX_RAND_ELEM_PTR");
 
     assert!(
-        pi_ptr < AUX_RAND_ELEM_PTR,
-        "pi_ptr ({pi_ptr}) >= AUX_RAND_ELEM_PTR ({AUX_RAND_ELEM_PTR})"
+        pi_ptr < aux_rand_elem_ptr,
+        "pi_ptr ({pi_ptr}) >= AUX_RAND_ELEM_PTR ({aux_rand_elem_ptr})"
     );
 
     (0..layout.total_inputs)

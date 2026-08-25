@@ -1,12 +1,14 @@
 use miden_core::{Felt, field::PrimeField64};
 
 use super::{
+    algebra::{cv_storage_coefficient, missing_rotation_result, universal_cv_word},
     layout::*,
     model::{execute_fused_rounds, initial_working_state, low_output, xof_lanes},
     schedule::fused_step_at,
     trace::{
-        BlakeGFeltRow, TraceMode, generate_felt_trace_block, generate_trace_block,
-        generate_trace_block_with_cycle_id, write_felt_trace_block,
+        BlakeGFeltRow, BlakeGRow, CV_STORAGE_COEFFICIENT_INVERSES, TraceMode,
+        generate_felt_trace_block, generate_trace_block, generate_trace_block_with_cycle_id,
+        retag_felt_trace_block_cycle_id, write_felt_trace_block,
     },
     views::{FooterOverlayRow, FusedGRow, LookupSlot},
 };
@@ -50,6 +52,17 @@ fn assert_slot(slot: LookupSlot<'_, u64>, expected: [u64; 3]) {
     assert_eq!(*slot.field0, expected[0]);
     assert_eq!(*slot.field1, expected[1]);
     assert_eq!(*slot.field2, expected[2]);
+}
+
+fn cv_word(row: &BlakeGRow, idx: usize) -> u64 {
+    universal_cv_word(|col| Felt::new_unchecked(row[col]), idx).as_canonical_u64()
+}
+
+#[test]
+fn cv_storage_coefficient_inverses_are_exact() {
+    for (idx, inverse) in CV_STORAGE_COEFFICIENT_INVERSES.into_iter().enumerate() {
+        assert_eq!(cv_storage_coefficient::<Felt>(idx) * inverse, Felt::ONE);
+    }
 }
 
 #[test]
@@ -97,24 +110,21 @@ fn trace_writer_materializes_compression_cycle_id_on_internal_bus_rows() {
         TraceMode::Compression,
     );
 
-    for row in 0..FUSED_G_ROWS {
-        for g in 0..NUM_G {
-            assert_eq!(trace.rows[row][g_msg_slot_col(g, 2)], cycle_id);
-        }
+    for row in 0..BLOCK_PERIOD {
+        let row = &trace.rows[row];
+        assert_eq!(row[F_COMPRESSION_CYCLE_ID_COL], cycle_id);
     }
     for footer in 0..FOOTER_ROWS {
         let row = &trace.rows[FOOTER_START + footer];
-        assert_eq!(row[F_COMPRESSION_CYCLE_ID_COL], cycle_id);
-        assert_eq!(row[F_HIN_SLOT_BASE_COL], 4 * cycle_id + footer as u64);
-        for word_slot in 0..F_MSG_WORD_SLOTS {
-            assert_eq!(row[footer_msg_word_slot_col(word_slot, 2)], cycle_id);
+        for (idx, &word) in test_h().iter().enumerate().take(2 * footer + 2) {
+            assert_eq!(cv_word(row, idx), word as u64);
         }
     }
 }
 
 #[test]
-fn trace_writer_accepts_largest_canonical_cycle_pair_key() {
-    let max_cycle_id = (Felt::ORDER_U64 - FOOTER_ROWS as u64) / FOOTER_ROWS as u64;
+fn trace_writer_accepts_largest_canonical_cycle_id() {
+    let max_cycle_id = Felt::ORDER_U64 - 1;
     let trace = generate_trace_block_with_cycle_id(
         test_block(),
         test_h(),
@@ -123,15 +133,15 @@ fn trace_writer_accepts_largest_canonical_cycle_pair_key() {
     );
 
     assert_eq!(
-        trace.rows[FOOTER_START + FOOTER_ROWS - 1][F_HIN_SLOT_BASE_COL],
-        FOOTER_ROWS as u64 * max_cycle_id + (FOOTER_ROWS - 1) as u64,
+        trace.rows[FOOTER_START + FOOTER_ROWS - 1][F_COMPRESSION_CYCLE_ID_COL],
+        max_cycle_id,
     );
 }
 
 #[test]
-#[should_panic(expected = "compression-cycle pair key must be a canonical field element")]
-fn trace_writer_rejects_noncanonical_cycle_pair_key() {
-    let invalid_cycle_id = (Felt::ORDER_U64 - FOOTER_ROWS as u64) / FOOTER_ROWS as u64 + 1;
+#[should_panic(expected = "compression-cycle ID must be a canonical field element")]
+fn trace_writer_rejects_noncanonical_cycle_id() {
+    let invalid_cycle_id = Felt::ORDER_U64;
     let _ = generate_trace_block_with_cycle_id(
         test_block(),
         test_h(),
@@ -187,12 +197,10 @@ fn fused_g_rows_materialize_expected_slots() {
             let k2 = sum2 >> 32;
             let b_new = (b ^ c_new).rotate_right(step.second_rotation);
 
-            assert_eq!(*row.a(g), a as u64);
-            assert_eq!(*row.c(g), c as u64);
-            assert_eq!(*row.k3_bit0(g), k3 & 1);
-            assert_eq!(*row.k3_bit1(g), k3 >> 1);
+            assert_eq!(*row.k3(g), k3);
             assert_eq!(*row.k2(g), k2);
-            assert_slot(row.msg_slot(g), [step.message_indices[g] as u64, msg as u64, 0]);
+            assert_eq!(*row.msg_word(g), msg as u64);
+            assert_eq!(*row.compression_cycle_id(), 0);
 
             let d_bytes = d.to_le_bytes();
             let a_new_bytes = a_new.to_le_bytes();
@@ -207,20 +215,41 @@ fn fused_g_rows_materialize_expected_slots() {
                         (d_bytes[byte] & a_new_bytes[byte]) as u64,
                     ],
                 );
-                assert_slot(
-                    row.bd_rot_slot(g, byte),
-                    [
-                        b_bytes[byte] as u64,
-                        c_new_bytes[byte] as u64,
-                        blakeg_rotation_contribution(
-                            byte,
-                            b_bytes[byte],
-                            c_new_bytes[byte],
-                            step.second_rotation,
-                        ) as u64,
-                    ],
-                );
+                let expected_result = blakeg_rotation_contribution(
+                    byte,
+                    b_bytes[byte],
+                    c_new_bytes[byte],
+                    step.second_rotation,
+                ) as u64;
+                if g_bd_rot_result_col(g, byte).is_some() {
+                    assert_slot(
+                        row.bd_rot_slot(g, byte),
+                        [b_bytes[byte] as u64, c_new_bytes[byte] as u64, expected_result],
+                    );
+                } else {
+                    let inputs = row.bd_rot_inputs(g, byte);
+                    assert_eq!(*inputs.field0, b_bytes[byte] as u64);
+                    assert_eq!(*inputs.field1, c_new_bytes[byte] as u64);
+                    let next = &trace.rows[row_idx + 1];
+                    let derived = missing_rotation_result(
+                        |col| Felt::new_unchecked(trace.rows[row_idx][col]),
+                        |col| Felt::new_unchecked(next[col]),
+                    );
+                    assert_eq!(derived.as_canonical_u64(), expected_result);
+                }
             }
+
+            let actual_a_new = packed_slot_bytes(&row, g, true, 1);
+            let actual_b = packed_slot_bytes(&row, g, false, 0);
+            let actual_c_new = packed_slot_bytes(&row, g, false, 1);
+            let actual_d = packed_slot_bytes(&row, g, true, 0);
+            let actual_d_new = (actual_d ^ actual_a_new).rotate_right(step.first_rotation);
+            let actual_k3 = *row.k3(g);
+            let reconstructed_a =
+                actual_a_new as u64 + (actual_k3 << 32) - actual_b as u64 - *row.msg_word(g);
+            let reconstructed_c = actual_c_new as u64 + (*row.k2(g) << 32) - actual_d_new as u64;
+            assert_eq!(reconstructed_a, a as u64);
+            assert_eq!(reconstructed_c, c as u64);
 
             v[ai] = a_new;
             v[di] = d_new;
@@ -232,6 +261,28 @@ fn fused_g_rows_materialize_expected_slots() {
     assert_eq!(v, trace.final_v);
 }
 
+fn packed_slot_bytes(row: &FusedGRow<'_, u64>, g: usize, ac_slot: bool, field: usize) -> u32 {
+    let bytes = core::array::from_fn(|byte| {
+        if ac_slot {
+            let slot = row.ac_byte_slot(g, byte);
+            match field {
+                0 => *slot.field0 as u8,
+                1 => *slot.field1 as u8,
+                2 => *slot.field2 as u8,
+                _ => unreachable!("lookup-slot field must be in 0..3"),
+            }
+        } else {
+            let slot = row.bd_rot_inputs(g, byte);
+            match field {
+                0 => *slot.field0 as u8,
+                1 => *slot.field1 as u8,
+                _ => unreachable!("rotation-input field must be zero or one"),
+            }
+        }
+    });
+    u32::from_le_bytes(bytes)
+}
+
 #[test]
 fn footer_overlay_rows_materialize_expected_surface() {
     let block = test_block();
@@ -241,12 +292,8 @@ fn footer_overlay_rows_materialize_expected_surface() {
     let low = low_output(trace.final_v);
     let xof = xof_lanes(trace.final_v, h);
     let r_values: [u64; 8] = core::array::from_fn(|i| pack_pair(block[2 * i], block[2 * i + 1]));
-    let c_values: [u64; 4] = core::array::from_fn(|i| pack_pair(h[2 * i], h[2 * i + 1]));
-    let d_values: [u64; 4] =
-        core::array::from_fn(|i| pack_pair(low[2 * i], low[2 * i + 1] & 0x7fff_ffff));
-
     for footer in 0..FOOTER_ROWS {
-        let row = FooterOverlayRow::new(&trace.rows[FOOTER_START + footer]);
+        let row = FooterOverlayRow::new(&trace.rows[FOOTER_START + footer], footer);
         let even = 2 * footer;
         let odd = even + 1;
 
@@ -259,11 +306,9 @@ fn footer_overlay_rows_materialize_expected_surface() {
                 (low[odd].to_le_bytes()[3] & F_TOP_BIT_MASK) as u64,
             ],
         );
-        assert_slot(row.hin_slot(), [footer as u64, h[even] as u64, h[odd] as u64]);
-
         for word_slot in 0..F_MSG_WORD_SLOTS {
             let msg_idx = footer_message_word_index(footer, word_slot);
-            assert_slot(row.msg_word_slot(word_slot), [msg_idx as u64, block[msg_idx] as u64, 0]);
+            assert_eq!(*row.msg_word(word_slot), block[msg_idx] as u64);
         }
         for limb in 0..F_RANGE_SLOTS {
             let msg_idx = footer_range_limb_word_index(footer, limb);
@@ -276,21 +321,25 @@ fn footer_overlay_rows_materialize_expected_surface() {
             assert_slot(row.range_slot(limb), [value as u64, 0, 0]);
         }
 
-        for (idx, &r_value) in r_values.iter().enumerate() {
-            let expected = if idx <= 2 * footer + 1 { r_value } else { 0 };
-            assert_eq!(*row.r(idx), expected);
+        for (idx, &r_value) in r_values.iter().enumerate().take(2 * footer) {
+            assert_eq!(*row.carried_r(idx), r_value);
         }
-        for idx in 0..4 {
-            let expected_c = if idx <= footer { c_values[idx] } else { 0 };
-            let expected_d = if idx <= footer { d_values[idx] } else { 0 };
-            assert_eq!(*row.c(idx), expected_c);
-            assert_eq!(*row.d(idx), expected_d);
+        for pair in 0..2 {
+            let lo = *row.msg_word(2 * pair) as u32;
+            let hi = *row.msg_word(2 * pair + 1) as u32;
+            assert_eq!(pack_pair(lo, hi), r_values[2 * footer + pair]);
+        }
+        for (idx, &word) in h.iter().enumerate().take(2 * footer + 2) {
+            assert_eq!(cv_word(&trace.rows[FOOTER_START + footer], idx), word as u64);
         }
 
         assert_future_w_queue(&row, footer, trace.final_v);
         assert_eq!(*row.compression_multiplicity(), 0);
         assert_eq!(*row.mode(), 1);
-        assert_eq!(*row.clk(), clk);
+        assert_eq!(*row.interface_tail(0), clk);
+        for idx in 1..4 {
+            assert_eq!(*row.interface_tail(idx), 0);
+        }
     }
 }
 
@@ -302,11 +351,36 @@ fn compression_footer_rows_carry_request_multiplicity() {
         TraceMode::CompressionWithMultiplicity { multiplicity: 3 },
     );
 
+    let low = low_output(trace.final_v);
+    let d_values: [u64; 4] =
+        core::array::from_fn(|i| pack_pair(low[2 * i], low[2 * i + 1] & 0x7fff_ffff));
     for footer in 0..FOOTER_ROWS {
-        let row = FooterOverlayRow::new(&trace.rows[FOOTER_START + footer]);
+        let row = FooterOverlayRow::new(&trace.rows[FOOTER_START + footer], footer);
         assert_eq!(*row.compression_multiplicity(), 3);
         assert_eq!(*row.mode(), 0);
-        assert_eq!(*row.clk(), 0);
+        for (idx, &value) in d_values.iter().enumerate() {
+            assert_eq!(*row.interface_tail(idx), value);
+        }
+    }
+}
+
+#[test]
+fn padding_retag_preserves_full_cv_coordinates() {
+    let h = test_h();
+    let mut trace = generate_felt_trace_block(test_block(), h, TraceMode::Compression);
+
+    retag_felt_trace_block_cycle_id(&mut trace.rows, 17);
+
+    for row in 0..FUSED_G_ROWS {
+        assert_eq!(trace.rows[row][F_COMPRESSION_CYCLE_ID_COL], Felt::from_u8(17));
+    }
+    for footer in 0..FOOTER_ROWS {
+        let row = &trace.rows[FOOTER_START + footer];
+        assert_eq!(row[F_COMPRESSION_CYCLE_ID_COL], Felt::from_u8(17));
+        for (idx, &word) in h.iter().enumerate().take(2 * footer + 2) {
+            let actual = universal_cv_word(|col| row[col], idx);
+            assert_eq!(actual, Felt::from_u32(word), "footer {footer}, CV word {idx}");
+        }
     }
 }
 
@@ -352,9 +426,8 @@ fn assert_future_w_queue(row: &FooterOverlayRow<'_, u64>, footer: usize, v: [u32
         _ => unreachable!(),
     };
 
-    for idx in 0..F_FUTURE_W_COLS {
-        let expected = future_w.get(idx).map(|&word_idx| v[word_idx] as u64).unwrap_or(0);
-        assert_eq!(*row.future_w(idx), expected);
+    for (idx, &word_idx) in future_w.iter().enumerate() {
+        assert_eq!(*row.future_w(idx), v[word_idx] as u64);
     }
 }
 

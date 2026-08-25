@@ -1,4 +1,4 @@
-//! Test-only typed views for the 32-row x 128-column BlakeG layout.
+//! Test-only typed views for the 32-row x 108-column BlakeG layout.
 
 use super::layout::*;
 
@@ -7,6 +7,12 @@ pub struct LookupSlot<'a, T> {
     pub field0: &'a T,
     pub field1: &'a T,
     pub field2: &'a T,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LookupInputs<'a, T> {
+    pub field0: &'a T,
+    pub field1: &'a T,
 }
 
 impl<'a, T> LookupSlot<'a, T> {
@@ -44,32 +50,31 @@ impl<'a, T> FusedGRow<'a, T> {
     pub fn bd_rot_slot(&self, g: usize, byte: usize) -> LookupSlot<'a, T> {
         debug_assert!(g < NUM_G);
         debug_assert!(byte < BYTES_PER_WORD);
+        debug_assert!(g_bd_rot_result_col(g, byte).is_some());
         LookupSlot::new(self.cols, g_bd_rot_slot_col(g, byte, 0))
     }
 
-    pub fn msg_slot(&self, g: usize) -> LookupSlot<'a, T> {
+    pub fn bd_rot_inputs(&self, g: usize, byte: usize) -> LookupInputs<'a, T> {
         debug_assert!(g < NUM_G);
-        LookupSlot::new(self.cols, g_msg_slot_col(g, 0))
+        debug_assert!(byte < BYTES_PER_WORD);
+        LookupInputs {
+            field0: self.col(g_bd_rot_slot_col(g, byte, 0)),
+            field1: self.col(g_bd_rot_slot_col(g, byte, 1)),
+        }
     }
 
-    pub fn a(&self, g: usize) -> &'a T {
+    pub fn msg_word(&self, g: usize) -> &'a T {
         debug_assert!(g < NUM_G);
-        self.col(G_A_BASE_COL + g)
+        self.col(g_msg_word_col(g))
     }
 
-    pub fn c(&self, g: usize) -> &'a T {
-        debug_assert!(g < NUM_G);
-        self.col(G_C_BASE_COL + g)
+    pub fn compression_cycle_id(&self) -> &'a T {
+        self.col(G_COMPRESSION_CYCLE_ID_COL)
     }
 
-    pub fn k3_bit0(&self, g: usize) -> &'a T {
+    pub fn k3(&self, g: usize) -> &'a T {
         debug_assert!(g < NUM_G);
-        self.col(G_K3_BIT0_BASE_COL + g)
-    }
-
-    pub fn k3_bit1(&self, g: usize) -> &'a T {
-        debug_assert!(g < NUM_G);
-        self.col(G_K3_BIT1_BASE_COL + g)
+        self.col(g_k3_col(g))
     }
 
     pub fn k2(&self, g: usize) -> &'a T {
@@ -80,12 +85,14 @@ impl<'a, T> FusedGRow<'a, T> {
 
 pub struct FooterOverlayRow<'a, T> {
     cols: &'a [T],
+    footer: usize,
 }
 
 impl<'a, T> FooterOverlayRow<'a, T> {
-    pub fn new(cols: &'a [T]) -> Self {
+    pub fn new(cols: &'a [T], footer: usize) -> Self {
         debug_assert_eq!(cols.len(), NUM_COLS);
-        Self { cols }
+        debug_assert!(footer < FOOTER_ROWS);
+        Self { cols, footer }
     }
 
     fn col(&self, idx: usize) -> &'a T {
@@ -102,13 +109,9 @@ impl<'a, T> FooterOverlayRow<'a, T> {
         LookupSlot::new(self.cols, F_TOP_BIT_SLOT_BASE_COL)
     }
 
-    pub fn hin_slot(&self) -> LookupSlot<'a, T> {
-        LookupSlot::new(self.cols, F_HIN_SLOT_BASE_COL)
-    }
-
-    pub fn msg_word_slot(&self, word: usize) -> LookupSlot<'a, T> {
+    pub fn msg_word(&self, word: usize) -> &'a T {
         debug_assert!(word < F_MSG_WORD_SLOTS);
-        LookupSlot::new(self.cols, footer_msg_word_slot_col(word, 0))
+        self.col(footer_msg_word_col(word))
     }
 
     pub fn range_slot(&self, limb: usize) -> LookupSlot<'a, T> {
@@ -116,24 +119,21 @@ impl<'a, T> FooterOverlayRow<'a, T> {
         LookupSlot::new(self.cols, footer_range_slot_col(limb, 0))
     }
 
-    pub fn r(&self, idx: usize) -> &'a T {
-        debug_assert!(idx < 8);
-        self.col(F_R_BASE_COL + idx)
+    pub fn carried_r(&self, idx: usize) -> &'a T {
+        self.col(footer_r_col(self.footer, idx))
     }
 
-    pub fn c(&self, idx: usize) -> &'a T {
-        debug_assert!(idx < 4);
-        self.col(F_C_BASE_COL + idx)
+    pub fn cv_storage(&self, idx: usize) -> &'a T {
+        debug_assert!(idx < 2 * self.footer + 2);
+        self.col(F_CV_STORAGE_COLS[idx])
     }
 
-    pub fn d(&self, idx: usize) -> &'a T {
-        debug_assert!(idx < 4);
-        self.col(F_D_BASE_COL + idx)
+    pub fn interface_tail(&self, idx: usize) -> &'a T {
+        self.col(footer_interface_tail_col(idx))
     }
 
     pub fn future_w(&self, idx: usize) -> &'a T {
-        debug_assert!(idx < F_FUTURE_W_COLS);
-        self.col(F_FUTURE_W_BASE_COL + idx)
+        self.col(footer_future_w_col(self.footer, idx))
     }
 
     pub fn r_canon_inv(&self, pair: usize) -> &'a T {

@@ -1,40 +1,39 @@
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 
 use miden_core::{
     Felt,
-    field::{PrimeCharacteristicRing, QuadFelt},
+    field::{Field, PrimeCharacteristicRing, QuadFelt},
     utils::RowMajorMatrix,
 };
 
 use super::{
+    algebra::{cv_storage_coefficient, universal_cv_word},
     layout::*,
     lookup::{
-        AEAD_HIGH_OUTPUT_COLUMN, AEAD_INPUT_COLUMN, AEAD_LOW_OUTPUT_COLUMN,
         BLAKEG_LOOKUP_COLUMN_SHAPE, BlakeGCompressionLookupAir, BlakeGCompressionMode,
-        COMPRESSION_LINK_COLUMN, LookupPlan, NARROW_BATCH_COLUMNS, NarrowLookup, NarrowLookupKind,
-        SingletonLookupKind, lookup_plan,
+        FOOTER_INPUT_COLUMN, FOOTER_OUTPUT_COLUMN, NARROW_BATCH_COLUMNS, NarrowLookup,
+        NarrowLookupKind, OverlayRelationKind, lookup_plan,
     },
+    model::low_output,
     periodic::{P_IS_AB, P_IS_CD, P_IS_FOOTER, get_periodic_column_values},
+    schedule::fused_step_at,
     trace::{BlakeGRow, TraceMode, generate_trace_block_with_cycle_id},
 };
 #[cfg(feature = "std")]
 use crate::lookup::debug::{ValidateLayout, ValidateLookupAir};
 use crate::{
+    constraints::{
+        and8_lookup::columns::blakeg_rotation_contribution,
+        lookup::messages::{
+            AeadBlakeGInputMsg, HasherCompressionLinkMsg, blakeg_rot7_bus, blakeg_rot12_bus,
+        },
+    },
     logup::BusId,
-    lookup::{Challenges, LookupFractions, build_lookup_fractions},
+    lookup::{
+        Challenges, LookupFractions, LookupMessage, accumulate, accumulate_slow,
+        build_lookup_fractions,
+    },
 };
-
-fn count_narrow(plan: &[NarrowLookup], kind: NarrowLookupKind, sign: i8) -> usize {
-    plan.iter().filter(|lookup| lookup.kind == kind && lookup.sign == sign).count()
-}
-
-fn signed_narrow_total(kind: NarrowLookupKind) -> i64 {
-    (0..BLOCK_PERIOD)
-        .flat_map(|row| lookup_plan(row, BlakeGCompressionMode::Compression).narrow)
-        .filter(|lookup| lookup.kind == kind)
-        .map(|lookup| lookup.sign as i64)
-        .sum()
-}
 
 fn test_block() -> [u32; 16] {
     [
@@ -70,14 +69,6 @@ fn test_h() -> [u32; 8] {
     ]
 }
 
-fn add_message_payload(map: &mut BTreeMap<[u64; 3], i64>, payload: [u64; 3], sign: i64) {
-    *map.entry(payload).or_default() += sign;
-}
-
-fn add_input_payload(map: &mut BTreeMap<[u64; 3], i64>, payload: [u64; 3], sign: i64) {
-    *map.entry(payload).or_default() += sign;
-}
-
 fn other_test_block() -> [u32; 16] {
     core::array::from_fn(|idx| 0x1000_0000 + idx as u32 * 17)
 }
@@ -86,11 +77,16 @@ fn other_test_h() -> [u32; 8] {
     core::array::from_fn(|idx| 0x2000_0000 + idx as u32 * 19)
 }
 
-fn packed_b(row: &BlakeGRow, g: usize) -> u64 {
-    row[g_bd_rot_slot_col(g, 0, 0)]
-        + (row[g_bd_rot_slot_col(g, 1, 0)] << 8)
-        + (row[g_bd_rot_slot_col(g, 2, 0)] << 16)
-        + (row[g_bd_rot_slot_col(g, 3, 0)] << 24)
+fn count_narrow(plan: &[NarrowLookup], kind: NarrowLookupKind, sign: i8) -> usize {
+    plan.iter().filter(|lookup| lookup.kind == kind && lookup.sign == sign).count()
+}
+
+fn signed_narrow_total(kind: NarrowLookupKind) -> i64 {
+    (0..BLOCK_PERIOD)
+        .flat_map(|row| lookup_plan(row, BlakeGCompressionMode::Compression).narrow)
+        .filter(|lookup| lookup.kind == kind)
+        .map(|lookup| lookup.sign as i64)
+        .sum()
 }
 
 fn felt_trace_matrix(mode: TraceMode) -> RowMajorMatrix<Felt> {
@@ -103,12 +99,33 @@ fn felt_trace_matrix_with_cycle_id(
 ) -> RowMajorMatrix<Felt> {
     let trace =
         generate_trace_block_with_cycle_id(test_block(), test_h(), compression_cycle_id, mode);
-    let values = trace
-        .rows
+    felt_matrix_from_rows(&trace.rows)
+}
+
+fn felt_matrix_from_rows(rows: &[BlakeGRow]) -> RowMajorMatrix<Felt> {
+    let values = rows
         .iter()
         .flat_map(|row| row.iter().map(|&value| Felt::new_unchecked(value)))
         .collect();
     RowMajorMatrix::new(values, NUM_COLS)
+}
+
+fn lookup_challenges() -> Challenges<QuadFelt> {
+    Challenges::new(QuadFelt::from_u32(7), QuadFelt::from_u32(11), 16, BusId::COUNT)
+}
+
+fn lookup_fractions(trace: &RowMajorMatrix<Felt>) -> LookupFractions<Felt, QuadFelt> {
+    build_lookup_fractions(
+        &BlakeGCompressionLookupAir,
+        trace,
+        None,
+        &get_periodic_column_values(),
+        &lookup_challenges(),
+    )
+}
+
+fn lookup_sigma(trace: &RowMajorMatrix<Felt>) -> QuadFelt {
+    accumulate_slow(&lookup_fractions(trace)).1
 }
 
 fn fractions_at(
@@ -122,35 +139,34 @@ fn fractions_at(
     &fractions.fractions()[start..end]
 }
 
-fn felt_fields<const N: usize>(fields: [u64; N]) -> [Felt; N] {
-    fields.map(Felt::new_unchecked)
-}
-
-fn lookup_challenges() -> Challenges<QuadFelt> {
-    Challenges::new(QuadFelt::from_u32(7), QuadFelt::from_u32(11), 16, BusId::COUNT)
-}
-
 fn expected_column_counts(row: usize, mode: BlakeGCompressionMode) -> [usize; AUX_COLS] {
     let mut counts = [0; AUX_COLS];
-    let plan = lookup_plan(row, mode);
-
-    for slot in 0..plan.narrow.len() {
-        counts[slot / 2] += 1;
+    match row_kind(row) {
+        RowKind::Ab | RowKind::Cd | RowKind::AbDiag | RowKind::CdDiag => {
+            counts[..NARROW_BATCH_COLUMNS].fill(2);
+            if row == 0 {
+                counts[FOOTER_INPUT_COLUMN] = 1;
+            }
+        },
+        RowKind::Footer(footer) => {
+            counts[..9].fill(2);
+            counts[11..13].fill(2);
+            counts[13] = 1;
+            counts[14] = 2;
+            counts[16..18].fill(2);
+            if footer == FOOTER_ROWS - 1 {
+                counts[FOOTER_INPUT_COLUMN] = 2;
+            }
+            if mode == BlakeGCompressionMode::AeadXof {
+                counts[FOOTER_OUTPUT_COLUMN] = 2;
+            }
+        },
     }
-
-    for singleton in plan.singletons {
-        counts[LookupPlan::singleton_aux_column(singleton.kind)] += 1;
-    }
-
     counts
 }
 
 fn assert_lookup_fraction_counts(mode: BlakeGCompressionMode, trace_mode: TraceMode) {
-    let air = BlakeGCompressionLookupAir;
-    let trace = felt_trace_matrix(trace_mode);
-    let periodic = get_periodic_column_values();
-    let fractions = build_lookup_fractions(&air, &trace, None, &periodic, &lookup_challenges());
-
+    let fractions = lookup_fractions(&felt_trace_matrix(trace_mode));
     assert_eq!(fractions.shape(), BLAKEG_LOOKUP_COLUMN_SHAPE);
     assert_eq!(fractions.counts().len(), BLOCK_PERIOD * AUX_COLS);
 
@@ -161,22 +177,94 @@ fn assert_lookup_fraction_counts(mode: BlakeGCompressionMode, trace_mode: TraceM
     }
 }
 
-#[test]
-fn lookup_plans_fit_fixed_aux_columns() {
-    assert_eq!(BLAKEG_LOOKUP_COLUMN_SHAPE.len(), AUX_COLS);
-    assert_eq!(NARROW_BATCH_COLUMNS, 20);
-    assert_eq!(COMPRESSION_LINK_COLUMN, 20);
-    assert_eq!(AEAD_INPUT_COLUMN, 21);
-    assert_eq!(AEAD_LOW_OUTPUT_COLUMN, 22);
-    assert_eq!(AEAD_HIGH_OUTPUT_COLUMN, 23);
+fn full_cv_fields(row: &BlakeGRow) -> [Felt; 9] {
+    core::array::from_fn(|idx| {
+        if idx == 0 {
+            Felt::new_unchecked(row[F_COMPRESSION_CYCLE_ID_COL])
+        } else {
+            universal_cv_word(|col| Felt::new_unchecked(row[col]), idx - 1)
+        }
+    })
+}
 
-    for mode in [BlakeGCompressionMode::Compression, BlakeGCompressionMode::AeadXof] {
-        let narrow_peak = (0..BLOCK_PERIOD)
-            .map(|row| lookup_plan(row, mode).narrow_aux_columns())
-            .max()
-            .unwrap();
-        assert_eq!(narrow_peak, NARROW_BATCH_COLUMNS);
+fn set_full_cv_words(row: &mut BlakeGRow, words: [u32; 8]) {
+    for idx in (NUM_G..8).chain(0..NUM_G) {
+        let word = words[idx];
+        let at = |col| Felt::new_unchecked(row[col]);
+        let target = Felt::from_u32(word);
+        let base = super::algebra::cv_word_base(&at, idx);
+        let offset = super::algebra::cv_storage_offset::<Felt>(idx);
+        let coefficient = super::algebra::cv_storage_coefficient::<Felt>(idx);
+        row[F_CV_STORAGE_COLS[idx]] =
+            ((target - base + offset) * coefficient.inverse()).as_canonical_u64();
     }
+}
+
+fn pack_pair(lo: u32, hi: u32) -> Felt {
+    Felt::from_u32(lo) + Felt::from_u64(1 << 32) * Felt::from_u32(hi)
+}
+
+fn add_to_raw_cell(cell: &mut u64, delta: Felt) {
+    *cell = (Felt::new_unchecked(*cell) + delta).as_canonical_u64();
+}
+
+fn compression_link_fields(block: [u32; 16], h: [u32; 8], final_v: [u32; 16]) -> [Felt; 16] {
+    let low = low_output(final_v);
+    core::array::from_fn(|idx| match idx {
+        0..=7 => pack_pair(block[2 * idx], block[2 * idx + 1]),
+        8..=11 => {
+            let pair = idx - 8;
+            pack_pair(h[2 * pair], h[2 * pair + 1])
+        },
+        12..=15 => {
+            let pair = idx - 12;
+            pack_pair(low[2 * pair], low[2 * pair + 1] & 0x7fff_ffff)
+        },
+        _ => unreachable!(),
+    })
+}
+
+fn aead_input_fields(block: [u32; 16], h: [u32; 8], clk: u64) -> [Felt; 16] {
+    core::array::from_fn(|idx| match idx {
+        0..=7 => pack_pair(block[2 * idx], block[2 * idx + 1]),
+        8..=11 => {
+            let pair = idx - 8;
+            pack_pair(h[2 * pair], h[2 * pair + 1])
+        },
+        12 => Felt::new_unchecked(clk),
+        13..=15 => Felt::ZERO,
+        _ => unreachable!(),
+    })
+}
+
+#[test]
+fn lookup_plan_and_column_liveness_match_the_20_column_design() {
+    assert_eq!(BLAKEG_LOOKUP_COLUMN_SHAPE, [2; 20]);
+    assert_eq!(NARROW_BATCH_COLUMNS, 18);
+    assert_eq!(FOOTER_INPUT_COLUMN, 18);
+    assert_eq!(FOOTER_OUTPUT_COLUMN, 19);
+
+    let first = lookup_plan(0, BlakeGCompressionMode::Compression);
+    assert_eq!(first.narrow.len(), 36);
+    assert_eq!(first.narrow_aux_columns(), 18);
+    assert_eq!(first.overlay_relations.len(), 1);
+    assert_eq!(first.overlay_relations[0].kind, OverlayRelationKind::FullCv);
+    assert_eq!(first.overlay_relations[0].sign, -1);
+
+    let later = lookup_plan(1, BlakeGCompressionMode::Compression);
+    assert_eq!(later.narrow.len(), 36);
+    assert!(later.overlay_relations.is_empty());
+
+    let footer0 = lookup_plan(FOOTER_START, BlakeGCompressionMode::Compression);
+    assert_eq!(footer0.narrow.len(), 29);
+    assert!(footer0.overlay_relations.is_empty());
+
+    let footer3 = lookup_plan(BLOCK_PERIOD - 1, BlakeGCompressionMode::Compression);
+    assert_eq!(footer3.narrow.len(), 29);
+    assert_eq!(footer3.overlay_relations.len(), 2);
+    assert_eq!(footer3.overlay_relations[0].kind, OverlayRelationKind::FullCv);
+    assert_eq!(footer3.overlay_relations[0].sign, 1);
+    assert_eq!(footer3.overlay_relations[1].kind, OverlayRelationKind::CompressionLink);
 }
 
 #[test]
@@ -196,195 +284,25 @@ fn lookup_plans_follow_periodic_row_families() {
 }
 
 #[test]
-fn first_ab_row_carries_all_initial_input_pair_removals() {
-    let first = lookup_plan(0, BlakeGCompressionMode::Compression);
-    assert_eq!(count_narrow(&first.narrow, NarrowLookupKind::InputPair, -1), 4);
-    assert_eq!(count_narrow(&first.narrow, NarrowLookupKind::And8, -1), 16);
-    assert_eq!(count_narrow(&first.narrow, NarrowLookupKind::Rot12, -1), 16);
-    assert_eq!(count_narrow(&first.narrow, NarrowLookupKind::MessageWord, 1), 4);
-
-    let later_ab = lookup_plan(FUSED_G_ROWS_PER_ROUND, BlakeGCompressionMode::Compression);
-    assert_eq!(count_narrow(&later_ab.narrow, NarrowLookupKind::InputPair, -1), 0);
-}
-
-#[test]
-fn footer_rows_carry_net_hin_and_message_group() {
-    let footer = lookup_plan(FOOTER_START + 2, BlakeGCompressionMode::Compression);
-
-    assert_eq!(count_narrow(&footer.narrow, NarrowLookupKind::And8, -1), 17);
-    assert_eq!(count_narrow(&footer.narrow, NarrowLookupKind::InputPair, 1), 1);
-    assert_eq!(count_narrow(&footer.narrow, NarrowLookupKind::MessageWord, -7), 4);
-    assert_eq!(count_narrow(&footer.narrow, NarrowLookupKind::RangeCheck, -1), 8);
-    assert!(footer.singletons.is_empty());
-}
-
-#[test]
-fn message_word_relation_balances_over_one_block() {
+fn internal_relations_balance_over_one_cycle() {
     assert_eq!(signed_narrow_total(NarrowLookupKind::MessageWord), 0);
+
+    let full_cv_total: i64 = (0..BLOCK_PERIOD)
+        .flat_map(|row| lookup_plan(row, BlakeGCompressionMode::Compression).overlay_relations)
+        .filter(|lookup| lookup.kind == OverlayRelationKind::FullCv)
+        .map(|lookup| lookup.sign as i64)
+        .sum();
+    assert_eq!(full_cv_total, 0);
 }
 
 #[test]
-fn input_pair_relation_balances_without_interface_row() {
-    assert_eq!(signed_narrow_total(NarrowLookupKind::InputPair), 0);
+fn lookup_air_emits_expected_compression_fraction_counts() {
+    assert_lookup_fraction_counts(BlakeGCompressionMode::Compression, TraceMode::Compression);
 }
 
 #[test]
-fn message_word_payloads_balance_over_generated_block() {
-    let cycle_id = 7;
-    let trace = generate_trace_block_with_cycle_id(
-        test_block(),
-        test_h(),
-        cycle_id,
-        TraceMode::Compression,
-    );
-    let mut balance = BTreeMap::new();
-
-    for row in 0..FUSED_G_ROWS {
-        for g in 0..NUM_G {
-            let base = g_msg_slot_col(g, 0);
-            add_message_payload(
-                &mut balance,
-                [trace.rows[row][base], trace.rows[row][base + 1], trace.rows[row][base + 2]],
-                1,
-            );
-        }
-    }
-
-    for footer in 0..FOOTER_ROWS {
-        let row = &trace.rows[FOOTER_START + footer];
-        for word_slot in 0..F_MSG_WORD_SLOTS {
-            let base = footer_msg_word_slot_col(word_slot, 0);
-            add_message_payload(&mut balance, [row[base], row[base + 1], row[base + 2]], -7);
-        }
-    }
-
-    assert!(balance.values().all(|&count| count == 0));
-}
-
-#[test]
-fn input_pair_payloads_balance_over_generated_block() {
-    let cycle_id = 7;
-    let trace = generate_trace_block_with_cycle_id(
-        test_block(),
-        test_h(),
-        cycle_id,
-        TraceMode::Compression,
-    );
-    let mut balance = BTreeMap::new();
-    let first_row = &trace.rows[0];
-
-    add_input_payload(
-        &mut balance,
-        [4 * cycle_id, first_row[G_A_BASE_COL], first_row[G_A_BASE_COL + 1]],
-        -1,
-    );
-    add_input_payload(
-        &mut balance,
-        [4 * cycle_id + 1, first_row[G_A_BASE_COL + 2], first_row[G_A_BASE_COL + 3]],
-        -1,
-    );
-    add_input_payload(
-        &mut balance,
-        [4 * cycle_id + 2, packed_b(first_row, 0), packed_b(first_row, 1)],
-        -1,
-    );
-    add_input_payload(
-        &mut balance,
-        [4 * cycle_id + 3, packed_b(first_row, 2), packed_b(first_row, 3)],
-        -1,
-    );
-
-    for footer in 0..FOOTER_ROWS {
-        let row = &trace.rows[FOOTER_START + footer];
-        add_input_payload(
-            &mut balance,
-            [
-                row[F_HIN_SLOT_BASE_COL],
-                row[F_HIN_SLOT_BASE_COL + 1],
-                row[F_HIN_SLOT_BASE_COL + 2],
-            ],
-            1,
-        );
-    }
-
-    assert!(balance.values().all(|&count| count == 0));
-}
-
-#[test]
-fn internal_bus_encodings_include_compression_cycle_id() {
-    let cycle_id = 7;
-    let challenges = lookup_challenges();
-    let trace = felt_trace_matrix_with_cycle_id(cycle_id, TraceMode::Compression);
-    let fractions = build_lookup_fractions(
-        &BlakeGCompressionLookupAir,
-        &trace,
-        None,
-        &get_periodic_column_values(),
-        &challenges,
-    );
-    let first_row = generate_trace_block_with_cycle_id(
-        test_block(),
-        test_h(),
-        cycle_id,
-        TraceMode::Compression,
-    )
-    .rows[0];
-
-    // Row 0, aux column 16 starts with fused message slot 32 (g=0).
-    let message = fractions_at(&fractions, 0, 16)[0].1;
-    assert_eq!(
-        message,
-        challenges.encode(
-            BusId::BlakeGMessageWord as usize,
-            felt_fields([
-                first_row[g_msg_slot_col(0, 0)],
-                first_row[g_msg_slot_col(0, 1)],
-                cycle_id,
-            ]),
-        ),
-    );
-
-    // Row 0, aux column 18 starts with fused input-pair slot 36 (pair 0).
-    let input = fractions_at(&fractions, 0, 18)[0].1;
-    assert_eq!(
-        input,
-        challenges.encode(
-            BusId::BlakeGInputWord as usize,
-            felt_fields([4 * cycle_id, first_row[G_A_BASE_COL], first_row[G_A_BASE_COL + 1]]),
-        ),
-    );
-
-    // Footer row 0, aux column 8 ends with input-pair slot 17.
-    let footer = &generate_trace_block_with_cycle_id(
-        test_block(),
-        test_h(),
-        cycle_id,
-        TraceMode::Compression,
-    )
-    .rows[FOOTER_START];
-    let footer_input = fractions_at(&fractions, FOOTER_START, 8)[1].1;
-    assert_eq!(
-        footer_input,
-        challenges.encode(
-            BusId::BlakeGInputWord as usize,
-            felt_fields([
-                footer[F_HIN_SLOT_BASE_COL],
-                footer[F_HIN_SLOT_BASE_COL + 1],
-                footer[F_HIN_SLOT_BASE_COL + 2],
-            ]),
-        ),
-    );
-
-    // Footer row 0, aux column 9 starts with message-word slot 18.
-    let message_base = footer_msg_word_slot_col(0, 0);
-    let footer_message = fractions_at(&fractions, FOOTER_START, 9)[0].1;
-    assert_eq!(
-        footer_message,
-        challenges.encode(
-            BusId::BlakeGMessageWord as usize,
-            felt_fields([footer[message_base], footer[message_base + 1], cycle_id]),
-        ),
-    );
+fn lookup_air_emits_expected_aead_fraction_counts() {
+    assert_lookup_fraction_counts(BlakeGCompressionMode::AeadXof, TraceMode::AeadXof { clk: 19 });
 }
 
 #[test]
@@ -405,50 +323,409 @@ fn lookup_degree_annotations_match_air_expressions() {
 }
 
 #[test]
-fn compression_cycle_tag_distinguishes_two_cycle_cv_swap() {
-    let trace_a =
-        generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::Compression);
-    let trace_b = generate_trace_block_with_cycle_id(
-        other_test_block(),
-        other_test_h(),
-        1,
+fn compact_messages_and_derived_rotation_encode_the_original_relations() {
+    let cycle_id = 7;
+    let challenges = lookup_challenges();
+    let trace = generate_trace_block_with_cycle_id(
+        test_block(),
+        test_h(),
+        cycle_id,
         TraceMode::Compression,
     );
-    let mut tagged = BTreeMap::new();
-    let mut untagged: BTreeMap<[u64; 3], i64> = BTreeMap::new();
+    let fractions = lookup_fractions(&felt_matrix_from_rows(&trace.rows));
 
-    // Each physical cycle consumes the other cycle's CV while retaining its own identifier.
-    for (cycle_id, consumed, advertised) in [(0u64, &trace_b, &trace_a), (1, &trace_a, &trace_b)] {
-        let first = &consumed.rows[0];
-        let consumed_pairs = [
-            [first[G_A_BASE_COL], first[G_A_BASE_COL + 1]],
-            [first[G_A_BASE_COL + 2], first[G_A_BASE_COL + 3]],
-            [packed_b(first, 0), packed_b(first, 1)],
-            [packed_b(first, 2), packed_b(first, 3)],
-        ];
-        for (pair, words) in consumed_pairs.into_iter().enumerate() {
-            add_input_payload(&mut tagged, [4 * cycle_id + pair as u64, words[0], words[1]], -1);
-            *untagged.entry([pair as u64, words[0], words[1]]).or_default() -= 1;
+    for row in 0..FUSED_G_ROWS {
+        let step = fused_step_at(row).expect("row is fused");
+        for g in 0..NUM_G {
+            let expected = challenges.encode(
+                BusId::BlakeGMessageWord as usize,
+                [
+                    Felt::from_usize(step.message_indices[g]),
+                    Felt::new_unchecked(trace.rows[row][g_msg_word_col(g)]),
+                    Felt::new_unchecked(cycle_id),
+                ],
+            );
+            assert!(fractions_at(&fractions, row, 16 + g / 2).contains(&(Felt::ONE, expected)));
         }
 
-        for footer in 0..FOOTER_ROWS {
-            let row = &advertised.rows[FOOTER_START + footer];
-            let payload =
-                [footer as u64, row[F_HIN_SLOT_BASE_COL + 1], row[F_HIN_SLOT_BASE_COL + 2]];
-            add_input_payload(&mut tagged, [4 * cycle_id + payload[0], payload[1], payload[2]], 1);
-            *untagged.entry(payload).or_default() += 1;
-        }
+        let lhs =
+            trace.rows[row][g_bd_rot_slot_col(MISSING_ROTATION_G, MISSING_ROTATION_BYTE, 0)] as u8;
+        let rhs =
+            trace.rows[row][g_bd_rot_slot_col(MISSING_ROTATION_G, MISSING_ROTATION_BYTE, 1)] as u8;
+        let result =
+            blakeg_rotation_contribution(MISSING_ROTATION_BYTE, lhs, rhs, step.second_rotation);
+        let bus = match step.second_rotation {
+            12 => blakeg_rot12_bus(MISSING_ROTATION_BYTE),
+            7 => blakeg_rot7_bus(MISSING_ROTATION_BYTE),
+            _ => unreachable!(),
+        };
+        let expected = challenges
+            .encode(bus as usize, [Felt::from_u8(lhs), Felt::from_u8(rhs), Felt::from_u32(result)]);
+        assert!(fractions_at(&fractions, row, 31 / 2).contains(&(-Felt::ONE, expected)));
     }
 
-    assert!(
-        untagged.values().all(|&count| count == 0),
-        "control: anonymous bus accepts swap"
-    );
-    assert!(tagged.values().any(|&count| count != 0), "tagged bus must reject swap");
+    for footer in 0..FOOTER_ROWS {
+        let row = FOOTER_START + footer;
+        for g in 0..NUM_G {
+            let expected = challenges.encode(
+                BusId::BlakeGMessageWord as usize,
+                [
+                    Felt::from_usize(footer_message_word_index(footer, g)),
+                    Felt::new_unchecked(trace.rows[row][footer_msg_word_col(g)]),
+                    Felt::new_unchecked(cycle_id),
+                ],
+            );
+            assert!(
+                fractions_at(&fractions, row, 16 + g / 2).contains(&(-Felt::from_u8(7), expected)),
+            );
+        }
+    }
 }
 
 #[test]
-fn compression_cycle_tag_distinguishes_two_cycle_message_swap() {
+fn atomic_full_cv_encoding_is_identical_on_first_fused_and_footer_three() {
+    let cycle_id = 7;
+    let challenges = lookup_challenges();
+    let trace = generate_trace_block_with_cycle_id(
+        test_block(),
+        test_h(),
+        cycle_id,
+        TraceMode::Compression,
+    );
+    let fractions = lookup_fractions(&felt_matrix_from_rows(&trace.rows));
+    let expected = challenges.encode(BusId::BlakeGInputCv as usize, full_cv_fields(&trace.rows[0]));
+
+    let first = fractions_at(&fractions, 0, FOOTER_INPUT_COLUMN);
+    assert_eq!(first, &[(-Felt::ONE, expected)]);
+
+    let footer_row = BLOCK_PERIOD - 1;
+    assert_eq!(full_cv_fields(&trace.rows[footer_row]), full_cv_fields(&trace.rows[0]));
+    assert!(
+        fractions_at(&fractions, footer_row, FOOTER_INPUT_COLUMN).contains(&(Felt::ONE, expected)),
+    );
+}
+
+#[test]
+fn footer_input_encoding_matches_each_domain_standard_message() {
+    let challenges = lookup_challenges();
+
+    let compression = generate_trace_block_with_cycle_id(
+        test_block(),
+        test_h(),
+        0,
+        TraceMode::CompressionWithMultiplicity { multiplicity: 3 },
+    );
+    let compression_fractions = lookup_fractions(&felt_matrix_from_rows(&compression.rows));
+    let compression_fields = compression_link_fields(test_block(), test_h(), compression.final_v);
+    let expected_compression = HasherCompressionLinkMsg {
+        block: core::array::from_fn(|idx| compression_fields[idx]),
+        cv_in: core::array::from_fn(|idx| compression_fields[8 + idx]),
+        cv_out: core::array::from_fn(|idx| compression_fields[12 + idx]),
+    }
+    .encode(&challenges);
+    assert!(
+        fractions_at(&compression_fractions, BLOCK_PERIOD - 1, FOOTER_INPUT_COLUMN)
+            .contains(&(-Felt::from_u8(3), expected_compression)),
+    );
+
+    let clk = 19;
+    let aead =
+        generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::AeadXof { clk });
+    let aead_fractions = lookup_fractions(&felt_matrix_from_rows(&aead.rows));
+    let aead_fields = aead_input_fields(test_block(), test_h(), clk);
+    let expected_aead = AeadBlakeGInputMsg {
+        clk: Felt::new_unchecked(clk),
+        state: core::array::from_fn(|idx| aead_fields[idx]),
+    }
+    .encode(&challenges);
+    assert!(
+        fractions_at(&aead_fractions, BLOCK_PERIOD - 1, FOOTER_INPUT_COLUMN)
+            .contains(&(-Felt::ONE, expected_aead)),
+    );
+    assert_ne!(expected_compression, expected_aead, "bus domains must remain separated");
+}
+
+#[test]
+fn full_cv_relation_binds_all_eight_raw_words_on_both_emission_rows() {
+    let honest = generate_trace_block_with_cycle_id(
+        test_block(),
+        test_h(),
+        0,
+        TraceMode::CompressionWithMultiplicity { multiplicity: 0 },
+    );
+    let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&honest.rows));
+
+    // Zero compression multiplicity disables the external-input fraction. On footer 3 these
+    // correction cells are also outside every active narrow slot, so each footer mutation below
+    // is detected by the atomic CV relation alone.
+    for &row in &[0, BLOCK_PERIOD - 1] {
+        for &col in &F_CV_STORAGE_COLS {
+            let mut rows = honest.rows;
+            rows[row][col] += 1;
+            assert_ne!(
+                lookup_sigma(&felt_matrix_from_rows(&rows)),
+                honest_sigma,
+                "full-CV relation omitted row {row}, storage column {col}",
+            );
+        }
+    }
+}
+
+#[test]
+fn first_row_message_and_valid_carry_mutations_change_lookup_sum() {
+    let honest =
+        generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::Compression);
+    let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&honest.rows));
+
+    let mut rows = honest.rows;
+    rows[0][g_msg_word_col(0)] += 1;
+    assert_ne!(lookup_sigma(&felt_matrix_from_rows(&rows)), honest_sigma);
+
+    for g in 0..NUM_G {
+        let mut rows = honest.rows;
+        let k3 = rows[0][g_k3_col(g)];
+        let alternate = (k3 + 1) % 3;
+        rows[0][g_k3_col(g)] = alternate;
+        assert_ne!(
+            lookup_sigma(&felt_matrix_from_rows(&rows)),
+            honest_sigma,
+            "atomic CV relation did not anchor reconstructed a[{g}]",
+        );
+    }
+}
+
+#[test]
+fn derived_rotation_lookup_binds_the_omitted_next_b_transition() {
+    let honest =
+        generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::Compression);
+    let honest_fractions = lookup_fractions(&felt_matrix_from_rows(&honest.rows));
+    let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&honest.rows));
+    let derived_column = 31 / 2;
+
+    for row in 0..FUSED_G_ROWS - 1 {
+        let step = fused_step_at(row).expect("row is fused");
+        let next_step = fused_step_at(row + 1).expect("next row is fused");
+        let affected_word = step.lane_map[MISSING_ROTATION_G][1];
+        let affected_next_g = next_step
+            .lane_map
+            .iter()
+            .position(|lane| lane[1] == affected_word)
+            .expect("the affected word remains in a B lane");
+        let mut rows = honest.rows;
+
+        add_to_raw_cell(&mut rows[row + 1][g_bd_rot_slot_col(affected_next_g, 0, 0)], Felt::ONE);
+        add_to_raw_cell(&mut rows[row + 1][g_msg_word_col(affected_next_g)], -Felt::ONE);
+        let mutated = lookup_fractions(&felt_matrix_from_rows(&rows));
+        assert_ne!(
+            fractions_at(&mutated, row, derived_column),
+            fractions_at(&honest_fractions, row, derived_column),
+            "the derived tuple did not read the affected next-row B input on row {row}",
+        );
+        assert_ne!(lookup_sigma(&felt_matrix_from_rows(&rows)), honest_sigma);
+
+        // A second mutation with the opposite byte weight restores the total used by the derived
+        // tuple. The main AIR's unaffected lane transition is responsible for rejecting this case.
+        let anchored_next_g = (affected_next_g + 1) % NUM_G;
+        add_to_raw_cell(&mut rows[row + 1][g_bd_rot_slot_col(anchored_next_g, 0, 0)], -Felt::ONE);
+        add_to_raw_cell(&mut rows[row + 1][g_msg_word_col(anchored_next_g)], Felt::ONE);
+        let compensated = lookup_fractions(&felt_matrix_from_rows(&rows));
+        assert_eq!(
+            fractions_at(&compensated, row, derived_column),
+            fractions_at(&honest_fractions, row, derived_column),
+        );
+    }
+}
+
+#[test]
+fn derived_rotation_cannot_cancel_a_mutated_stored_contribution() {
+    let honest =
+        generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::Compression);
+    let honest_fractions = lookup_fractions(&felt_matrix_from_rows(&honest.rows));
+    let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&honest.rows));
+    let mut rows = honest.rows;
+
+    // Raising both terms by one leaves `next_B_sum - stored_result_sum` unchanged. The omitted
+    // tuple therefore stays honest, while the independently looked-up stored tuple must change.
+    add_to_raw_cell(&mut rows[0][g_bd_rot_slot_col(0, 0, 2)], Felt::ONE);
+    add_to_raw_cell(&mut rows[1][g_bd_rot_slot_col(0, 0, 0)], Felt::ONE);
+    add_to_raw_cell(&mut rows[1][g_msg_word_col(0)], -Felt::ONE);
+    let mutated = lookup_fractions(&felt_matrix_from_rows(&rows));
+    assert_eq!(fractions_at(&mutated, 0, 31 / 2), fractions_at(&honest_fractions, 0, 31 / 2));
+    assert_ne!(fractions_at(&mutated, 0, 16 / 2), fractions_at(&honest_fractions, 0, 16 / 2));
+    assert_ne!(lookup_sigma(&felt_matrix_from_rows(&rows)), honest_sigma);
+}
+
+#[test]
+fn derived_rotation_lookup_binds_both_uncommitted_tuple_inputs() {
+    let honest =
+        generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::Compression);
+    let honest_fractions = lookup_fractions(&felt_matrix_from_rows(&honest.rows));
+
+    for field in 0..2 {
+        let mut rows = honest.rows;
+        add_to_raw_cell(
+            &mut rows[0][g_bd_rot_slot_col(MISSING_ROTATION_G, MISSING_ROTATION_BYTE, field)],
+            Felt::ONE,
+        );
+        let mutated = lookup_fractions(&felt_matrix_from_rows(&rows));
+        assert_ne!(
+            fractions_at(&mutated, 0, 31 / 2),
+            fractions_at(&honest_fractions, 0, 31 / 2),
+            "missing tuple field {field} was not bound",
+        );
+    }
+}
+
+#[test]
+fn derived_rotation_rejects_a_compensated_last_fused_footer_mutation() {
+    let honest =
+        generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::Compression);
+    let honest_fractions = lookup_fractions(&felt_matrix_from_rows(&honest.rows));
+    let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&honest.rows));
+    let mut rows = honest.rows;
+    let affected_idx = F_FUTURE_W_WORD_INDICES
+        .iter()
+        .position(|&word_idx| word_idx == 4)
+        .expect("footer 0 carries final B word four");
+
+    add_to_raw_cell(&mut rows[FOOTER_START][footer_future_w_col(0, affected_idx)], Felt::ONE);
+    let coefficient = cv_storage_coefficient::<Felt>(7);
+    add_to_raw_cell(&mut rows[FOOTER_START][F_B_SUM_CORRECTION_COL], coefficient.inverse());
+
+    let mutated = lookup_fractions(&felt_matrix_from_rows(&rows));
+    assert_ne!(
+        fractions_at(&mutated, FUSED_G_ROWS - 1, 31 / 2),
+        fractions_at(&honest_fractions, FUSED_G_ROWS - 1, 31 / 2),
+    );
+    assert_ne!(lookup_sigma(&felt_matrix_from_rows(&rows)), honest_sigma);
+}
+
+#[test]
+fn external_input_binds_every_footer_three_payload_field() {
+    for mode in [TraceMode::Compression, TraceMode::AeadXof { clk: 19 }] {
+        let honest = generate_trace_block_with_cycle_id(test_block(), test_h(), 0, mode);
+        let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&honest.rows));
+        let row = BLOCK_PERIOD - 1;
+
+        let mut columns = Vec::new();
+        columns.extend((0..6).map(|idx| footer_r_col(FOOTER_ROWS - 1, idx)));
+        columns.extend((0..4).map(footer_msg_word_col));
+        columns.extend(F_CV_STORAGE_COLS);
+        match mode {
+            TraceMode::Compression => {
+                columns.extend((0..4).map(footer_interface_tail_col));
+            },
+            TraceMode::AeadXof { .. } => columns.push(F_INTERFACE_TAIL0_COL),
+            TraceMode::CompressionWithMultiplicity { .. } => unreachable!(),
+        }
+
+        columns.sort_unstable();
+        columns.dedup();
+        for col in columns {
+            let mut rows = honest.rows;
+            rows[row][col] += 1;
+            assert_ne!(
+                lookup_sigma(&felt_matrix_from_rows(&rows)),
+                honest_sigma,
+                "external input omitted mode {mode:?}, column {col}",
+            );
+        }
+    }
+}
+
+#[test]
+fn aead_output_batch_binds_both_pairs_on_every_footer() {
+    let periodic = get_periodic_column_values();
+    let challenges = lookup_challenges();
+    let honest = generate_trace_block_with_cycle_id(
+        test_block(),
+        test_h(),
+        0,
+        TraceMode::AeadXof { clk: 19 },
+    );
+    let honest_matrix = felt_matrix_from_rows(&honest.rows);
+    let honest_fractions = build_lookup_fractions(
+        &BlakeGCompressionLookupAir,
+        &honest_matrix,
+        None,
+        &periodic,
+        &challenges,
+    );
+
+    for footer in 0..FOOTER_ROWS {
+        let row = FOOTER_START + footer;
+        for slot in [
+            F_HIGH_EVEN_SLOT_BASE,
+            F_HIGH_ODD_SLOT_BASE,
+            F_OUTPUT_EVEN_SLOT_BASE,
+            F_OUTPUT_ODD_SLOT_BASE,
+        ] {
+            let mut rows = honest.rows;
+            rows[row][footer_xor_slot_col(slot, 0)] += 1;
+            let mutated = lookup_fractions(&felt_matrix_from_rows(&rows));
+            assert_ne!(
+                fractions_at(&mutated, row, FOOTER_OUTPUT_COLUMN),
+                fractions_at(&honest_fractions, row, FOOTER_OUTPUT_COLUMN),
+                "AEAD output slot {slot} was not bound on footer {footer}",
+            );
+        }
+    }
+}
+
+#[test]
+fn cycle_tag_rejects_two_cycle_atomic_cv_swap() {
+    let h_a = test_h();
+    let h_b = other_test_h();
+    let mut tagged: BTreeMap<[u64; 9], i64> = BTreeMap::new();
+    let mut anonymous: BTreeMap<[u64; 8], i64> = BTreeMap::new();
+
+    for (cycle_id, consumed, advertised) in [(0u64, h_b, h_a), (1, h_a, h_b)] {
+        let consumed_tagged =
+            core::array::from_fn(|idx| if idx == 0 { cycle_id } else { consumed[idx - 1] as u64 });
+        let advertised_tagged =
+            core::array::from_fn(
+                |idx| {
+                    if idx == 0 { cycle_id } else { advertised[idx - 1] as u64 }
+                },
+            );
+        *tagged.entry(consumed_tagged).or_default() -= 1;
+        *tagged.entry(advertised_tagged).or_default() += 1;
+        *anonymous.entry(consumed.map(u64::from)).or_default() -= 1;
+        *anonymous.entry(advertised.map(u64::from)).or_default() += 1;
+    }
+
+    assert!(anonymous.values().all(|&count| count == 0));
+    assert!(tagged.values().any(|&count| count != 0));
+}
+
+#[test]
+fn actual_lookup_rejects_two_cycle_atomic_cv_swap() {
+    let h_a = test_h();
+    let h_b = other_test_h();
+    let trace_a = generate_trace_block_with_cycle_id(
+        test_block(),
+        h_a,
+        0,
+        TraceMode::CompressionWithMultiplicity { multiplicity: 0 },
+    );
+    let trace_b = generate_trace_block_with_cycle_id(
+        other_test_block(),
+        h_b,
+        1,
+        TraceMode::CompressionWithMultiplicity { multiplicity: 0 },
+    );
+    let mut rows = Vec::from(trace_a.rows);
+    rows.extend(trace_b.rows);
+    let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&rows));
+
+    set_full_cv_words(&mut rows[BLOCK_PERIOD - 1], h_b);
+    set_full_cv_words(&mut rows[2 * BLOCK_PERIOD - 1], h_a);
+
+    assert_ne!(lookup_sigma(&felt_matrix_from_rows(&rows)), honest_sigma);
+}
+
+#[test]
+fn cycle_tag_rejects_two_cycle_message_swap() {
     let trace_a =
         generate_trace_block_with_cycle_id(test_block(), test_h(), 0, TraceMode::Compression);
     let trace_b = generate_trace_block_with_cycle_id(
@@ -457,81 +734,108 @@ fn compression_cycle_tag_distinguishes_two_cycle_message_swap() {
         1,
         TraceMode::Compression,
     );
-    let mut tagged = BTreeMap::new();
-    let mut untagged: BTreeMap<[u64; 2], i64> = BTreeMap::new();
+    let mut tagged: BTreeMap<[u64; 3], i64> = BTreeMap::new();
+    let mut anonymous: BTreeMap<[u64; 2], i64> = BTreeMap::new();
 
-    // Each physical cycle consumes the other cycle's message words while retaining its own ID.
     for (cycle_id, consumed, advertised) in [(0u64, &trace_b, &trace_a), (1, &trace_a, &trace_b)] {
         for row in 0..FUSED_G_ROWS {
+            let step = fused_step_at(row).expect("row is fused");
             for g in 0..NUM_G {
-                let base = g_msg_slot_col(g, 0);
-                let payload = [consumed.rows[row][base], consumed.rows[row][base + 1]];
-                add_message_payload(&mut tagged, [payload[0], payload[1], cycle_id], 1);
-                *untagged.entry(payload).or_default() += 1;
+                let payload =
+                    [step.message_indices[g] as u64, consumed.rows[row][g_msg_word_col(g)]];
+                *tagged.entry([payload[0], payload[1], cycle_id]).or_default() += 1;
+                *anonymous.entry(payload).or_default() += 1;
             }
         }
-
         for footer in 0..FOOTER_ROWS {
             let row = &advertised.rows[FOOTER_START + footer];
             for word_slot in 0..F_MSG_WORD_SLOTS {
-                let base = footer_msg_word_slot_col(word_slot, 0);
-                let payload = [row[base], row[base + 1]];
-                add_message_payload(&mut tagged, [payload[0], payload[1], cycle_id], -7);
-                *untagged.entry(payload).or_default() -= 7;
+                let payload = [
+                    footer_message_word_index(footer, word_slot) as u64,
+                    row[footer_msg_word_col(word_slot)],
+                ];
+                *tagged.entry([payload[0], payload[1], cycle_id]).or_default() -= 7;
+                *anonymous.entry(payload).or_default() -= 7;
             }
         }
     }
 
-    assert!(
-        untagged.values().all(|&count| count == 0),
-        "control: anonymous bus accepts swap"
-    );
-    assert!(tagged.values().any(|&count| count != 0), "tagged bus must reject swap");
+    assert!(anonymous.values().all(|&count| count == 0));
+    assert!(tagged.values().any(|&count| count != 0));
 }
 
 #[test]
-fn final_footer_singletons_are_mode_specific() {
-    let compression = lookup_plan(FOOTER_START + 3, BlakeGCompressionMode::Compression);
-    assert_eq!(compression.singletons.len(), 1);
-    assert_eq!(compression.singletons[0].kind, SingletonLookupKind::CompressionLink);
-    assert_eq!(compression.singletons[0].sign, -1);
-
-    let aead = lookup_plan(FOOTER_START + 3, BlakeGCompressionMode::AeadXof);
-    assert_eq!(aead.singletons.len(), 3);
-    assert_eq!(aead.singletons[0].kind, SingletonLookupKind::AeadInput);
-    assert_eq!(aead.singletons[0].sign, -1);
-    assert_eq!(LookupPlan::singleton_aux_column(aead.singletons[0].kind), AEAD_INPUT_COLUMN,);
-    assert_eq!(aead.singletons[1].kind, SingletonLookupKind::AeadLowOutputPair);
-    assert_eq!(aead.singletons[1].sign, -1);
-    assert_eq!(
-        LookupPlan::singleton_aux_column(aead.singletons[1].kind),
-        AEAD_LOW_OUTPUT_COLUMN,
+fn actual_lookup_rejects_each_two_cycle_message_swap() {
+    let h_a = test_h();
+    let h_b = other_test_h();
+    let trace_a = generate_trace_block_with_cycle_id(
+        test_block(),
+        h_a,
+        0,
+        TraceMode::CompressionWithMultiplicity { multiplicity: 0 },
     );
-    assert_eq!(aead.singletons[2].kind, SingletonLookupKind::AeadHighOutputPair);
-    assert_eq!(aead.singletons[2].sign, -1);
-    assert_eq!(
-        LookupPlan::singleton_aux_column(aead.singletons[2].kind),
-        AEAD_HIGH_OUTPUT_COLUMN,
+    let trace_b = generate_trace_block_with_cycle_id(
+        other_test_block(),
+        h_b,
+        1,
+        TraceMode::CompressionWithMultiplicity { multiplicity: 0 },
     );
-}
+    let honest_rows: Vec<_> = trace_a.rows.into_iter().chain(trace_b.rows).collect();
+    let honest_sigma = lookup_sigma(&felt_matrix_from_rows(&honest_rows));
 
-#[test]
-fn batch_two_aux_columns_pair_adjacent_narrow_lookups() {
-    let plan = lookup_plan(0, BlakeGCompressionMode::Compression);
-    assert_eq!(plan.narrow.len(), 40);
+    // Swap one footer-advertised word at a time while leaving each cycle tag in place. Swapping
+    // the corresponding range limbs keeps the anonymous range-check multiset balanced. Footer 3
+    // overlaps the linear full-CV expression, so restore its correction coordinates to keep the
+    // atomic CV relation unchanged and isolate the message-word tag.
+    for word_idx in 0..16 {
+        let footer = word_idx / F_MSG_WORD_SLOTS;
+        let word_slot = word_idx % F_MSG_WORD_SLOTS;
+        let row = FOOTER_START + footer;
+        let mut rows = honest_rows.clone();
+        let (first_cycle, second_cycle) = rows.split_at_mut(BLOCK_PERIOD);
 
-    for slot in 0..plan.narrow.len() {
-        assert_eq!(LookupPlan::narrow_aux_column(slot), slot / 2);
+        for col in [
+            footer_msg_word_col(word_slot),
+            footer_range_slot_col(2 * word_slot, 0),
+            footer_range_slot_col(2 * word_slot + 1, 0),
+        ] {
+            core::mem::swap(&mut first_cycle[row][col], &mut second_cycle[row][col]);
+        }
+
+        if footer == FOOTER_ROWS - 1 {
+            set_full_cv_words(&mut first_cycle[BLOCK_PERIOD - 1], h_a);
+            set_full_cv_words(&mut second_cycle[BLOCK_PERIOD - 1], h_b);
+        }
+
+        assert_ne!(
+            lookup_sigma(&felt_matrix_from_rows(&rows)),
+            honest_sigma,
+            "cycle-tagged message word {word_idx} accepted a two-cycle swap",
+        );
     }
-    assert_eq!(plan.narrow_aux_columns(), 20);
 }
 
 #[test]
-fn lookup_air_emits_expected_compression_fraction_counts() {
-    assert_lookup_fraction_counts(BlakeGCompressionMode::Compression, TraceMode::Compression);
-}
+fn honest_aux_accumulation_matches_reference_and_inactive_columns_are_zero() {
+    for (mode, is_aead) in [(TraceMode::Compression, false), (TraceMode::AeadXof { clk: 19 }, true)]
+    {
+        let fractions = lookup_fractions(&felt_trace_matrix(mode));
+        let (fast_aux, fast_sum) = accumulate(&fractions);
+        let (slow_aux, slow_sum) = accumulate_slow(&fractions);
+        for (col, slow_column) in slow_aux.iter().enumerate() {
+            for (row, &expected) in slow_column.iter().enumerate() {
+                assert_eq!(fast_aux.values[row * AUX_COLS + col], expected);
+            }
+        }
+        assert_eq!(fast_sum, slow_sum);
 
-#[test]
-fn lookup_air_emits_expected_aead_fraction_counts() {
-    assert_lookup_fraction_counts(BlakeGCompressionMode::AeadXof, TraceMode::AeadXof { clk: 19 });
+        for row in 0..BLOCK_PERIOD {
+            if row != 0 && row != BLOCK_PERIOD - 1 {
+                assert_eq!(fast_aux.values[row * AUX_COLS + FOOTER_INPUT_COLUMN], QuadFelt::ZERO);
+            }
+            if !(is_aead && row >= FOOTER_START) {
+                assert_eq!(fast_aux.values[row * AUX_COLS + FOOTER_OUTPUT_COLUMN], QuadFelt::ZERO);
+            }
+        }
+    }
 }

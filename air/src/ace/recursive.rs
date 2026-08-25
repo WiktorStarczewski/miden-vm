@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use miden_ace_codegen::{
-    AceConfig, AceError, FactoredCircuitFactory, LayoutKind, ShuffleEncodeBuffer,
+    AceConfig, AceError, FactoredCircuitFactory, InputLayout, LayoutKind, ShuffleEncodeBuffer,
 };
 use miden_core::{Felt, Word, crypto::hash::Eidos, field::QuadFelt};
 use miden_crypto::merkle::MerklePath;
@@ -95,6 +95,11 @@ impl RecursiveAceCircuitFactory {
     /// Quotient chunk count recorded in the factored circuit's actual READ layout.
     pub fn num_quotient_chunks(&self) -> usize {
         self.inner.factored().layout().counts.num_quotient_chunks
+    }
+
+    /// ACE READ layout shared by every recursive-verifier proof order.
+    pub fn input_layout(&self) -> &InputLayout {
+        self.inner.factored().layout()
     }
 
     /// Compute the registry leaf for one proof order without assembling its circuit.

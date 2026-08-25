@@ -100,7 +100,8 @@ internal computation provider connected by lookup arguments.
 
 ## BlakeG compression AIR
 
-`BlakeGCompressionAir` is a 128-column AIR with one 32-row block per physical compression:
+`BlakeGCompressionAir` uses 108 main columns and 20 auxiliary columns, with one 32-row block per
+physical compression:
 
 | Rows | Role |
 | ---- | ---- |
@@ -108,9 +109,12 @@ internal computation provider connected by lookup arguments.
 | 28–31 | Footer rows assembling the message, input chaining value, digest, XOF lanes, and external relations |
 
 Periodic selectors identify the G-function phase, diagonal steps, message-schedule indices, and
-each footer row. The fused rows prove u32 additions, XOR witnesses, and rotations; footer rows
-reconstruct the original block and chaining word, perform feed-forward XOR, enforce canonical
-field encodings, and expose the result.
+each footer row. The fused rows prove u32 additions, XOR witnesses, and rotations. Their input
+`a` and `c` words are reconstructed from the output words and constrained carry witnesses, then
+anchored to the initial state or preceding fused row. Footer rows reconstruct the original block
+and chaining word, perform feed-forward XOR, enforce canonical field encodings, and expose the result.
+The eight raw chaining-value words cross the cycle in one atomic, cycle-tagged internal relation;
+the sixteen message words remain independently cycle-tagged.
 
 The compression AIR has two external modes:
 
@@ -129,10 +133,10 @@ Every 32-row block carries a canonical `compression_cycle_id`:
 - the ID is constant throughout the block;
 - it increments exactly once between blocks, including padding blocks.
 
-The ID is phase-overlaid into existing fused and footer cells rather than adding a dedicated main
-column. All internal message-word and chaining-value LogUp relations include the physical ID. For
-chaining-value pairs, `(cycle_id, pair_index)` is encoded injectively as
-`4 * cycle_id + pair_index`.
+The ID occupies one shared main column throughout the 32-row block rather than being duplicated in
+every message tuple. All internal message-word and chaining-value LogUp relations include the
+physical ID. The chaining-value relation carries `(cycle_id, h[0], ..., h[7])` atomically, while
+each message-word relation carries the cycle ID directly.
 
 This binding is security-critical. Without it, internal inputs from two valid compression cycles
 could be swapped and still cancel as anonymous multisets. With it, every internal witness is tied

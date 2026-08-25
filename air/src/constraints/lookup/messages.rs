@@ -94,8 +94,8 @@ pub enum BusId {
     AceWiring = 22,
     /// Hasher compression-link bus: `[block(8), cv_in(4), cv_out(4)]`.
     HasherCompressionLink = 23,
-    /// Reserved to keep following bus ids stable.
-    ReservedHasherBus24 = 24,
+    /// BlakeG internal full chaining-value bus: `[compression_cycle_id, h[0..8]]`.
+    BlakeGInputCv = 24,
     /// Byte-pair lookup table: ordinary `[a, b, a & b]` for byte-sized operands.
     And8Lookup = 25,
     /// BlakeG rot12 contribution for byte position 0: `[a, b, contribution]`.
@@ -121,7 +121,7 @@ pub enum BusId {
     BlakeGMessageWord = 35,
     /// AEAD stream operation request: `[ctx, clk, src_ptr, dst_ptr, lane_base]`.
     AeadStreamRequest = 36,
-    /// AEAD-XOF BlakeG input request: `[clk, state[0..12]]`.
+    /// AEAD-XOF BlakeG input request: `[state[0..12], clk, 0, 0, 0]`.
     AeadBlakeGInput = 37,
     /// AEAD-XOF BlakeG output pair: `[clk, first_lane_idx, value0, value1]`.
     AeadBlakeGOutputPair = 38,
@@ -166,7 +166,7 @@ const _: () = assert!(BusId::SiblingTable as usize == 20);
 const _: () = assert!(BusId::RangeCheck as usize == 21);
 const _: () = assert!(BusId::AceWiring as usize == 22);
 const _: () = assert!(BusId::HasherCompressionLink as usize == 23);
-const _: () = assert!(BusId::ReservedHasherBus24 as usize == 24);
+const _: () = assert!(BusId::BlakeGInputCv as usize == 24);
 const _: () = assert!(BusId::And8Lookup as usize == 25);
 const _: () = assert!(BusId::BlakeGRot12Pos0 as usize == 26);
 const _: () = assert!(BusId::BlakeGRot12Pos1 as usize == 27);
@@ -637,7 +637,7 @@ pub struct AeadStreamRequestMsg<E> {
     pub lane_base: E,
 }
 
-/// AEAD-XOF BlakeG input request: `[clk, state[0..12]]`.
+/// AEAD-XOF BlakeG input request: `[state[0..12], clk, 0, 0, 0]`.
 #[derive(Clone, Debug)]
 pub struct AeadBlakeGInputMsg<E> {
     pub clk: E,
@@ -844,11 +844,13 @@ where
     EF: PrimeCharacteristicRing + Clone + Algebra<E>,
 {
     fn encode(&self, challenges: &Challenges<EF>) -> EF {
-        let fields: [E; 13] = core::array::from_fn(|i| {
-            if i == 0 {
+        let fields: [E; 16] = core::array::from_fn(|i| {
+            if i < 12 {
+                self.state[i].clone()
+            } else if i == 12 {
                 self.clk.clone()
             } else {
-                self.state[i - 1].clone()
+                E::ZERO
             }
         });
         challenges.encode(BusId::AeadBlakeGInput as usize, fields)

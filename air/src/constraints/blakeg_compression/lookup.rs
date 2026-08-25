@@ -4,12 +4,15 @@
 use alloc::vec::Vec;
 use core::borrow::Borrow;
 
-use miden_core::{Felt, field::PrimeCharacteristicRing};
+use miden_core::{
+    Felt,
+    field::{Algebra, PrimeCharacteristicRing},
+};
 #[cfg(test)]
 use miden_crypto::stark::air::WindowAccess;
 
 use super::{
-    algebra::{pack_u32_le, xor_from_and},
+    algebra::{missing_rotation_result, pack_u32_le, universal_cv_word, xor_from_and},
     layout::*,
     selectors::BlakeGSelectors,
 };
@@ -17,10 +20,11 @@ use super::{
 use crate::{constraints::lookup::MIDEN_MAX_MESSAGE_WIDTH, lookup::LookupAir};
 use crate::{
     constraints::lookup::messages::{
-        AeadBlakeGInputMsg, AeadBlakeGOutputPairMsg, BusId, HasherCompressionLinkMsg,
-        blakeg_rot7_bus, blakeg_rot12_bus,
+        AeadBlakeGOutputPairMsg, BusId, blakeg_rot7_bus, blakeg_rot12_bus,
     },
-    lookup::{Deg, LookupBuilder, LookupColumn, LookupGroup},
+    lookup::{
+        Challenges, Deg, LookupBatch, LookupBuilder, LookupColumn, LookupGroup, LookupMessage,
+    },
 };
 
 #[cfg(test)]
@@ -37,7 +41,6 @@ pub enum NarrowLookupKind {
     Rot12,
     Rot7,
     MessageWord,
-    InputPair,
     RangeCheck,
 }
 
@@ -50,7 +53,8 @@ pub struct NarrowLookup {
 
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SingletonLookupKind {
+pub enum OverlayRelationKind {
+    FullCv,
     CompressionLink,
     AeadInput,
     AeadLowOutputPair,
@@ -59,8 +63,8 @@ pub enum SingletonLookupKind {
 
 #[cfg(test)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct SingletonLookup {
-    pub kind: SingletonLookupKind,
+pub struct OverlayRelation {
+    pub kind: OverlayRelationKind,
     pub sign: i8,
 }
 
@@ -68,7 +72,7 @@ pub struct SingletonLookup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LookupPlan {
     pub narrow: Vec<NarrowLookup>,
-    pub singletons: Vec<SingletonLookup>,
+    pub overlay_relations: Vec<OverlayRelation>,
 }
 
 #[cfg(test)]
@@ -76,27 +80,71 @@ impl LookupPlan {
     pub fn narrow_aux_columns(&self) -> usize {
         self.narrow.len().div_ceil(2)
     }
-
-    pub fn narrow_aux_column(slot: usize) -> usize {
-        slot / 2
-    }
-
-    pub fn singleton_aux_column(kind: SingletonLookupKind) -> usize {
-        match kind {
-            SingletonLookupKind::CompressionLink => COMPRESSION_LINK_COLUMN,
-            SingletonLookupKind::AeadInput => AEAD_INPUT_COLUMN,
-            SingletonLookupKind::AeadLowOutputPair => AEAD_LOW_OUTPUT_COLUMN,
-            SingletonLookupKind::AeadHighOutputPair => AEAD_HIGH_OUTPUT_COLUMN,
-        }
-    }
 }
 
-/// Typed view of the 128 BlakeG compression main-trace columns.
+/// Typed view of the 108 BlakeG compression main-trace columns.
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct BlakeGCompressionCols<T> {
     /// Physical columns in the layout documented by the BlakeG compression module.
     pub columns: [T; NUM_COLS],
+}
+
+/// Mode-selected external input with a shared 16-field payload.
+///
+/// Compression and AEAD use the same `[block_or_state(8), cv_in(4), tail(4)]` field order. Only
+/// their domain-separated bus prefixes differ, so selecting the mode never multiplies a witness
+/// value and the encoded denominator remains linear.
+#[derive(Debug)]
+struct FooterInputMsg<E> {
+    mode: E,
+    block: [E; 8],
+    cv_in: [E; 4],
+    tail: [E; 4],
+}
+
+/// Cycle-tagged internal relation carrying all eight raw chaining-value words atomically.
+#[derive(Debug)]
+struct FullCvMsg<E> {
+    compression_cycle_id: E,
+    words: [E; 8],
+}
+
+impl<E, EF> LookupMessage<E, EF> for FooterInputMsg<E>
+where
+    E: PrimeCharacteristicRing,
+    EF: Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        let compression_prefix =
+            challenges.bus_prefix[BusId::HasherCompressionLink as usize].clone();
+        let aead_prefix = challenges.bus_prefix[BusId::AeadBlakeGInput as usize].clone();
+        let mut encoded =
+            compression_prefix.clone() + (aead_prefix - compression_prefix) * self.mode.clone();
+        for (idx, field) in
+            self.block.iter().chain(self.cv_in.iter()).chain(self.tail.iter()).enumerate()
+        {
+            encoded += challenges.beta_powers[idx].clone() * field.clone();
+        }
+        encoded
+    }
+}
+
+impl<E, EF> LookupMessage<E, EF> for FullCvMsg<E>
+where
+    E: PrimeCharacteristicRing,
+    EF: Algebra<E>,
+{
+    fn encode(&self, challenges: &Challenges<EF>) -> EF {
+        let fields: [E; 9] = core::array::from_fn(|idx| {
+            if idx == 0 {
+                self.compression_cycle_id.clone()
+            } else {
+                self.words[idx - 1].clone()
+            }
+        });
+        challenges.encode(BusId::BlakeGInputCv as usize, fields)
+    }
 }
 
 impl<T> Borrow<BlakeGCompressionCols<T>> for [T] {
@@ -114,17 +162,11 @@ impl<T> Borrow<BlakeGCompressionCols<T>> for [T] {
 }
 
 /// Number of lookup fractions grouped into each BlakeG auxiliary column.
-pub(crate) const BLAKEG_LOOKUP_COLUMN_SHAPE: [usize; AUX_COLS] = [
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, //
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, //
-    1, 1, 1, 1,
-];
+pub(crate) const BLAKEG_LOOKUP_COLUMN_SHAPE: [usize; AUX_COLS] = [2; AUX_COLS];
 
-pub(crate) const NARROW_BATCH_COLUMNS: usize = 20;
-pub(crate) const COMPRESSION_LINK_COLUMN: usize = 20;
-pub(crate) const AEAD_INPUT_COLUMN: usize = 21;
-pub(crate) const AEAD_LOW_OUTPUT_COLUMN: usize = 22;
-pub(crate) const AEAD_HIGH_OUTPUT_COLUMN: usize = 23;
+pub(crate) const NARROW_BATCH_COLUMNS: usize = 18;
+pub(crate) const FOOTER_INPUT_COLUMN: usize = 18;
+pub(crate) const FOOTER_OUTPUT_COLUMN: usize = 19;
 
 #[cfg(test)]
 const FOOTER_HIGH_AND8_LOOKUPS: usize = 2 * BYTES_PER_WORD;
@@ -137,14 +179,13 @@ const FOOTER_AND8_LOOKUPS: usize =
     FOOTER_HIGH_AND8_LOOKUPS + FOOTER_LOW_AND8_LOOKUPS + FOOTER_TOP_BIT_AND8_LOOKUPS;
 
 const BATCH2_DEG: Deg = Deg { v: 2, u: 2 };
-const SINGLETON_DEG: Deg = Deg { v: 2, u: 2 };
-const COMPRESSION_LINK_DEG: Deg = Deg { v: 2, u: 2 };
-
+const FOOTER_INPUT_DEG: Deg = Deg { v: 3, u: 2 };
+const FOOTER_OUTPUT_BATCH2_DEG: Deg = Deg { v: 3, u: 2 };
 fn selected_column_deg(aux_col: usize) -> Deg {
     match aux_col {
         0..NARROW_BATCH_COLUMNS => BATCH2_DEG,
-        COMPRESSION_LINK_COLUMN => COMPRESSION_LINK_DEG,
-        AEAD_INPUT_COLUMN..=AEAD_HIGH_OUTPUT_COLUMN => SINGLETON_DEG,
+        FOOTER_INPUT_COLUMN => FOOTER_INPUT_DEG,
+        FOOTER_OUTPUT_COLUMN => FOOTER_OUTPUT_BATCH2_DEG,
         _ => unreachable!("32-row BlakeG lookup aux column out of range"),
     }
 }
@@ -182,11 +223,12 @@ where
     fn eval(&self, builder: &mut LB) {
         let main = builder.main();
         let local: &BlakeGCompressionCols<_> = main.current_slice().borrow();
+        let next: &BlakeGCompressionCols<_> = main.next_slice().borrow();
         let periodic_values: Vec<LB::Expr> =
             builder.periodic_values().iter().map(|value| (*value).into()).collect();
         let selectors = BlakeGSelectors::new(&periodic_values, 0);
 
-        emit_lookup_columns(builder, local, &selectors);
+        emit_lookup_columns(builder, local, next, &selectors);
     }
 }
 
@@ -194,6 +236,7 @@ where
 pub(crate) fn emit_lookup_columns<LB>(
     builder: &mut LB,
     local: &BlakeGCompressionCols<LB::Var>,
+    next: &BlakeGCompressionCols<LB::Var>,
     selectors: &BlakeGSelectors<LB::Expr>,
 ) where
     LB: BlakeGCompressionLookupBuilder,
@@ -204,7 +247,7 @@ pub(crate) fn emit_lookup_columns<LB>(
             |col| {
                 col.group(
                     "blakeg_compression",
-                    |group| emit_lookup_column::<LB, _>(group, local, selectors, aux_col),
+                    |group| emit_lookup_column::<LB, _>(group, local, next, selectors, aux_col),
                     column_deg,
                 );
             },
@@ -216,6 +259,7 @@ pub(crate) fn emit_lookup_columns<LB>(
 fn emit_lookup_column<LB, G>(
     group: &mut G,
     local: &BlakeGCompressionCols<LB::Var>,
+    next: &BlakeGCompressionCols<LB::Var>,
     selectors: &BlakeGSelectors<LB::Expr>,
     aux_col: usize,
 ) where
@@ -223,9 +267,11 @@ fn emit_lookup_column<LB, G>(
     G: LookupGroup<Expr = LB::Expr, ExprEF = LB::ExprEF>,
 {
     match aux_col {
-        0..NARROW_BATCH_COLUMNS => emit_narrow_pair::<LB, G>(group, local, selectors, aux_col),
-        COMPRESSION_LINK_COLUMN..=AEAD_HIGH_OUTPUT_COLUMN => {
-            emit_footer_singletons::<LB, G>(group, local, selectors, aux_col)
+        0..NARROW_BATCH_COLUMNS => {
+            emit_narrow_pair::<LB, G>(group, local, next, selectors, aux_col)
+        },
+        FOOTER_INPUT_COLUMN..=FOOTER_OUTPUT_COLUMN => {
+            emit_footer_column::<LB, G>(group, local, selectors, aux_col)
         },
         _ => unreachable!("32-row BlakeG lookup aux column out of range"),
     }
@@ -234,6 +280,7 @@ fn emit_lookup_column<LB, G>(
 fn emit_narrow_pair<LB, G>(
     group: &mut G,
     local: &BlakeGCompressionCols<LB::Var>,
+    next: &BlakeGCompressionCols<LB::Var>,
     selectors: &BlakeGSelectors<LB::Expr>,
     aux_col: usize,
 ) where
@@ -244,8 +291,8 @@ fn emit_narrow_pair<LB, G>(
     let slot1 = slot0 + 1;
     let slot0_multiplicity = narrow_slot_multiplicity::<LB>(slot0, selectors);
     let slot1_multiplicity = narrow_slot_multiplicity::<LB>(slot1, selectors);
-    let slot0_encoding = narrow_slot_encoding::<LB, G>(&*group, local, selectors, slot0);
-    let slot1_encoding = narrow_slot_encoding::<LB, G>(&*group, local, selectors, slot1);
+    let slot0_encoding = narrow_slot_encoding::<LB, G>(&*group, local, next, selectors, slot0);
+    let slot1_encoding = narrow_slot_encoding::<LB, G>(&*group, local, next, selectors, slot1);
 
     group.selected_batch2_encoded(
         "narrow_pair",
@@ -258,7 +305,7 @@ fn emit_narrow_pair<LB, G>(
     );
 }
 
-fn emit_footer_singletons<LB, G>(
+fn emit_footer_column<LB, G>(
     group: &mut G,
     local: &BlakeGCompressionCols<LB::Var>,
     selectors: &BlakeGSelectors<LB::Expr>,
@@ -271,58 +318,66 @@ fn emit_footer_singletons<LB, G>(
     let is_f3 = selectors.is_footer_row(FOOTER_ROWS - 1);
 
     match aux_col {
-        COMPRESSION_LINK_COLUMN => {
-            // The main AIR enforces `mode * compression_multiplicity = 0` on every footer row, so
-            // multiplying by `(1 - mode)` here would be algebraically redundant and would raise the
-            // declared numerator degree by one.
-            group.insert(
-                "compression_link",
-                is_f3,
-                -c::<LB>(local, F_COMPRESSION_MULTIPLICITY_COL),
-                || compression_link_msg::<LB>(local),
-                COMPRESSION_LINK_DEG,
+        FOOTER_INPUT_COLUMN => {
+            // Both denominators are linear. The CV multiplicity has degree one and the selected
+            // external-input multiplicity has degree two, so the batched U has degree two and V
+            // has degree three. On the first fused row, and on a zero-multiplicity compression
+            // padding footer, the external-input denominator remains in the cross product with
+            // zero multiplicity. Its alpha coefficient is one, so it cannot vanish identically;
+            // cancellation is limited to the standard random-denominator bad event. This layout
+            // has at most 40 denominator factors per row, versus at most 44 in the 24-column
+            // layout. The handwritten auxiliary pin covers rows where both relations are inactive.
+            let cv_multiplicity = is_f3.clone() - selectors.is_first_fused();
+            let input_multiplicity =
+                -is_f3 * (c::<LB>(local, F_COMPRESSION_MULTIPLICITY_COL) + mode.clone());
+            group.batch(
+                "full_cv_and_external_input",
+                LB::Expr::ONE,
+                |batch| {
+                    batch.insert(
+                        "full_cv",
+                        cv_multiplicity,
+                        full_cv_msg::<LB>(local),
+                        Deg { v: 1, u: 1 },
+                    );
+                    batch.insert(
+                        "compression_or_aead_input",
+                        input_multiplicity,
+                        footer_input_msg::<LB>(local, mode),
+                        Deg { v: 2, u: 1 },
+                    );
+                },
+                FOOTER_INPUT_DEG,
             );
         },
-        AEAD_INPUT_COLUMN => {
-            group.insert("aead_input", is_f3, -mode, || aead_input_msg::<LB>(local), SINGLETON_DEG);
+        FOOTER_OUTPUT_COLUMN => {
+            // Both outputs are active together in AEAD mode. A separate handwritten extension
+            // constraint pins this auxiliary column to zero on every other row, including when
+            // either denominator is zero. Each denominator is linear and the common multiplicity
+            // has degree two, giving degree two for U and degree three for V.
+            let multiplicity = -selectors.is_footer() * mode;
+            group.batch(
+                "aead_output_pairs",
+                LB::Expr::ONE,
+                |batch| {
+                    batch.insert(
+                        "aead_low_output_pair",
+                        multiplicity.clone(),
+                        aead_output_pair_msg_for_current_footer::<LB>(local, selectors, 0),
+                        Deg { v: 2, u: 1 },
+                    );
+                    batch.insert(
+                        "aead_high_output_pair",
+                        multiplicity,
+                        aead_output_pair_msg_for_current_footer::<LB>(local, selectors, 8),
+                        Deg { v: 2, u: 1 },
+                    );
+                },
+                FOOTER_OUTPUT_BATCH2_DEG,
+            );
         },
-        AEAD_LOW_OUTPUT_COLUMN => {
-            for footer in 0..FOOTER_ROWS {
-                emit_aead_output_pair::<LB, G>(group, local, selectors, footer, mode.clone(), 0);
-            }
-        },
-        AEAD_HIGH_OUTPUT_COLUMN => {
-            for footer in 0..FOOTER_ROWS {
-                emit_aead_output_pair::<LB, G>(group, local, selectors, footer, mode.clone(), 8);
-            }
-        },
-        _ => unreachable!("32-row BlakeG singleton aux column out of range"),
+        _ => unreachable!("32-row BlakeG footer aux column out of range"),
     }
-}
-
-fn emit_aead_output_pair<LB, G>(
-    group: &mut G,
-    local: &BlakeGCompressionCols<LB::Var>,
-    selectors: &BlakeGSelectors<LB::Expr>,
-    footer: usize,
-    mode: LB::Expr,
-    lane_offset: usize,
-) where
-    LB: BlakeGCompressionLookupBuilder,
-    G: LookupGroup<Expr = LB::Expr, ExprEF = LB::ExprEF>,
-{
-    let values = if lane_offset == 0 {
-        footer_output_word::<LB>(local)
-    } else {
-        footer_high_word::<LB>(local)
-    };
-    group.insert(
-        "aead_output_pair",
-        selectors.is_footer_row(footer),
-        -mode,
-        || aead_output_pair_msg::<LB>(local, footer, lane_offset, values),
-        SINGLETON_DEG,
-    );
 }
 
 fn narrow_slot_multiplicity<LB>(slot: usize, selectors: &BlakeGSelectors<LB::Expr>) -> LB::Expr
@@ -333,13 +388,10 @@ where
     let footer = selectors.is_footer();
 
     match slot {
-        0..=16 => -(fused + footer),
-        17 => -fused + footer,
-        18..=21 => -fused - expr::<LB>(7) * footer,
-        22..=29 => -(fused + footer),
-        30..=31 => -fused,
-        32..=35 => fused,
-        36..=39 => -selectors.is_first_fused(),
+        0..=17 => -(fused + footer),
+        18..=21 | 27 | 30..=31 => -fused,
+        22..=26 | 28..=29 => -(fused + footer),
+        32..=35 => fused - expr::<LB>(7) * footer,
         _ => unreachable!("32-row BlakeG narrow slot out of range"),
     }
 }
@@ -347,6 +399,7 @@ where
 fn narrow_slot_encoding<LB, G>(
     group: &G,
     local: &BlakeGCompressionCols<LB::Var>,
+    next: &BlakeGCompressionCols<LB::Var>,
     selectors: &BlakeGSelectors<LB::Expr>,
     slot: usize,
 ) -> G::ExprEF
@@ -363,16 +416,19 @@ where
         add_rot_bus::<LB, G>(&mut encoded, group, slot, selectors);
         add_footer_overlay_slot::<LB, G>(&mut encoded, group, selectors, slot);
     } else if slot <= 35 {
-        add_bus(&mut encoded, group, BusId::BlakeGMessageWord, is_fused::<LB>(selectors));
-    } else if slot <= 39 {
-        add_bus(&mut encoded, group, BusId::BlakeGInputWord, selectors.is_first_fused());
+        add_bus(
+            &mut encoded,
+            group,
+            BusId::BlakeGMessageWord,
+            is_fused::<LB>(selectors) + selectors.is_footer(),
+        );
     } else {
         unreachable!("32-row BlakeG narrow slot out of range");
     }
 
     let activity = narrow_slot_activity::<LB>(slot, selectors);
     add_bus(&mut encoded, group, BusId::RangeCheck, LB::Expr::ONE - activity);
-    add_fields_direct(&mut encoded, group, narrow_slot_fields::<LB>(local, slot));
+    add_fields_direct(&mut encoded, group, narrow_slot_fields::<LB>(local, next, selectors, slot));
     encoded
 }
 
@@ -381,9 +437,8 @@ where
     LB: BlakeGCompressionLookupBuilder,
 {
     match slot {
-        0..=29 => is_fused::<LB>(selectors) + selectors.is_footer(),
-        30..=35 => is_fused::<LB>(selectors),
-        36..=39 => selectors.is_first_fused(),
+        0..=17 | 22..=26 | 28..=29 | 32..=35 => is_fused::<LB>(selectors) + selectors.is_footer(),
+        18..=21 | 27 | 30..=31 => is_fused::<LB>(selectors),
         _ => unreachable!("32-row BlakeG narrow slot out of range"),
     }
 }
@@ -402,13 +457,7 @@ fn add_footer_overlay_slot<LB, G>(
         16 => {
             add_bus(encoded, group, BusId::And8Lookup, branch);
         },
-        17 => {
-            add_bus(encoded, group, BusId::BlakeGInputWord, branch);
-        },
-        18..=21 => {
-            add_bus(encoded, group, BusId::BlakeGMessageWord, branch);
-        },
-        22..=29 => {
+        17 | 22..=26 | 28..=29 => {
             add_bus(encoded, group, BusId::RangeCheck, branch);
         },
         _ => {},
@@ -445,49 +494,100 @@ where
     }
 }
 
-fn compression_link_msg<LB>(
+fn footer_input_msg<LB>(
     local: &BlakeGCompressionCols<LB::Var>,
-) -> HasherCompressionLinkMsg<LB::Expr>
+    mode: LB::Expr,
+) -> FooterInputMsg<LB::Expr>
 where
     LB: BlakeGCompressionLookupBuilder,
 {
-    HasherCompressionLinkMsg {
-        block: core::array::from_fn(|i| c::<LB>(local, F_R_BASE_COL + i)),
-        cv_in: core::array::from_fn(|i| c::<LB>(local, F_C_BASE_COL + i)),
-        cv_out: core::array::from_fn(|i| c::<LB>(local, F_D_BASE_COL + i)),
+    FooterInputMsg {
+        mode,
+        block: footer_block::<LB>(local),
+        cv_in: footer_cv_in::<LB>(local),
+        tail: footer_tail::<LB>(local),
     }
 }
 
-fn aead_input_msg<LB>(local: &BlakeGCompressionCols<LB::Var>) -> AeadBlakeGInputMsg<LB::Expr>
+fn full_cv_msg<LB>(local: &BlakeGCompressionCols<LB::Var>) -> FullCvMsg<LB::Expr>
 where
     LB: BlakeGCompressionLookupBuilder,
 {
-    AeadBlakeGInputMsg {
-        clk: c::<LB>(local, F_CLK_COL),
-        state: core::array::from_fn(|i| {
-            if i < 8 {
-                c::<LB>(local, F_R_BASE_COL + i)
-            } else {
-                c::<LB>(local, F_C_BASE_COL + i - 8)
-            }
-        }),
+    FullCvMsg {
+        compression_cycle_id: c::<LB>(local, F_COMPRESSION_CYCLE_ID_COL),
+        words: core::array::from_fn(|idx| cv_word::<LB>(local, idx)),
     }
 }
 
-fn aead_output_pair_msg<LB>(
+fn footer_block<LB>(local: &BlakeGCompressionCols<LB::Var>) -> [LB::Expr; 8]
+where
+    LB: BlakeGCompressionLookupBuilder,
+{
+    core::array::from_fn(|idx| {
+        if idx < 6 {
+            c::<LB>(local, footer_r_col(FOOTER_ROWS - 1, idx))
+        } else {
+            let pair = idx - 6;
+            pack_pair::<LB>(
+                c::<LB>(local, footer_msg_word_col(2 * pair)),
+                c::<LB>(local, footer_msg_word_col(2 * pair + 1)),
+            )
+        }
+    })
+}
+
+fn footer_cv_in<LB>(local: &BlakeGCompressionCols<LB::Var>) -> [LB::Expr; 4]
+where
+    LB: BlakeGCompressionLookupBuilder,
+{
+    core::array::from_fn(|idx| {
+        pack_pair::<LB>(cv_word::<LB>(local, 2 * idx), cv_word::<LB>(local, 2 * idx + 1))
+    })
+}
+
+fn footer_tail<LB>(local: &BlakeGCompressionCols<LB::Var>) -> [LB::Expr; 4]
+where
+    LB: BlakeGCompressionLookupBuilder,
+{
+    core::array::from_fn(|idx| c::<LB>(local, footer_interface_tail_col(idx)))
+}
+
+fn cv_word<LB>(local: &BlakeGCompressionCols<LB::Var>, idx: usize) -> LB::Expr
+where
+    LB: BlakeGCompressionLookupBuilder,
+{
+    universal_cv_word(|col| c::<LB>(local, col), idx)
+}
+
+fn pack_pair<LB>(lo: LB::Expr, hi: LB::Expr) -> LB::Expr
+where
+    LB: BlakeGCompressionLookupBuilder,
+{
+    lo + expr::<LB>(1u64 << 32) * hi
+}
+
+fn aead_output_pair_msg_for_current_footer<LB>(
     local: &BlakeGCompressionCols<LB::Var>,
-    footer: usize,
+    selectors: &BlakeGSelectors<LB::Expr>,
     lane_offset: usize,
-    values: [LB::Expr; 2],
 ) -> AeadBlakeGOutputPairMsg<LB::Expr>
 where
     LB: BlakeGCompressionLookupBuilder,
 {
+    let footer_idx = selectors.is_footer_row(1)
+        + expr::<LB>(2) * selectors.is_footer_row(2)
+        + expr::<LB>(3) * selectors.is_footer_row(3);
+    let [value0, value1] = if lane_offset == 0 {
+        footer_output_word::<LB>(local)
+    } else {
+        footer_high_word::<LB>(local)
+    };
+
     AeadBlakeGOutputPairMsg {
         clk: c::<LB>(local, F_CLK_COL),
-        first_lane_idx: expr::<LB>((lane_offset + 2 * footer) as u64),
-        value0: values[0].clone(),
-        value1: values[1].clone(),
+        first_lane_idx: expr::<LB>(lane_offset as u64) + expr::<LB>(2) * footer_idx,
+        value0,
+        value1,
     }
 }
 
@@ -534,40 +634,43 @@ where
     xor_from_and(lhs, rhs, and)
 }
 
-fn first_input_pair_fields<LB>(local: &BlakeGCompressionCols<LB::Var>, pair: usize) -> [LB::Expr; 3]
-where
-    LB: BlakeGCompressionLookupBuilder,
-{
-    let word = |idx| {
-        if idx < 4 {
-            c::<LB>(local, G_A_BASE_COL + idx)
-        } else {
-            pack4::<LB>(
-                c::<LB>(local, g_bd_rot_slot_col(idx - 4, 0, 0)),
-                c::<LB>(local, g_bd_rot_slot_col(idx - 4, 1, 0)),
-                c::<LB>(local, g_bd_rot_slot_col(idx - 4, 2, 0)),
-                c::<LB>(local, g_bd_rot_slot_col(idx - 4, 3, 0)),
-            )
-        }
-    };
-
-    [
-        expr::<LB>(FOOTER_ROWS as u64) * c::<LB>(local, g_msg_slot_col(0, 2))
-            + expr::<LB>(pair as u64),
-        word(2 * pair),
-        word(2 * pair + 1),
-    ]
-}
-
-fn narrow_slot_fields<LB>(local: &BlakeGCompressionCols<LB::Var>, slot: usize) -> [LB::Expr; 3]
+fn narrow_slot_fields<LB>(
+    local: &BlakeGCompressionCols<LB::Var>,
+    next: &BlakeGCompressionCols<LB::Var>,
+    selectors: &BlakeGSelectors<LB::Expr>,
+    slot: usize,
+) -> [LB::Expr; 3]
 where
     LB: BlakeGCompressionLookupBuilder,
 {
     match slot {
-        0..=35 => fields_at::<LB>(local, byte_slot_base(0, slot)),
-        36..=39 => first_input_pair_fields::<LB>(local, slot - 36),
+        0..=30 => fields_at::<LB>(local, byte_slot_base(0, slot)),
+        31 => [
+            c::<LB>(local, g_bd_rot_slot_col(MISSING_ROTATION_G, MISSING_ROTATION_BYTE, 0)),
+            c::<LB>(local, g_bd_rot_slot_col(MISSING_ROTATION_G, MISSING_ROTATION_BYTE, 1)),
+            missing_rotation_result(|col| c::<LB>(local, col), |col| c::<LB>(next, col)),
+        ],
+        32..=35 => {
+            let g = slot - 32;
+            [
+                message_index::<LB>(selectors, g),
+                c::<LB>(local, g_msg_word_col(g)),
+                c::<LB>(local, G_COMPRESSION_CYCLE_ID_COL),
+            ]
+        },
         _ => unreachable!("32-row BlakeG narrow slot out of range"),
     }
+}
+
+fn message_index<LB>(selectors: &BlakeGSelectors<LB::Expr>, g: usize) -> LB::Expr
+where
+    LB: BlakeGCompressionLookupBuilder,
+{
+    let footer = selectors.is_footer();
+    let footer_idx = selectors.is_footer_row(1)
+        + expr::<LB>(2) * selectors.is_footer_row(2)
+        + expr::<LB>(3) * selectors.is_footer_row(3);
+    selectors.sigma_msg_index(g) + expr::<LB>(g as u64) * footer + expr::<LB>(4) * footer_idx
 }
 
 fn fields_at<LB>(local: &BlakeGCompressionCols<LB::Var>, base: usize) -> [LB::Expr; 3]
@@ -611,14 +714,17 @@ where
 pub fn lookup_plan(row: usize, mode: BlakeGCompressionMode) -> LookupPlan {
     let mut plan = LookupPlan {
         narrow: Vec::new(),
-        singletons: Vec::new(),
+        overlay_relations: Vec::new(),
     };
 
     match row_kind(row) {
         RowKind::Ab => {
             add_fused_g_lookups(&mut plan, NarrowLookupKind::Rot12);
             if row == 0 {
-                push_narrow(&mut plan, NarrowLookupKind::InputPair, -1, 4);
+                plan.overlay_relations.push(OverlayRelation {
+                    kind: OverlayRelationKind::FullCv,
+                    sign: -1,
+                });
             }
         },
         RowKind::AbDiag => add_fused_g_lookups(&mut plan, NarrowLookupKind::Rot12),
@@ -639,32 +745,38 @@ fn add_fused_g_lookups(plan: &mut LookupPlan, rotation_kind: NarrowLookupKind) {
 #[cfg(test)]
 fn add_footer_lookups(plan: &mut LookupPlan, footer: usize, mode: BlakeGCompressionMode) {
     push_narrow(plan, NarrowLookupKind::And8, -1, FOOTER_AND8_LOOKUPS);
-    push_narrow(plan, NarrowLookupKind::InputPair, 1, 1);
     push_narrow(plan, NarrowLookupKind::MessageWord, -7, F_MSG_WORD_SLOTS);
     push_narrow(plan, NarrowLookupKind::RangeCheck, -1, F_RANGE_SLOTS);
+
+    if footer == FOOTER_ROWS - 1 {
+        plan.overlay_relations.push(OverlayRelation {
+            kind: OverlayRelationKind::FullCv,
+            sign: 1,
+        });
+    }
 
     match mode {
         BlakeGCompressionMode::Compression => {
             if footer == FOOTER_ROWS - 1 {
-                plan.singletons.push(SingletonLookup {
-                    kind: SingletonLookupKind::CompressionLink,
+                plan.overlay_relations.push(OverlayRelation {
+                    kind: OverlayRelationKind::CompressionLink,
                     sign: -1,
                 });
             }
         },
         BlakeGCompressionMode::AeadXof => {
             if footer == FOOTER_ROWS - 1 {
-                plan.singletons.push(SingletonLookup {
-                    kind: SingletonLookupKind::AeadInput,
+                plan.overlay_relations.push(OverlayRelation {
+                    kind: OverlayRelationKind::AeadInput,
                     sign: -1,
                 });
             }
-            plan.singletons.push(SingletonLookup {
-                kind: SingletonLookupKind::AeadLowOutputPair,
+            plan.overlay_relations.push(OverlayRelation {
+                kind: OverlayRelationKind::AeadLowOutputPair,
                 sign: -1,
             });
-            plan.singletons.push(SingletonLookup {
-                kind: SingletonLookupKind::AeadHighOutputPair,
+            plan.overlay_relations.push(OverlayRelation {
+                kind: OverlayRelationKind::AeadHighOutputPair,
                 sign: -1,
             });
         },

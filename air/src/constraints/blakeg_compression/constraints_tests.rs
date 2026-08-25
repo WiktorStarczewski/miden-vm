@@ -2,16 +2,20 @@ use alloc::vec::Vec;
 
 use miden_core::field::{Field, PrimeCharacteristicRing, QuadFelt};
 use miden_crypto::stark::{
-    air::{AirBuilder, ExtensionBuilder, PermutationAirBuilder, RowWindow},
+    air::{AirBuilder, ConstraintDegrees, ExtensionBuilder, PermutationAirBuilder, RowWindow},
     matrix::RowMajorMatrix,
 };
 
 use super::{
-    constraints::{enforce_footer_rows, enforce_fused_rows},
+    constraints::{
+        enforce_footer_rows, enforce_fused_rows, enforce_inactive_footer_input_aux,
+        enforce_inactive_footer_output_aux,
+    },
     layout::*,
+    lookup::{FOOTER_INPUT_COLUMN, FOOTER_OUTPUT_COLUMN},
     model::initial_working_state,
     periodic::get_periodic_column_values,
-    schedule::BLAKEG_IV,
+    schedule::{BLAKEG_IV, G_IDX_DIAG, fused_step_at},
     selectors::BlakeGSelectors,
     trace::{
         BlakeGFeltRow, TraceMode, generate_felt_trace_block,
@@ -19,7 +23,10 @@ use super::{
         generate_felt_trace_block_with_initial_state_for_test, rewrite_felt_footer_for_test,
     },
 };
-use crate::Felt;
+use crate::{
+    Felt, HandwrittenMidenAir, MidenAir,
+    lookup::{ConstraintLookupBuilder, LookupAir},
+};
 
 struct ConstraintEvalBuilder {
     main: RowMajorMatrix<Felt>,
@@ -28,9 +35,91 @@ struct ConstraintEvalBuilder {
     permutation_values: Vec<QuadFelt>,
     periodic_values: Vec<Felt>,
     evaluations: Vec<Felt>,
+    extension_evaluations: Vec<QuadFelt>,
     preprocessed_window: RowWindow<'static, Felt>,
     is_first_row: Felt,
     is_last_row: Felt,
+}
+
+#[test]
+fn handwritten_constraint_degree_remains_three() {
+    let air = HandwrittenMidenAir(MidenAir::BlakeGCompression);
+    let degree = ConstraintDegrees::from_air::<Felt, QuadFelt, _>(&air);
+    assert_eq!(degree, ConstraintDegrees { base: 3, ext: 3 });
+}
+
+#[test]
+fn footer_input_aux_is_pinned_outside_full_cv_rows() {
+    let row = [Felt::ZERO; NUM_COLS];
+
+    for row_idx in 0..BLOCK_PERIOD {
+        let mut builder =
+            ConstraintEvalBuilder::new(&row, &row, periodic_row(row_idx), row_idx, BLOCK_PERIOD);
+        builder.aux.values[FOOTER_INPUT_COLUMN] = QuadFelt::ONE;
+        let selectors = BlakeGSelectors::<Felt>::new(builder.periodic_values(), 0);
+
+        enforce_inactive_footer_input_aux(&mut builder, &selectors);
+
+        assert_eq!(builder.extension_evaluations.len(), 1);
+        let expected = if row_idx == 0 || row_idx == BLOCK_PERIOD - 1 {
+            QuadFelt::ZERO
+        } else {
+            QuadFelt::ONE
+        };
+        assert_eq!(builder.extension_evaluations[0], expected, "row {row_idx}");
+    }
+}
+
+#[test]
+fn footer_output_aux_is_pinned_outside_aead_footers() {
+    for mode in [Felt::ZERO, Felt::ONE] {
+        for row_idx in 0..BLOCK_PERIOD {
+            let mut row = [Felt::ZERO; NUM_COLS];
+            row[F_MODE_COL] = mode;
+            let mut builder = ConstraintEvalBuilder::new(
+                &row,
+                &row,
+                periodic_row(row_idx),
+                row_idx,
+                BLOCK_PERIOD,
+            );
+            builder.aux.values[FOOTER_OUTPUT_COLUMN] = QuadFelt::ONE;
+            let selectors = BlakeGSelectors::<Felt>::new(builder.periodic_values(), 0);
+
+            enforce_inactive_footer_output_aux(&mut builder, &row, &selectors);
+
+            assert_eq!(builder.extension_evaluations.len(), 1);
+            let is_active = mode == Felt::ONE && row_idx >= FOOTER_START;
+            let expected = QuadFelt::from_bool(!is_active);
+            assert_eq!(builder.extension_evaluations[0], expected, "mode {mode}, row {row_idx}");
+        }
+    }
+}
+
+#[test]
+fn inactive_footer_aux_pins_close_zero_denominator_rows() {
+    // With alpha = beta = 0 and an all-zero fused row, both footer-column denominators are zero.
+    // Their zero multiplicities therefore make the generic cross-multiplied constraints vacuous.
+    // The handwritten inactive-row pins must still reject nonzero auxiliary cells.
+    let row = [Felt::ZERO; NUM_COLS];
+    let mut builder = ConstraintEvalBuilder::new(&row, &row, periodic_row(1), 1, BLOCK_PERIOD);
+    builder.aux.values[FOOTER_INPUT_COLUMN] = QuadFelt::ONE;
+    builder.aux.values[FOOTER_OUTPUT_COLUMN] = QuadFelt::ONE;
+
+    let air = MidenAir::BlakeGCompression;
+    let mut lookup_builder = ConstraintLookupBuilder::new(&mut builder, &air);
+    LookupAir::eval(&air, &mut lookup_builder);
+
+    // Column zero emits its anchor and recurrence; every later column emits one constraint.
+    assert_eq!(builder.extension_evaluations.len(), AUX_COLS + 1);
+    assert_eq!(builder.extension_evaluations[FOOTER_INPUT_COLUMN + 1], QuadFelt::ZERO);
+    assert_eq!(builder.extension_evaluations[FOOTER_OUTPUT_COLUMN + 1], QuadFelt::ZERO);
+
+    let selectors = BlakeGSelectors::<Felt>::new(builder.periodic_values(), 0);
+    enforce_inactive_footer_input_aux(&mut builder, &selectors);
+    enforce_inactive_footer_output_aux(&mut builder, &row, &selectors);
+
+    assert_eq!(&builder.extension_evaluations[AUX_COLS + 1..], &[QuadFelt::ONE, QuadFelt::ONE]);
 }
 
 impl ConstraintEvalBuilder {
@@ -47,15 +136,24 @@ impl ConstraintEvalBuilder {
 
         Self {
             main: RowMajorMatrix::new(main, NUM_COLS),
-            aux: RowMajorMatrix::new(vec![QuadFelt::ZERO; 2], 1),
+            aux: RowMajorMatrix::new(vec![QuadFelt::ZERO; 2 * AUX_COLS], AUX_COLS),
             randomness: vec![QuadFelt::ZERO; 2],
             permutation_values: vec![QuadFelt::ZERO],
             periodic_values,
             evaluations: Vec::new(),
+            extension_evaluations: Vec::new(),
             preprocessed_window: RowWindow::from_two_rows(&[], &[]),
             is_first_row: Felt::from_bool(row_idx == 0),
             is_last_row: Felt::from_bool(row_idx + 1 == trace_len),
         }
+    }
+
+    fn into_base_evaluations(self) -> Vec<Felt> {
+        assert!(
+            self.extension_evaluations.is_empty(),
+            "BlakeG base-constraint tests must not emit extension-field constraints",
+        );
+        self.evaluations
     }
 }
 
@@ -111,11 +209,11 @@ impl ExtensionBuilder for ConstraintEvalBuilder {
     type ExprEF = QuadFelt;
     type VarEF = QuadFelt;
 
-    fn assert_zero_ext<I>(&mut self, _x: I)
+    fn assert_zero_ext<I>(&mut self, x: I)
     where
         I: Into<Self::ExprEF>,
     {
-        panic!("BlakeG base-constraint tests must not emit extension-field constraints");
+        self.extension_evaluations.push(x.into());
     }
 }
 
@@ -191,7 +289,7 @@ fn eval_fused_row(local: &[Felt; NUM_COLS], next: &[Felt; NUM_COLS], row_idx: us
         ConstraintEvalBuilder::new(local, next, periodic_row(row_idx), row_idx, BLOCK_PERIOD);
     let selectors = BlakeGSelectors::<Felt>::new(builder.periodic_values(), 0);
     enforce_fused_rows(&mut builder, local, next, &selectors);
-    builder.evaluations
+    builder.into_base_evaluations()
 }
 
 fn eval_footer_row(local: &[Felt; NUM_COLS], next: &[Felt; NUM_COLS], row_idx: usize) -> Vec<Felt> {
@@ -199,7 +297,7 @@ fn eval_footer_row(local: &[Felt; NUM_COLS], next: &[Felt; NUM_COLS], row_idx: u
         ConstraintEvalBuilder::new(local, next, periodic_row(row_idx), row_idx, BLOCK_PERIOD);
     let selectors = BlakeGSelectors::<Felt>::new(builder.periodic_values(), 0);
     enforce_footer_rows(&mut builder, local, next, &selectors);
-    builder.evaluations
+    builder.into_base_evaluations()
 }
 
 fn eval_main_row(trace: &[BlakeGFeltRow], row_idx: usize) -> Vec<Felt> {
@@ -211,7 +309,7 @@ fn eval_main_row(trace: &[BlakeGFeltRow], row_idx: usize) -> Vec<Felt> {
     let selectors = BlakeGSelectors::<Felt>::new(builder.periodic_values(), 0);
     enforce_fused_rows(&mut builder, local, next, &selectors);
     enforce_footer_rows(&mut builder, local, next, &selectors);
-    builder.evaluations
+    builder.into_base_evaluations()
 }
 
 fn two_cycle_trace(second_cycle_id: u64) -> Vec<BlakeGFeltRow> {
@@ -256,52 +354,37 @@ fn rewrite_footer_d_prefix(trace: &mut [BlakeGFeltRow], footer: usize) {
     let masked_odd = out_odd - (top_bit << 24);
     let packed = Felt::from_u32(out_even) + Felt::from_u64(1 << 32) * Felt::from_u32(masked_odd);
 
-    for row in trace.iter_mut().skip(origin) {
-        row[F_D_BASE_COL + footer] = packed;
+    for later_footer in footer..FOOTER_ROWS {
+        trace[FOOTER_START + later_footer][footer_interface_tail_col(footer)] = packed;
     }
 }
 
 #[test]
 fn air_constraint_mutation_matrix_rejects_each_witness_family() {
     let cases = [
-        ("message index", 0, g_msg_slot_col(0, 0), 0),
-        ("message word", 0, g_msg_slot_col(0, 1), 0),
-        ("message cycle id", 0, g_msg_slot_col(1, 2), 0),
-        ("input a", 0, G_A_BASE_COL, 0),
-        ("input c / IV", 0, G_C_BASE_COL, 0),
-        ("k3 bit 0", 0, G_K3_BIT0_BASE_COL, 0),
-        ("k3 bit 1", 0, G_K3_BIT1_BASE_COL, 0),
+        ("message cycle id", 0, G_COMPRESSION_CYCLE_ID_COL, 0),
         ("k2", 0, G_K2_BASE_COL, 0),
         ("AC lhs", 0, g_ac_byte_slot_col(0, 0, 0), 0),
         ("AC rhs", 0, g_ac_byte_slot_col(0, 0, 1), 0),
         ("AC and", 0, g_ac_byte_slot_col(0, 0, 2), 0),
-        ("BD lhs", 0, g_bd_rot_slot_col(0, 0, 0), 0),
         ("BD rhs", 0, g_bd_rot_slot_col(0, 0, 1), 0),
         ("BD contribution", 0, g_bd_rot_slot_col(0, 0, 2), 0),
-        ("fused transition", 1, G_A_BASE_COL, 0),
-        ("footer bridge", FOOTER_START, F_FUTURE_W_BASE_COL, FUSED_G_ROWS - 1),
+        ("fused transition", 1, g_ac_byte_slot_col(0, 0, 1), 0),
+        ("footer bridge", FOOTER_START, footer_future_w_col(0, 0), FUSED_G_ROWS - 1),
+        ("footer B-sum bridge", FOOTER_START, F_B_SUM_CORRECTION_COL, FUSED_G_ROWS - 1),
         ("footer xor duplicate", FOOTER_START, footer_xor_slot_col(8, 1), FOOTER_START),
         ("footer top byte", FOOTER_START, F_TOP_BIT_SLOT_BASE_COL, FOOTER_START),
-        ("footer HIN tag", FOOTER_START, F_HIN_SLOT_BASE_COL, FOOTER_START),
-        ("footer HIN value", FOOTER_START, F_HIN_SLOT_BASE_COL + 1, FOOTER_START),
-        (
-            "footer message index",
-            FOOTER_START,
-            footer_msg_word_slot_col(0, 0),
-            FOOTER_START,
-        ),
-        (
-            "footer message cycle id",
-            FOOTER_START,
-            footer_msg_word_slot_col(0, 2),
-            FOOTER_START,
-        ),
+        ("footer CV correction", FOOTER_START, F_CV_STORAGE_COLS[0], FOOTER_START),
+        ("footer message word", FOOTER_START, footer_msg_word_col(0), FOOTER_START),
         ("footer range limb", FOOTER_START, footer_range_slot_col(0, 0), FOOTER_START),
         ("footer range padding", FOOTER_START, footer_range_slot_col(0, 1), FOOTER_START),
-        ("footer R", FOOTER_START, F_R_BASE_COL, FOOTER_START),
-        ("footer C", FOOTER_START, F_C_BASE_COL, FOOTER_START),
-        ("footer D", FOOTER_START, F_D_BASE_COL, FOOTER_START),
-        ("footer future-W tail", FOOTER_START, F_FUTURE_W_BASE_COL + 11, FOOTER_START),
+        (
+            "footer interface tail",
+            FOOTER_START,
+            footer_interface_tail_col(0),
+            FOOTER_START,
+        ),
+        ("footer future-W tail", FOOTER_START, footer_future_w_col(0, 11), FOOTER_START),
         ("footer R canonical inverse", FOOTER_START, F_R_CANON_INV_BASE_COL, FOOTER_START),
         ("footer R canonical zero", FOOTER_START, F_R_CANON_Z_BASE_COL, FOOTER_START),
         ("footer C canonical inverse", FOOTER_START, F_C_CANON_INV_COL, FOOTER_START),
@@ -346,16 +429,8 @@ fn air_constraints_accept_two_consecutive_compression_cycles() {
 #[test]
 fn air_constraints_pin_first_compression_cycle_id_to_zero() {
     let mut trace = two_cycle_trace(2);
-    for row in trace.iter_mut().take(FUSED_G_ROWS) {
-        for g in 0..NUM_G {
-            row[g_msg_slot_col(g, 2)] = Felt::ONE;
-        }
-    }
-    for row in trace.iter_mut().take(BLOCK_PERIOD).skip(FOOTER_START) {
+    for row in trace.iter_mut().take(BLOCK_PERIOD) {
         row[F_COMPRESSION_CYCLE_ID_COL] = Felt::ONE;
-        for word_slot in 0..F_MSG_WORD_SLOTS {
-            row[footer_msg_word_slot_col(word_slot, 2)] = Felt::ONE;
-        }
     }
 
     assert_any_nonzero(&eval_main_row(&trace, 0));
@@ -364,7 +439,7 @@ fn air_constraints_pin_first_compression_cycle_id_to_zero() {
 #[test]
 fn air_constraints_reject_inconsistent_fused_cycle_id() {
     let mut trace = two_cycle_trace(1);
-    trace[5][g_msg_slot_col(1, 2)] += Felt::ONE;
+    trace[5][G_COMPRESSION_CYCLE_ID_COL] += Felt::ONE;
 
     assert_any_nonzero(&eval_main_row(&trace, 5));
 }
@@ -377,9 +452,7 @@ fn air_constraints_pin_inner_fused_cycle_id_constancy() {
     // cycle 0 borrows cycle 1's ID, while row 0, row 27, and the footer retain cycle 0's ID. Only
     // the cross-row cycle-ID constraint can reject the two discontinuities.
     for row in trace.iter_mut().take(FUSED_G_ROWS - 1).skip(1) {
-        for g in 0..NUM_G {
-            row[g_msg_slot_col(g, 2)] = Felt::ONE;
-        }
+        row[G_COMPRESSION_CYCLE_ID_COL] = Felt::ONE;
     }
 
     for row_idx in 0..trace.len() {
@@ -395,7 +468,7 @@ fn air_constraints_pin_inner_fused_cycle_id_constancy() {
 #[test]
 fn air_constraints_reject_inconsistent_footer_cycle_id() {
     let mut trace = two_cycle_trace(1);
-    trace[FOOTER_START][footer_msg_word_slot_col(1, 2)] += Felt::ONE;
+    trace[FOOTER_START][F_COMPRESSION_CYCLE_ID_COL] += Felt::ONE;
 
     assert_any_nonzero(&eval_main_row(&trace, FOOTER_START));
 }
@@ -404,9 +477,6 @@ fn air_constraints_reject_inconsistent_footer_cycle_id() {
 fn air_constraints_bind_fused_and_footer_cycle_ids() {
     let mut trace = two_cycle_trace(1);
     trace[FOOTER_START][F_COMPRESSION_CYCLE_ID_COL] += Felt::ONE;
-    for word_slot in 0..F_MSG_WORD_SLOTS {
-        trace[FOOTER_START][footer_msg_word_slot_col(word_slot, 2)] += Felt::ONE;
-    }
 
     assert_any_nonzero(&eval_main_row(&trace, FUSED_G_ROWS - 1));
 }
@@ -428,14 +498,6 @@ fn air_fused_constraints_accept_generated_trace() {
 }
 
 #[test]
-fn air_fused_constraints_reject_bad_message_index() {
-    let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    trace.rows[0][g_msg_slot_col(0, 0)] += Felt::ONE;
-
-    assert_any_nonzero(&eval_fused_row(&trace.rows[0], &trace.rows[1], 0));
-}
-
-#[test]
 fn air_fused_constraints_reject_bad_carry() {
     let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
     trace.rows[0][G_K2_BASE_COL] = Felt::new_unchecked(2);
@@ -444,60 +506,28 @@ fn air_fused_constraints_reject_bad_carry() {
 }
 
 #[test]
-fn air_fused_constraints_pin_k3_low_bit_booleanity() {
-    let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    let (row_idx, g) = (0..FUSED_G_ROWS)
-        .flat_map(|row_idx| (0..NUM_G).map(move |g| (row_idx, g)))
-        .find(|&(row_idx, g)| {
-            trace.rows[row_idx][G_K3_BIT0_BASE_COL + g] == Felt::ZERO
-                && trace.rows[row_idx][G_K3_BIT1_BASE_COL + g] == Felt::ONE
-        })
-        .expect("test trace must contain a carry of two");
-
-    // Preserve k3 = bit0 + 2 * bit1 while making only bit0 non-boolean.
-    trace.rows[row_idx][G_K3_BIT0_BASE_COL + g] = Felt::TWO;
-    trace.rows[row_idx][G_K3_BIT1_BASE_COL + g] = Felt::ZERO;
-
-    assert_any_nonzero(&eval_fused_row(&trace.rows[row_idx], &trace.rows[row_idx + 1], row_idx));
-}
-
-#[test]
-fn air_fused_constraints_pin_k3_high_bit_booleanity() {
-    let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    let (row_idx, g) = (0..FUSED_G_ROWS)
-        .flat_map(|row_idx| (0..NUM_G).map(move |g| (row_idx, g)))
-        .find(|&(row_idx, g)| {
-            trace.rows[row_idx][G_K3_BIT0_BASE_COL + g] == Felt::ONE
-                && trace.rows[row_idx][G_K3_BIT1_BASE_COL + g] == Felt::ZERO
-        })
-        .expect("test trace must contain a carry of one");
-
-    // Preserve k3 = 1 while making only bit1 non-boolean.
-    trace.rows[row_idx][G_K3_BIT0_BASE_COL + g] = Felt::ZERO;
-    trace.rows[row_idx][G_K3_BIT1_BASE_COL + g] = Felt::TWO.inverse();
-
-    assert_any_nonzero(&eval_fused_row(&trace.rows[row_idx], &trace.rows[row_idx + 1], row_idx));
-}
-
-#[test]
-fn air_fused_constraints_exclude_k3_carry_of_three() {
+fn air_fused_constraints_accept_all_ternary_k3_roots() {
     let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
     let row_idx = FUSED_G_ROWS - 1;
     let g = 0;
     let next = trace.rows[row_idx + 1];
-    let row = &mut trace.rows[row_idx];
-    let original_k3 = row[G_K3_BIT0_BASE_COL + g] + Felt::TWO * row[G_K3_BIT1_BASE_COL + g];
-    let delta = (original_k3 - Felt::from_u32(3)) * Felt::from_u64(1 << 32);
 
-    // Make both carry bits one and adjust the test-only byte witnesses so the addition and XOR
-    // equations still vanish. Since the last fused row has no fused-row transition, only the
-    // constraint excluding the impossible carry value three can reject this local witness.
-    row[G_K3_BIT0_BASE_COL + g] = Felt::ONE;
-    row[G_K3_BIT1_BASE_COL + g] = Felt::ONE;
-    row[g_ac_byte_slot_col(g, 0, 1)] += delta;
-    row[g_ac_byte_slot_col(g, 0, 2)] += delta * Felt::TWO.inverse();
+    for root in [Felt::ZERO, Felt::ONE, Felt::TWO] {
+        trace.rows[row_idx][g_k3_col(g)] = root;
+        assert_all_zero(&eval_fused_row(&trace.rows[row_idx], &next, row_idx));
+    }
+}
 
-    assert_any_nonzero(&eval_fused_row(row, &next, row_idx));
+#[test]
+fn air_fused_constraints_reject_nonternary_k3_values() {
+    let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
+    let row_idx = FUSED_G_ROWS - 1;
+    let next = trace.rows[row_idx + 1];
+
+    for invalid in [Felt::from_u32(3), Felt::from_u32(17), -Felt::ONE] {
+        trace.rows[row_idx][g_k3_col(0)] = invalid;
+        assert_any_nonzero(&eval_fused_row(&trace.rows[row_idx], &next, row_idx));
+    }
 }
 
 #[test]
@@ -529,7 +559,7 @@ fn air_fused_constraints_reject_bad_rotation_payload() {
 #[test]
 fn air_fused_constraints_reject_bad_initial_iv() {
     let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    trace.rows[0][G_C_BASE_COL] += Felt::ONE;
+    trace.rows[0][g_bd_rot_slot_col(0, 0, 1)] += Felt::ONE;
 
     assert_any_nonzero(&eval_fused_row(&trace.rows[0], &trace.rows[1], 0));
 }
@@ -561,9 +591,107 @@ fn air_fused_constraints_pin_both_initial_iv_halves() {
 #[test]
 fn air_fused_constraints_reject_bad_transition() {
     let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    trace.rows[1][G_A_BASE_COL] += Felt::ONE;
+    trace.rows[1][g_ac_byte_slot_col(0, 0, 1)] += Felt::ONE;
 
     assert_any_nonzero(&eval_fused_row(&trace.rows[0], &trace.rows[1], 0));
+}
+
+#[test]
+fn air_missing_b_transition_is_replaced_by_the_total_b_relation() {
+    let trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
+
+    for row in 0..FUSED_G_ROWS - 1 {
+        let local = &trace.rows[row];
+        let mut next = trace.rows[row + 1];
+        let step = fused_step_at(row).expect("row is fused");
+        let next_step = fused_step_at(row + 1).expect("next row is fused");
+        let affected_word = step.lane_map[MISSING_ROTATION_G][1];
+        let affected_next_g = next_step
+            .lane_map
+            .iter()
+            .position(|lane| lane[1] == affected_word)
+            .expect("the affected word remains in a B lane");
+
+        // Compensating the B input in reconstructed A isolates the intentionally omitted direct
+        // B transition. The total-B lookup remains responsible for rejecting this mutation.
+        next[g_bd_rot_slot_col(affected_next_g, 0, 0)] += Felt::ONE;
+        next[g_msg_word_col(affected_next_g)] -= Felt::ONE;
+        assert_all_zero(&eval_fused_row(local, &next, row));
+
+        // Preserving the total with another B lane cannot float both values: that lane's direct
+        // transition remains and rejects the compensated mutation.
+        let anchored_next_g = (affected_next_g + 1) % NUM_G;
+        next[g_bd_rot_slot_col(anchored_next_g, 0, 0)] -= Felt::ONE;
+        next[g_msg_word_col(anchored_next_g)] += Felt::ONE;
+        assert_any_nonzero(&eval_fused_row(local, &next, row));
+    }
+}
+
+#[test]
+fn air_last_fused_total_b_bridge_accepts_only_equal_two_sided_changes() {
+    let trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
+    let local = &trace.rows[FUSED_G_ROWS - 1];
+    let mut footer0 = trace.rows[FOOTER_START];
+    let affected_idx = F_FUTURE_W_WORD_INDICES
+        .iter()
+        .position(|&word_idx| word_idx == G_IDX_DIAG[MISSING_ROTATION_G][1])
+        .expect("footer 0 carries the affected final B word");
+
+    footer0[footer_future_w_col(0, affected_idx)] += Felt::ONE;
+    assert_any_nonzero(&eval_footer_row(local, &footer0, FUSED_G_ROWS - 1));
+
+    let coefficient = super::algebra::cv_storage_coefficient::<Felt>(7);
+    footer0[F_B_SUM_CORRECTION_COL] += coefficient.inverse();
+    assert_all_zero(&eval_footer_row(local, &footer0, FUSED_G_ROWS - 1));
+}
+
+#[test]
+fn air_reconstructed_inputs_are_anchored_on_every_fused_row() {
+    let trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
+
+    // Row zero's reconstructed `a` is anchored by the atomic cycle-tagged CV relation. Every
+    // later row's reconstructed `a` and `c` must be anchored by the immediately preceding
+    // transition. Change only a locally valid carry encoding so no booleanity constraint can mask
+    // a missing transition anchor.
+    for row_idx in 1..FUSED_G_ROWS {
+        for g in 0..NUM_G {
+            let mut forged = trace.rows[row_idx];
+            let k3 = forged[g_k3_col(g)].as_canonical_u64();
+            let alternate_k3 = (k3 + 1) % 3;
+            forged[g_k3_col(g)] = Felt::new_unchecked(alternate_k3);
+
+            let evaluations = eval_fused_row(&trace.rows[row_idx - 1], &forged, row_idx - 1);
+            assert!(
+                evaluations.iter().any(|&value| value != Felt::ZERO),
+                "reconstructed a[{g}] floated on fused row {row_idx}",
+            );
+
+            let mut forged = trace.rows[row_idx];
+            forged[G_K2_BASE_COL + g] = Felt::ONE - forged[G_K2_BASE_COL + g];
+
+            let evaluations = eval_fused_row(&trace.rows[row_idx - 1], &forged, row_idx - 1);
+            assert!(
+                evaluations.iter().any(|&value| value != Felt::ZERO),
+                "reconstructed c[{g}] floated on fused row {row_idx}",
+            );
+        }
+    }
+}
+
+#[test]
+fn air_reconstructed_c_is_anchored_by_iv_on_first_row() {
+    let trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
+
+    for g in 0..NUM_G {
+        let mut forged = trace.rows[0];
+        forged[G_K2_BASE_COL + g] = Felt::ONE - forged[G_K2_BASE_COL + g];
+
+        let evaluations = eval_fused_row(&forged, &trace.rows[1], 0);
+        assert!(
+            evaluations.iter().any(|&value| value != Felt::ZERO),
+            "initial IV did not anchor reconstructed c[{g}]",
+        );
+    }
 }
 
 #[test]
@@ -608,7 +736,7 @@ fn air_footer_constraints_accept_generated_trace() {
 #[test]
 fn air_footer_constraints_reject_bad_bridge() {
     let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    trace.rows[FOOTER_START][F_FUTURE_W_BASE_COL] += Felt::ONE;
+    trace.rows[FOOTER_START][footer_future_w_col(0, 0)] += Felt::ONE;
 
     assert_any_nonzero(&eval_footer_row(
         &trace.rows[FUSED_G_ROWS - 1],
@@ -656,52 +784,42 @@ fn air_footer_constraints_reject_bad_message_limb() {
 }
 
 #[test]
-fn air_footer_constraints_reject_bad_hin_binding() {
-    for col in F_HIN_SLOT_BASE_COL..F_HIN_SLOT_BASE_COL + 3 {
-        let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-        trace.rows[FOOTER_START][col] += Felt::ONE;
+fn air_footer_constraints_reject_bad_current_cv_binding() {
+    for footer in 0..FOOTER_ROWS {
+        for &col in &F_CV_STORAGE_COLS[2 * footer..2 * footer + 2] {
+            let mut trace =
+                generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
+            trace.rows[FOOTER_START + footer][col] += Felt::ONE;
+            let next = (FOOTER_START + footer + 1).min(BLOCK_PERIOD - 1);
 
-        assert_any_nonzero(&eval_footer_row(
-            &trace.rows[FOOTER_START],
-            &trace.rows[FOOTER_START + 1],
-            FOOTER_START,
-        ));
+            assert_any_nonzero(&eval_footer_row(
+                &trace.rows[FOOTER_START + footer],
+                &trace.rows[next],
+                FOOTER_START + footer,
+            ));
+        }
     }
 }
 
 #[test]
-fn air_footer_constraints_pin_r_c_and_d_payload_packings() {
+fn air_footer_constraints_pin_current_message_cv_and_tail_values() {
     for footer in 0..FOOTER_ROWS {
         let origin = FOOTER_START + footer;
         let columns = [
-            F_R_BASE_COL + 2 * footer,
-            F_R_BASE_COL + 2 * footer + 1,
-            F_C_BASE_COL + footer,
-            F_D_BASE_COL + footer,
+            footer_msg_word_col(0),
+            footer_msg_word_col(1),
+            F_CV_STORAGE_COLS[2 * footer],
+            F_CV_STORAGE_COLS[2 * footer + 1],
+            footer_interface_tail_col(footer),
         ];
 
         for col in columns {
             let mut trace =
                 generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
 
-            // Keep every subsequent copy consistent so that only the local packing equation at
-            // the value's introduction row rejects the witness.
-            for row in trace.rows.iter_mut().skip(origin) {
-                row[col] += Felt::ONE;
-            }
-
-            for row_idx in FOOTER_START..BLOCK_PERIOD {
-                let next_idx = (row_idx + 1).min(BLOCK_PERIOD - 1);
-                let rejected =
-                    eval_footer_row(&trace.rows[row_idx], &trace.rows[next_idx], row_idx)
-                        .iter()
-                        .any(|&value| value != Felt::ZERO);
-                assert_eq!(
-                    rejected,
-                    row_idx == origin,
-                    "column {col} had an unexpected result on footer row {row_idx}",
-                );
-            }
+            trace.rows[origin][col] += Felt::ONE;
+            let next = (origin + 1).min(BLOCK_PERIOD - 1);
+            assert_any_nonzero(&eval_footer_row(&trace.rows[origin], &trace.rows[next], origin));
         }
     }
 }
@@ -762,7 +880,7 @@ fn air_footer_constraints_pin_top_bit_mask() {
 #[test]
 fn air_footer_constraints_reject_bad_future_w_shift() {
     let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    trace.rows[FOOTER_START][F_FUTURE_W_BASE_COL] += Felt::ONE;
+    trace.rows[FOOTER_START][footer_future_w_col(0, 0)] += Felt::ONE;
 
     // Evaluate F0 directly, without the last-fused-to-F0 bridge, to isolate the footer queue shift.
     assert_any_nonzero(&eval_footer_row(
@@ -818,21 +936,22 @@ fn air_footer_constraints_pin_mode_booleanity() {
     for row_idx in FOOTER_START..BLOCK_PERIOD {
         let next_idx = (row_idx + 1).min(BLOCK_PERIOD - 1);
         let evaluations = eval_footer_row(&trace.rows[row_idx], &trace.rows[next_idx], row_idx);
-        assert_eq!(
-            evaluations.iter().filter(|&&value| value != Felt::ZERO).count(),
-            1,
-            "mode booleanity was not isolated on footer row {row_idx}",
-        );
+        assert_any_nonzero(&evaluations);
     }
 }
 
 #[test]
 fn air_footer_constraints_pin_mode_persistence() {
-    let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    for (footer, row) in trace.rows.iter_mut().skip(FOOTER_START).enumerate() {
-        row[F_MODE_COL] = Felt::from_bool(footer < FOOTER_ROWS - 1);
-        row[F_COMPRESSION_MULTIPLICITY_COL] = Felt::ZERO;
-    }
+    let mut trace =
+        generate_felt_trace_block(test_block(), test_h(), TraceMode::AeadXof { clk: 19 });
+    let footer3 = &mut trace.rows[BLOCK_PERIOD - 1];
+    footer3[F_MODE_COL] = Felt::ZERO;
+    let out_even = footer_xor_word_value(footer3, F_OUTPUT_EVEN_SLOT_BASE);
+    let out_odd = footer_xor_word_value(footer3, F_OUTPUT_ODD_SLOT_BASE);
+    let top_bit = footer3[F_TOP_BIT_SLOT_BASE_COL + 2].as_canonical_u64() as u32;
+    let masked_odd = out_odd - (top_bit << 24);
+    footer3[footer_interface_tail_col(FOOTER_ROWS - 1)] =
+        Felt::from_u32(out_even) + Felt::from_u64(1 << 32) * Felt::from_u32(masked_odd);
 
     for row_idx in FOOTER_START..BLOCK_PERIOD {
         let next_idx = (row_idx + 1).min(BLOCK_PERIOD - 1);
@@ -850,7 +969,7 @@ fn air_footer_constraints_pin_mode_persistence() {
 #[test]
 fn air_footer_constraints_reject_bad_footer_transition() {
     let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-    trace.rows[FOOTER_START + 1][F_R_BASE_COL] += Felt::ONE;
+    trace.rows[FOOTER_START + 1][footer_r_col(1, 0)] += Felt::ONE;
 
     assert_any_nonzero(&eval_footer_row(
         &trace.rows[FOOTER_START],
@@ -860,11 +979,82 @@ fn air_footer_constraints_reject_bad_footer_transition() {
 }
 
 #[test]
-fn air_footer_constraints_pin_c_and_d_persistence() {
-    for col in [F_C_BASE_COL, F_D_BASE_COL] {
+fn air_footer_state_band_pins_every_cross_row_value() {
+    let trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
+
+    for footer in 0..FOOTER_ROWS - 1 {
+        let row_idx = FOOTER_START + footer;
+        let local = &trace.rows[row_idx];
+        let next = &trace.rows[row_idx + 1];
+
+        for idx in 0..2 * footer + 2 {
+            let mut forged_next = *next;
+            forged_next[footer_r_col(footer + 1, idx)] += Felt::ONE;
+            assert!(
+                eval_footer_row(local, &forged_next, row_idx)
+                    .iter()
+                    .any(|&value| value != Felt::ZERO),
+                "footer {footer} did not carry R[{idx}]",
+            );
+        }
+
+        for idx in 0..=2 * footer + 1 {
+            let mut forged_next = *next;
+            forged_next[F_CV_STORAGE_COLS[idx]] += Felt::ONE;
+            assert!(
+                eval_footer_row(local, &forged_next, row_idx)
+                    .iter()
+                    .any(|&value| value != Felt::ZERO),
+                "footer {footer} did not carry CV[{idx}]",
+            );
+        }
+
+        for idx in 0..=footer {
+            let mut forged_next = *next;
+            forged_next[footer_interface_tail_col(idx)] += Felt::ONE;
+            assert!(
+                eval_footer_row(local, &forged_next, row_idx)
+                    .iter()
+                    .any(|&value| value != Felt::ZERO),
+                "footer {footer} did not carry interface tail[{idx}]",
+            );
+        }
+
+        for idx in 0..4 {
+            let mut forged_local = *local;
+            forged_local[footer_future_w_col(footer, idx)] += Felt::ONE;
+            assert!(
+                eval_footer_row(&forged_local, next, row_idx)
+                    .iter()
+                    .any(|&value| value != Felt::ZERO),
+                "footer {footer} did not bind consumed future-W[{idx}]",
+            );
+        }
+
+        for idx in 0..footer_future_w_indices(footer + 1).len() {
+            let mut forged_next = *next;
+            forged_next[footer_future_w_col(footer + 1, idx)] += Felt::ONE;
+            assert!(
+                eval_footer_row(local, &forged_next, row_idx)
+                    .iter()
+                    .any(|&value| value != Felt::ZERO),
+                "footer {footer} did not shift future-W[{idx}]",
+            );
+        }
+    }
+}
+
+#[test]
+fn air_footer_constraints_pin_cv_and_interface_tail_persistence() {
+    for is_cv in [true, false] {
         let mut trace = generate_felt_trace_block(test_block(), test_h(), TraceMode::Compression);
-        for row in trace.rows.iter_mut().skip(FOOTER_START + 1) {
-            row[col] += Felt::ONE;
+        for footer in 1..FOOTER_ROWS {
+            let col = if is_cv {
+                F_CV_STORAGE_COLS[0]
+            } else {
+                footer_interface_tail_col(0)
+            };
+            trace.rows[FOOTER_START + footer][col] += Felt::ONE;
         }
 
         for row_idx in FOOTER_START..BLOCK_PERIOD {
@@ -875,7 +1065,8 @@ fn air_footer_constraints_pin_c_and_d_persistence() {
             assert_eq!(
                 rejected,
                 row_idx == FOOTER_START,
-                "column {col} had an unexpected result on row {row_idx}",
+                "{} persistence had an unexpected result on row {row_idx}",
+                if is_cv { "CV" } else { "interface tail" },
             );
         }
     }
@@ -892,11 +1083,7 @@ fn air_footer_constraints_reject_aead_compression_multiplicity() {
     for row_idx in FOOTER_START..BLOCK_PERIOD {
         let next_idx = (row_idx + 1).min(BLOCK_PERIOD - 1);
         let evaluations = eval_footer_row(&trace.rows[row_idx], &trace.rows[next_idx], row_idx);
-        assert_eq!(
-            evaluations.iter().filter(|&&value| value != Felt::ZERO).count(),
-            1,
-            "AEAD multiplicity was not isolated on footer row {row_idx}",
-        );
+        assert_any_nonzero(&evaluations);
     }
 }
 

@@ -63,7 +63,10 @@ pub use constraints::{
 };
 use constraints::{
     blakeg_compression::{
-        constraints::{enforce_footer_rows, enforce_fused_rows},
+        constraints::{
+            enforce_footer_rows, enforce_fused_rows, enforce_inactive_footer_input_aux,
+            enforce_inactive_footer_output_aux,
+        },
         lookup::{BLAKEG_LOOKUP_COLUMN_SHAPE, BlakeGCompressionLookupBuilder, emit_lookup_columns},
         periodic::get_periodic_column_values,
         selectors::BlakeGSelectors,
@@ -542,6 +545,8 @@ impl BlakeGCompressionAir {
 
             enforce_fused_rows(builder, local, next, &selectors);
             enforce_footer_rows(builder, local, next, &selectors);
+            enforce_inactive_footer_input_aux(builder, &selectors);
+            enforce_inactive_footer_output_aux(builder, local, &selectors);
         }
         let mut lb = ConstraintLookupBuilder::new(builder, &MidenAir::BlakeGCompression);
         self.lookup_eval(&mut lb);
@@ -566,11 +571,12 @@ impl BlakeGCompressionAir {
     fn lookup_eval<LB: BlakeGCompressionLookupBuilder>(self, builder: &mut LB) {
         let main = builder.main();
         let local: &BlakeGCompressionCols<_> = main.current_slice().borrow();
+        let next: &BlakeGCompressionCols<_> = main.next_slice().borrow();
         let periodic_values: Vec<LB::Expr> =
             builder.periodic_values().iter().map(|value| (*value).into()).collect();
         let selectors = BlakeGSelectors::new(&periodic_values, 0);
 
-        emit_lookup_columns(builder, local, &selectors);
+        emit_lookup_columns(builder, local, next, &selectors);
     }
 
     fn lookup_eval_boundary<B: BoundaryBuilder>(self, _boundary: &mut B) {}

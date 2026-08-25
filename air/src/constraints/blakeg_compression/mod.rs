@@ -8,10 +8,9 @@
 //!
 //! Every cycle carries a canonical `compression_cycle_id`: the first cycle is zero, the value is
 //! constant over all 32 rows, and it increments between cycles. Every internal message-word and
-//! chaining-value binding includes that identity. For the chaining-value bus, the cycle and pair
-//! are packed injectively as `4 * compression_cycle_id + pair_index`; message-word slots carry the
-//! ID directly. This prevents inputs from one physical compression from satisfying the internal
-//! lookups of another.
+//! chaining-value binding includes that identity. The chaining-value relation carries all eight
+//! raw words atomically; message-word slots carry the ID directly. This prevents inputs from one
+//! physical compression from satisfying the internal lookups of another.
 //!
 //! The Miden VM instantiates this module as its native compression AIR. The processor constructs
 //! the same 32-row blocks through the public trace-writing API exported below.

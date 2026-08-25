@@ -44,6 +44,16 @@ fn pvm_layout_const(name: &str) -> u32 {
     u32::try_from(value).expect("PVM layout pointer must fit in u32")
 }
 
+fn vm_layout_const(name: &str) -> u32 {
+    let source = include_str!("../../asm/sys/vm/layout.masm");
+    let prefix = format!("const {name} = ");
+    let value = source
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix)?.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("missing generated VM layout constant {name}"));
+    u32::try_from(value).expect("VM layout pointer must fit in u32")
+}
+
 // RECURSIVE VERIFIER TESTS
 // ================================================================================================
 

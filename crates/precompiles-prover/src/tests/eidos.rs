@@ -10,7 +10,8 @@ use miden_air::{
         debug::{check_trace_balance, trace::BalanceReport},
     },
     trace::blakeg_compression::{
-        TraceMode as MvmTraceMode, generate_felt_trace_block as generate_mvm_block,
+        self as mvm_blakeg, TraceMode as MvmTraceMode,
+        generate_felt_trace_block as generate_mvm_block,
     },
 };
 use miden_core::{
@@ -33,10 +34,13 @@ use crate::{
         COL_REMAINING, EidosCap, EidosDigest, EidosInMsg, EidosOutMsg, NUM_AUX_COLS, NUM_MAIN_COLS,
         blakeg::{
             layout::{
-                BLOCK_PERIOD as BLAKEG_COMPRESSION_CYCLE_LEN, BYTE_SLOT_WIDTH, F_D_BASE_COL,
-                F_MSG_GROUP_BASE_COL, F_MSG_GROUP_SLOTS, F_R_BASE_COL, F_R_CANON_INV_BASE_COL,
-                F_R_CANON_Z_BASE_COL, FOOTER_ROWS, FOOTER_START,
-                NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS, g_msg_slot_col,
+                BLOCK_PERIOD as BLAKEG_COMPRESSION_CYCLE_LEN, BYTE_SLOT_WIDTH, F_C_BASE_COL,
+                F_C_CANON_INV_COL, F_C_CANON_Z_COL, F_COMPRESSION_CYCLE_ID_COL, F_D_BASE_COL,
+                F_FUTURE_W_BASE_COL, F_HIN_SLOT_BASE_COL, F_MSG_GROUP_BASE_COL, F_MSG_GROUP_SLOTS,
+                F_R_BASE_COL, F_R_CANON_INV_BASE_COL, F_R_CANON_Z_BASE_COL, FOOTER_ROWS,
+                FOOTER_START, G_A_BASE_COL, G_C_BASE_COL, G_K2_BASE_COL, G_K3_BIT0_BASE_COL,
+                G_K3_BIT1_BASE_COL, NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS,
+                footer_future_w_indices, g_bd_rot_slot_col, g_msg_slot_col,
             },
             trace::{
                 BlakeGFeltTraceBlock, generate_felt_trace_block_with_cycle_id,
@@ -458,8 +462,13 @@ fn pvm_trace_writer_rejects_noncanonical_packed_input() {
 }
 
 #[test]
-fn mvm_and_pvm_writers_agree_on_every_shared_blakeg_cell() {
-    const MVM_ONLY_FOOTER_COLS: [usize; 3] = [124, 126, 127];
+fn mvm_and_pvm_writers_agree_on_shared_blakeg_witness() {
+    const TWO_POW_32: Felt = Felt::new_unchecked(1 << 32);
+    const MISSING_ROTATION_G: usize = mvm_blakeg::NUM_G - 1;
+    const MISSING_ROTATION_BYTE: usize = mvm_blakeg::BYTES_PER_WORD - 1;
+
+    assert_eq!(NUM_BLAKEG_COMPRESSION_COLS, 128);
+    assert_eq!(mvm_blakeg::NUM_BLAKEG_COMPRESSION_COLS, 108);
 
     for case in 0..16_u32 {
         let block = core::array::from_fn(|i| {
@@ -476,14 +485,157 @@ fn mvm_and_pvm_writers_agree_on_every_shared_blakeg_cell() {
         let mvm = generate_mvm_block(block, cv, MvmTraceMode::Compression);
 
         assert_eq!(pvm.final_v, mvm.final_v, "final working state differs in case {case}");
-        for row in 0..BLAKEG_COMPRESSION_CYCLE_LEN {
-            for col in 0..NUM_BLAKEG_COMPRESSION_COLS {
-                if row >= FOOTER_START && MVM_ONLY_FOOTER_COLS.contains(&col) {
-                    continue;
-                }
+
+        for row in 0..FOOTER_START {
+            for col in 0..mvm_blakeg::g_msg_word_col(0) {
                 assert_eq!(
                     pvm.rows[row][col], mvm.rows[row][col],
-                    "MVM/PVM BlakeG trace mismatch in case {case}, row {row}, column {col}",
+                    "MVM/PVM shared fused cell mismatch in case {case}, row {row}, column {col}",
+                );
+            }
+
+            // The MVM omits this result cell and reconstructs it from the next-row B total.
+            let next_b_sum = (0..mvm_blakeg::NUM_G).fold(Felt::ZERO, |sum, g| {
+                sum + (0..mvm_blakeg::BYTES_PER_WORD).fold(Felt::ZERO, |word, byte| {
+                    word + Felt::new_unchecked(1 << (8 * byte))
+                        * mvm.rows[row + 1][mvm_blakeg::g_bd_rot_slot_col(g, byte, 0)]
+                })
+            });
+            let stored_rotation_sum = (0..mvm_blakeg::NUM_G).fold(Felt::ZERO, |sum, g| {
+                sum + (0..mvm_blakeg::BYTES_PER_WORD).fold(Felt::ZERO, |word, byte| {
+                    match mvm_blakeg::g_bd_rot_result_col(g, byte) {
+                        Some(col) => word + mvm.rows[row][col],
+                        None => word,
+                    }
+                })
+            });
+            assert_eq!(
+                pvm.rows[row][g_bd_rot_slot_col(MISSING_ROTATION_G, MISSING_ROTATION_BYTE, 2)],
+                next_b_sum - stored_rotation_sum,
+                "MVM-derived/PVM-stored rotation mismatch in case {case}, row {row}",
+            );
+
+            assert_eq!(
+                &pvm.rows[row][G_K2_BASE_COL..G_K2_BASE_COL + 4],
+                &mvm.rows[row][mvm_blakeg::G_K2_BASE_COL..mvm_blakeg::G_K2_BASE_COL + 4],
+                "MVM/PVM carry mismatch in case {case}, row {row}",
+            );
+
+            for g in 0..4 {
+                let pack_slot_field = |column: fn(usize, usize, usize) -> usize, field| {
+                    (0..4).fold(Felt::ZERO, |value, byte| {
+                        value
+                            + Felt::new_unchecked(1 << (8 * byte))
+                                * mvm.rows[row][column(g, byte, field)]
+                    })
+                };
+                let a_new = pack_slot_field(mvm_blakeg::g_ac_byte_slot_col, 1);
+                let b = pack_slot_field(mvm_blakeg::g_bd_rot_slot_col, 0);
+                let msg = mvm.rows[row][mvm_blakeg::g_msg_word_col(g)];
+                let k3 = mvm.rows[row][mvm_blakeg::g_k3_col(g)];
+                let pvm_k3 = pvm.rows[row][G_K3_BIT0_BASE_COL + g]
+                    + Felt::from_u8(2) * pvm.rows[row][G_K3_BIT1_BASE_COL + g];
+                assert_eq!(pvm_k3, k3, "MVM/PVM k3 mismatch in case {case}, row {row}, G {g}");
+                assert_eq!(
+                    pvm.rows[row][G_A_BASE_COL + g],
+                    a_new + TWO_POW_32 * k3 - b - msg,
+                    "MVM reconstruction of PVM a input failed in case {case}, row {row}, G {g}",
+                );
+
+                let c_new = pack_slot_field(mvm_blakeg::g_bd_rot_slot_col, 1);
+                let xor_word = (0..4).fold(0_u32, |word, byte| {
+                    let base = mvm_blakeg::g_ac_byte_slot_col(g, byte, 0);
+                    let lhs = mvm.rows[row][base].as_canonical_u64() as u8;
+                    let rhs = mvm.rows[row][base + 1].as_canonical_u64() as u8;
+                    word | (u32::from(lhs ^ rhs) << (8 * byte))
+                });
+                let first_rotation = if row % 2 == 0 { 16 } else { 8 };
+                let d_new = Felt::from_u32(xor_word.rotate_right(first_rotation));
+                let k2 = mvm.rows[row][mvm_blakeg::G_K2_BASE_COL + g];
+                assert_eq!(
+                    pvm.rows[row][G_C_BASE_COL + g],
+                    c_new + TWO_POW_32 * k2 - d_new,
+                    "MVM reconstruction of PVM c input failed in case {case}, row {row}, G {g}",
+                );
+            }
+        }
+
+        for footer in 0..FOOTER_ROWS {
+            let row = FOOTER_START + footer;
+            for col in 0..F_HIN_SLOT_BASE_COL {
+                assert_eq!(
+                    pvm.rows[row][col], mvm.rows[row][col],
+                    "MVM/PVM shared footer cell mismatch in case {case}, footer {footer}, column {col}",
+                );
+            }
+
+            for idx in 0..2 * footer {
+                assert_eq!(
+                    pvm.rows[row][F_R_BASE_COL + idx],
+                    mvm.rows[row][mvm_blakeg::footer_r_col(footer, idx)],
+                    "MVM/PVM carried R mismatch in case {case}, footer {footer}, field {idx}",
+                );
+            }
+            for pair in 0..2 {
+                let lo = mvm.rows[row][mvm_blakeg::footer_msg_word_col(2 * pair)];
+                let hi = mvm.rows[row][mvm_blakeg::footer_msg_word_col(2 * pair + 1)];
+                assert_eq!(
+                    pvm.rows[row][F_R_BASE_COL + 2 * footer + pair],
+                    lo + TWO_POW_32 * hi,
+                    "MVM/PVM current R mismatch in case {case}, footer {footer}, pair {pair}",
+                );
+            }
+
+            for idx in 0..=footer {
+                assert_eq!(
+                    pvm.rows[row][F_D_BASE_COL + idx],
+                    mvm.rows[row][mvm_blakeg::footer_interface_tail_col(idx)],
+                    "MVM/PVM output field mismatch in case {case}, footer {footer}, field {idx}",
+                );
+            }
+            for idx in 0..footer_future_w_indices(footer).len() {
+                assert_eq!(
+                    pvm.rows[row][F_FUTURE_W_BASE_COL + idx],
+                    mvm.rows[row][mvm_blakeg::footer_future_w_col(footer, idx)],
+                    "MVM/PVM future-state mismatch in case {case}, footer {footer}, field {idx}",
+                );
+            }
+
+            for pair in 0..2 {
+                assert_eq!(
+                    pvm.rows[row][F_R_CANON_INV_BASE_COL + pair],
+                    mvm.rows[row][mvm_blakeg::F_R_CANON_INV_BASE_COL + pair],
+                    "MVM/PVM R inverse mismatch in case {case}, footer {footer}, pair {pair}",
+                );
+                assert_eq!(
+                    pvm.rows[row][F_R_CANON_Z_BASE_COL + pair],
+                    mvm.rows[row][mvm_blakeg::F_R_CANON_Z_BASE_COL + pair],
+                    "MVM/PVM R zero flag mismatch in case {case}, footer {footer}, pair {pair}",
+                );
+            }
+            assert_eq!(
+                pvm.rows[row][F_C_CANON_INV_COL],
+                mvm.rows[row][mvm_blakeg::F_C_CANON_INV_COL],
+                "MVM/PVM CV inverse mismatch in case {case}, footer {footer}",
+            );
+            assert_eq!(
+                pvm.rows[row][F_C_CANON_Z_COL],
+                mvm.rows[row][mvm_blakeg::F_C_CANON_Z_COL],
+                "MVM/PVM CV zero flag mismatch in case {case}, footer {footer}",
+            );
+            assert_eq!(
+                pvm.rows[row][F_COMPRESSION_CYCLE_ID_COL],
+                mvm.rows[row][mvm_blakeg::F_COMPRESSION_CYCLE_ID_COL],
+                "MVM/PVM cycle ID mismatch in case {case}, footer {footer}",
+            );
+
+            for idx in 0..=footer {
+                let expected =
+                    Felt::from_u32(cv[2 * idx]) + TWO_POW_32 * Felt::from_u32(cv[2 * idx + 1]);
+                assert_eq!(
+                    pvm.rows[row][F_C_BASE_COL + idx],
+                    expected,
+                    "PVM packed CV mismatch in case {case}, footer {footer}, field {idx}",
                 );
             }
         }

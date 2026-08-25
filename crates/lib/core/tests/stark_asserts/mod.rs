@@ -525,12 +525,13 @@ fn verifier_memory_layout_is_complete_dense_and_disjoint() {
         ("vm/layout.masm", "KERNEL_WITNESS_PTR", 0, 1020),
         // Includes the alignment word before OOD_EVALUATIONS_PTR.
         ("vm/layout.masm", "AUX_RAND_ELEM_PTR", 0, 8),
-        ("vm/layout.masm", "OOD_EVALUATIONS_PTR", 0, 1376),
+        // Two 320-evaluation rows, represented over the quadratic extension field.
+        ("vm/layout.masm", "OOD_EVALUATIONS_PTR", 0, 2 * 320 * 2),
         ("vm/layout.masm", "AUX_BUS_BOUNDARY_PTR", 0, 8),
         ("vm/layout.masm", "AUXILIARY_ACE_INPUTS_PTR", 0, 48),
         // Fixed VM stream reservation ending at the PVM allocation.
-        ("vm/layout.masm", "ACE_CIRCUIT_STREAM_PTR", 0, 10848),
-        ("vm/layout.masm", "CURRENT_TRACE_ROW_PTR", 0, 344),
+        ("vm/layout.masm", "ACE_CIRCUIT_STREAM_PTR", 0, 10944),
+        ("vm/layout.masm", "CURRENT_TRACE_ROW_PTR", 0, 320),
     ];
 
     #[derive(Debug)]
