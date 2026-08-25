@@ -8,6 +8,7 @@ use miden_core::{
 };
 
 use super::{
+    algebra::{cv_storage_coefficient, cv_storage_offset, cv_word_base, sum_input_b},
     layout::*,
     model::{initial_working_state, low_output},
     schedule::fused_step_at,
@@ -19,6 +20,23 @@ pub type BlakeGRow = [u64; NUM_COLS];
 pub type BlakeGFeltRow = [Felt; NUM_COLS];
 
 const CANONICALITY_HIGH_WORD_MAX: u64 = u32::MAX as u64;
+const INV_TWO_POW_16: Felt = Felt::new_unchecked(18_446_462_594_437_939_201);
+const INV_TWO_POW_24: Felt = Felt::new_unchecked(18_446_742_969_902_956_801);
+const INV_TWO_POW_32: Felt = Felt::new_unchecked(18_446_744_065_119_617_026);
+
+/// Inverses of the eight coefficients returned by `cv_storage_coefficient()`.
+///
+/// Keeping these fixed field elements avoids 21 inversions for every newly materialized block.
+const CV_STORAGE_COEFFICIENT_INVERSES: [Felt; 8] = [
+    INV_TWO_POW_32,
+    INV_TWO_POW_32,
+    INV_TWO_POW_32,
+    INV_TWO_POW_32,
+    INV_TWO_POW_16,
+    Felt::ONE,
+    INV_TWO_POW_24,
+    INV_TWO_POW_16,
+];
 
 #[cfg(test)]
 pub struct BlakeGTraceBlock {
@@ -58,11 +76,17 @@ impl ByteLookupRecorder for NoopByteLookupRecorder {
 }
 
 trait TraceRow {
+    fn get_u64(&self, col: usize) -> u64;
     fn set_u64(&mut self, col: usize, value: u64);
 }
 
 #[cfg(test)]
 impl TraceRow for BlakeGRow {
+    #[inline]
+    fn get_u64(&self, col: usize) -> u64 {
+        self[col]
+    }
+
     #[inline]
     fn set_u64(&mut self, col: usize, value: u64) {
         self[col] = value;
@@ -70,6 +94,11 @@ impl TraceRow for BlakeGRow {
 }
 
 impl TraceRow for BlakeGFeltRow {
+    #[inline]
+    fn get_u64(&self, col: usize) -> u64 {
+        self[col].as_canonical_u64()
+    }
+
     #[inline]
     fn set_u64(&mut self, col: usize, value: u64) {
         self[col] = Felt::new_unchecked(value);
@@ -150,8 +179,8 @@ pub(crate) fn rewrite_felt_footer_for_test(
 ///
 /// # Panics
 ///
-/// Panics if `rows` contains fewer than 32 rows or if trace metadata is not a canonical field
-/// element (including the packed cycle/pair key).
+/// Panics if `rows` contains fewer than 32 rows or if trace metadata, including the compression
+/// cycle ID, is not a canonical field element.
 pub fn write_felt_trace_block(
     rows: &mut [BlakeGFeltRow],
     block: [u32; 16],
@@ -180,8 +209,8 @@ pub fn write_felt_trace_block(
 ///
 /// # Panics
 ///
-/// Panics if `rows` contains fewer than 32 rows or if trace metadata is not a canonical field
-/// element (including the packed cycle/pair key).
+/// Panics if `rows` contains fewer than 32 rows or if trace metadata, including the compression
+/// cycle ID, is not a canonical field element.
 pub fn write_felt_trace_block_into_zeroed_with_lookups<R>(
     rows: &mut [BlakeGFeltRow],
     block: [u32; 16],
@@ -208,26 +237,14 @@ where
 ///
 /// # Panics
 ///
-/// Panics if `rows` contains fewer than 32 rows or the packed cycle/pair key would not be a
-/// canonical field element.
+/// Panics if `rows` contains fewer than 32 rows or the compression cycle ID is not a canonical
+/// field element.
 pub fn retag_felt_trace_block_cycle_id(rows: &mut [BlakeGFeltRow], compression_cycle_id: u64) {
     assert!(rows.len() >= BLOCK_PERIOD, "32-row BlakeG retag needs at least one full block");
     validate_compression_cycle_id(compression_cycle_id);
     let cycle_id = Felt::new_unchecked(compression_cycle_id);
 
-    for row in &mut rows[..FUSED_G_ROWS] {
-        for g in 0..NUM_G {
-            row[g_msg_slot_col(g, 2)] = cycle_id;
-        }
-    }
-
-    for footer in 0..FOOTER_ROWS {
-        let row = &mut rows[FOOTER_START + footer];
-        row[F_HIN_SLOT_BASE_COL] =
-            Felt::new_unchecked(compression_cycle_pair_index(compression_cycle_id, footer));
-        for word_slot in 0..F_MSG_WORD_SLOTS {
-            row[footer_msg_word_slot_col(word_slot, 2)] = cycle_id;
-        }
+    for row in &mut rows[..BLOCK_PERIOD] {
         row[F_COMPRESSION_CYCLE_ID_COL] = cycle_id;
     }
 }
@@ -288,10 +305,9 @@ where
 }
 
 fn validate_compression_cycle_id(compression_cycle_id: u64) {
-    let max_cycle_id = (Felt::ORDER_U64 - FOOTER_ROWS as u64) / FOOTER_ROWS as u64;
     assert!(
-        compression_cycle_id <= max_cycle_id,
-        "BlakeG compression-cycle pair key must be a canonical field element",
+        compression_cycle_id < Felt::ORDER_U64,
+        "BlakeG compression-cycle ID must be a canonical field element",
     );
 }
 
@@ -307,6 +323,7 @@ fn write_fused_g_row<T, R>(
     R: ByteLookupRecorder,
 {
     let step = fused_step_at(row_idx).expect("row is a fused G row");
+    row.set_u64(G_COMPRESSION_CYCLE_ID_COL, compression_cycle_id);
 
     for g in 0..NUM_G {
         let [ai, bi, ci, di] = step.lane_map[g];
@@ -328,15 +345,8 @@ fn write_fused_g_row<T, R>(
 
         write_first_half_slots(row, g, d, a_new, recorder);
         write_second_half_slots(row, g, b, c_new, step.second_rotation, recorder);
-        write_lookup_slot(
-            row,
-            g_msg_slot_col(g, 0),
-            [step.message_indices[g] as u64, msg as u64, compression_cycle_id],
-        );
-        row.set_u64(G_A_BASE_COL + g, a as u64);
-        row.set_u64(G_C_BASE_COL + g, c as u64);
-        row.set_u64(G_K3_BIT0_BASE_COL + g, k3 & 1);
-        row.set_u64(G_K3_BIT1_BASE_COL + g, k3 >> 1);
+        row.set_u64(g_msg_word_col(g), msg as u64);
+        row.set_u64(g_k3_col(g), k3);
         row.set_u64(G_K2_BASE_COL + g, k2);
 
         v[ai] = a_new;
@@ -359,42 +369,28 @@ fn write_footer_rows<T, R>(
 {
     let low = low_output(v);
     let r_values = packed_message_values(block);
-    let c_values = packed_h_values(h);
     let d_values = packed_output_values(low);
     let footer_canonicality = footer_canonicality_witnesses(block, h);
 
     for footer in 0..FOOTER_ROWS {
         let row = &mut rows[FOOTER_START + footer];
-        let even = 2 * footer;
-        let odd = even + 1;
+        let odd = 2 * footer + 1;
 
         write_footer_xor_slots(row, footer, h, v, recorder);
         write_top_bit_slot(row, low[odd], recorder);
-        write_lookup_slot(
-            row,
-            F_HIN_SLOT_BASE_COL,
-            [
-                compression_cycle_pair_index(compression_cycle_id, footer),
-                h[even] as u64,
-                h[odd] as u64,
-            ],
-        );
-        write_footer_message_group(row, footer, block, compression_cycle_id);
-        write_prefix(row, F_R_BASE_COL, &r_values, 2 * footer + 2);
-        write_prefix(row, F_C_BASE_COL, &c_values, footer + 1);
-        write_prefix(row, F_D_BASE_COL, &d_values, footer + 1);
+        write_footer_message_group(row, footer, block);
+        write_footer_r_prefix(row, footer, &r_values);
         write_future_w_queue(row, footer, v);
         write_footer_canonicality(row, footer, &footer_canonicality);
         row.set_u64(F_COMPRESSION_CYCLE_ID_COL, compression_cycle_id);
+        for (idx, &value) in d_values.iter().enumerate() {
+            row.set_u64(footer_digest_col(idx), value);
+        }
+        if footer == 0 {
+            write_footer_b_sum_correction(row, v);
+        }
+        write_footer_cv_coordinates(row, footer, h);
     }
-}
-
-fn compression_cycle_pair_index(compression_cycle_id: u64, pair: usize) -> u64 {
-    debug_assert!(pair < FOOTER_ROWS);
-    compression_cycle_id
-        .checked_mul(FOOTER_ROWS as u64)
-        .and_then(|base| base.checked_add(pair as u64))
-        .expect("BlakeG compression-cycle pair index must fit in u64")
 }
 
 fn write_footer_xor_slots<T, R>(
@@ -452,19 +448,10 @@ where
     recorder.record(BlakeGByteLookup::And8, top_byte, F_TOP_BIT_MASK, masked as u32);
 }
 
-fn write_footer_message_group<T: TraceRow>(
-    row: &mut T,
-    footer: usize,
-    block: [u32; 16],
-    compression_cycle_id: u64,
-) {
+fn write_footer_message_group<T: TraceRow>(row: &mut T, footer: usize, block: [u32; 16]) {
     for word_slot in 0..F_MSG_WORD_SLOTS {
         let msg_idx = footer_message_word_index(footer, word_slot);
-        write_lookup_slot(
-            row,
-            footer_msg_word_slot_col(word_slot, 0),
-            [msg_idx as u64, block[msg_idx] as u64, compression_cycle_id],
-        );
+        row.set_u64(footer_msg_word_col(word_slot), block[msg_idx] as u64);
     }
 
     for limb in 0..F_RANGE_SLOTS {
@@ -481,7 +468,13 @@ fn write_footer_message_group<T: TraceRow>(
 
 fn write_future_w_queue<T: TraceRow>(row: &mut T, footer: usize, v: [u32; 16]) {
     for (idx, &word_idx) in footer_future_w_indices(footer).iter().enumerate() {
-        row.set_u64(F_FUTURE_W_BASE_COL + idx, v[word_idx] as u64);
+        row.set_u64(footer_future_w_col(footer, idx), v[word_idx] as u64);
+    }
+}
+
+fn write_footer_r_prefix<T: TraceRow>(row: &mut T, footer: usize, r_values: &[u64; 8]) {
+    for (idx, &value) in r_values.iter().enumerate().take(2 * footer) {
+        row.set_u64(footer_r_col(footer, idx), value);
     }
 }
 
@@ -499,6 +492,33 @@ fn write_footer_canonicality<T: TraceRow>(
     let witness = witnesses[footer * 3 + 2];
     row.set_u64(F_C_CANON_INV_COL, witness.inv);
     row.set_u64(F_C_CANON_Z_COL, witness.z);
+}
+
+fn write_footer_cv_coordinates<T: TraceRow>(row: &mut T, footer: usize, h: [u32; 8]) {
+    let live = 2 * footer + 2;
+    for idx in (NUM_G..live).chain(0..live.min(NUM_G)) {
+        let word = h[idx];
+        let target = Felt::new_unchecked(word as u64);
+        let at = |col| Felt::new_unchecked(row.get_u64(col));
+        let base = cv_word_base(&at, idx);
+        let offset = cv_storage_offset::<Felt>(idx);
+        row.set_u64(
+            F_CV_STORAGE_COLS[idx],
+            ((target - base + offset) * CV_STORAGE_COEFFICIENT_INVERSES[idx]).as_canonical_u64(),
+        );
+    }
+}
+
+fn write_footer_b_sum_correction<T: TraceRow>(row: &mut T, final_v: [u32; 16]) {
+    let at = |col| Felt::new_unchecked(row.get_u64(col));
+    let coefficient = cv_storage_coefficient::<Felt>(7);
+    let correction = at(F_B_SUM_CORRECTION_COL);
+    let base = sum_input_b(at) - coefficient * correction;
+    let target = final_v[4..8].iter().fold(Felt::ZERO, |sum, &word| sum + Felt::from_u32(word));
+    row.set_u64(
+        F_B_SUM_CORRECTION_COL,
+        ((target - base) * CV_STORAGE_COEFFICIENT_INVERSES[7]).as_canonical_u64(),
+    );
 }
 
 fn write_first_half_slots<T, R>(row: &mut T, g: usize, d: u32, a_new: u32, recorder: &mut R)
@@ -533,12 +553,12 @@ fn write_second_half_slots<T, R>(
     let b_bytes = b.to_le_bytes();
     let c_new_bytes = c_new.to_le_bytes();
     for byte in 0..BYTES_PER_WORD {
-        let result = rotation_contribution(byte, b_bytes[byte], c_new_bytes[byte], rotation);
-        write_lookup_slot(
-            row,
-            g_bd_rot_slot_col(g, byte, 0),
-            [b_bytes[byte] as u64, c_new_bytes[byte] as u64, result as u64],
-        );
+        let result = blakeg_rotation_contribution(byte, b_bytes[byte], c_new_bytes[byte], rotation);
+        row.set_u64(g_bd_rot_slot_col(g, byte, 0), b_bytes[byte] as u64);
+        row.set_u64(g_bd_rot_slot_col(g, byte, 1), c_new_bytes[byte] as u64);
+        if let Some(result_col) = g_bd_rot_result_col(g, byte) {
+            row.set_u64(result_col, result as u64);
+        }
         let lookup = match rotation {
             12 => BlakeGByteLookup::Rot12 { byte },
             7 => BlakeGByteLookup::Rot7 { byte },
@@ -548,7 +568,7 @@ fn write_second_half_slots<T, R>(
     }
 }
 
-const fn rotation_contribution(byte_pos: usize, lhs: u8, rhs: u8, rotation: u32) -> u32 {
+const fn blakeg_rotation_contribution(byte_pos: usize, lhs: u8, rhs: u8, rotation: u32) -> u32 {
     assert!(byte_pos < BYTES_PER_WORD, "byte position must be in 0..4");
     let word = ((lhs ^ rhs) as u32) << (8 * byte_pos);
     word.rotate_right(rotation)
@@ -560,23 +580,8 @@ fn write_lookup_slot<T: TraceRow>(row: &mut T, base: usize, values: [u64; BYTE_S
     row.set_u64(base + 2, values[2]);
 }
 
-fn write_prefix<T: TraceRow, const N: usize>(
-    row: &mut T,
-    base: usize,
-    values: &[u64; N],
-    len: usize,
-) {
-    for (idx, &value) in values.iter().enumerate().take(len) {
-        row.set_u64(base + idx, value);
-    }
-}
-
 fn packed_message_values(block: [u32; 16]) -> [u64; 8] {
     core::array::from_fn(|i| pack_pair(block[2 * i], block[2 * i + 1]))
-}
-
-fn packed_h_values(h: [u32; 8]) -> [u64; 4] {
-    core::array::from_fn(|i| pack_pair(h[2 * i], h[2 * i + 1]))
 }
 
 fn packed_output_values(low: [u32; 8]) -> [u64; 4] {
@@ -623,5 +628,17 @@ fn canonicality_high_word_offset(hi: u32) -> Felt {
     match CANONICALITY_HIGH_WORD_MAX - hi as u64 {
         0 => Felt::ZERO,
         delta => Felt::new_unchecked(Felt::ORDER - delta),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cv_storage_coefficient_inverses_are_exact() {
+        for (idx, inverse) in CV_STORAGE_COEFFICIENT_INVERSES.into_iter().enumerate() {
+            assert_eq!(cv_storage_coefficient::<Felt>(idx) * inverse, Felt::ONE);
+        }
     }
 }

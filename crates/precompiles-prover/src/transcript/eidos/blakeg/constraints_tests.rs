@@ -9,7 +9,7 @@ use miden_crypto::stark::air::{AirBuilder, ExtensionBuilder, PermutationAirBuild
 
 use super::{
     constraints::{enforce_footer_rows, enforce_fused_rows},
-    layout::{BLOCK_PERIOD, FUSED_G_ROWS, NUM_COLS, NUM_G, g_msg_slot_col},
+    layout::{BLOCK_PERIOD, FUSED_G_ROWS, G_COMPRESSION_CYCLE_ID_COL, NUM_COLS},
     periodic::get_periodic_column_values,
     selectors::BlakeGSelectors,
     trace::{BlakeGFeltRow, generate_felt_trace_block_with_cycle_id},
@@ -158,13 +158,10 @@ fn cross_row_cycle_id_constancy_is_independently_load_bearing() {
     let second = generate_felt_trace_block_with_cycle_id(block, cv, 1);
     let mut trace: Vec<_> = first.rows.into_iter().chain(second.rows).collect();
 
-    // Keep all four per-row message-slot IDs equal while rows 1..26 borrow cycle 1's ID. Only the
-    // cross-row constancy constraint can see the two discontinuities at transitions 0->1 and
-    // 26->27.
+    // Rows 1..26 borrow cycle 1's ID. Only the cross-row constancy constraint can see the two
+    // discontinuities at transitions 0->1 and 26->27.
     for row in trace.iter_mut().take(FUSED_G_ROWS - 1).skip(1) {
-        for lane in 0..NUM_G {
-            row[g_msg_slot_col(lane, 2)] = Felt::ONE;
-        }
+        row[G_COMPRESSION_CYCLE_ID_COL] = Felt::ONE;
     }
 
     for row_idx in 0..trace.len() {

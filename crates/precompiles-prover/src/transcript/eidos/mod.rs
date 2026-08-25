@@ -1,12 +1,14 @@
-//! BlakeG compression chiplet for the deferred transcript.
+//! Native Eidos/BlakeG chaining chiplet for the deferred transcript.
 //!
 //! This is the direct PVM replacement for the former 16-row Poseidon2 permutation chiplet. Each
 //! logical Eidos compression occupies one physical 32-row BlakeG cycle. The surrounding transcript
-//! keeps its input/output relations and logical absorption IDs; those relations are emitted
+//! keeps its input/output relations and logical chain-step IDs; those relations are emitted
 //! directly from the BlakeG cycle rather than through a separate bridge AIR.
 
 pub(crate) mod blakeg;
 pub mod digest;
+#[cfg(test)]
+mod interface_tests;
 pub mod messages;
 pub mod trace;
 
@@ -14,20 +16,21 @@ use alloc::{vec, vec::Vec};
 use core::{array, borrow::Borrow};
 
 use blakeg::{
-    BLAKEG_LOOKUP_COLUMN_SHAPE, BlakeGCompressionCols, BlakeGCompressionLookupBuilder,
+    BLAKEG_LOOKUP_COLUMN_SHAPE, BlakeGCompressionCols,
     NUM_PERIODIC_COLUMNS as BLAKEG_PERIODIC_COLS,
     constraints::{enforce_footer_rows, enforce_fused_rows},
     emit_lookup_columns, get_periodic_column_values,
     layout::{
-        BLOCK_PERIOD as BLAKEG_COMPRESSION_CYCLE_LEN, F_C_BASE_COL, F_D_BASE_COL, F_R_BASE_COL,
-        NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS,
+        BLOCK_PERIOD as BLAKEG_COMPRESSION_CYCLE_LEN, F_COMPRESSION_CYCLE_ID_COL, FOOTER_ROWS,
+        NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS, footer_digest_col, footer_msg_word_col,
+        footer_r_col,
     },
     selectors::BlakeGSelectors,
+    universal_cv_word,
 };
 pub use digest::{EidosCap, EidosDigest};
 pub use messages::{
-    EIDOS_IN_TAG_CAP_AND, EIDOS_IN_TAG_CAP_CHUNKS, EIDOS_IN_TAG_CAP_NODE, EIDOS_IN_TAG_RATE0,
-    EIDOS_IN_TAG_RATE1, EidosInMsg, EidosOutMsg,
+    EIDOS_DOMAIN_AND, EIDOS_DOMAIN_CHUNKS, EIDOS_DOMAIN_NODE, EidosChainInputMsg, EidosOutMsg,
 };
 use miden_air::{
     logup::{BusId as MidenBusId, MIDEN_MAX_MESSAGE_WIDTH},
@@ -39,7 +42,7 @@ use miden_air::{
 use miden_core::{
     Felt,
     deferred::{DEFERRED_CHUNKS_DOMAIN, DEFERRED_NODE_DOMAIN, DEFERRED_ROOT_DOMAIN},
-    field::{PrimeCharacteristicRing, QuadFelt},
+    field::{Algebra, PrimeCharacteristicRing, QuadFelt},
     utils::RowMajorMatrix,
 };
 use miden_crypto::hash::eidos::Eidos;
@@ -49,16 +52,16 @@ use crate::{
     composite::{SubAirBuilder, concatenate_bands, extract_band},
     logup::{
         CyclicConstraintLookupBuilder, Deg, LookupBatch, LookupBuilder, LookupColumn, LookupGroup,
-        NUM_PUBLIC_VALUES, NUM_RANDOMNESS, NUM_SIGMA_VALUES, build_logup_aux_trace,
+        LookupMessage, NUM_PUBLIC_VALUES, NUM_RANDOMNESS, NUM_SIGMA_VALUES, build_logup_aux_trace,
     },
-    relations::{MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
+    relations::{BusId, MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
     utils::{current_main, next_main},
 };
 
 // MAIN COLUMN LAYOUT
 // ================================================================================================
 
-/// The first 128 columns are the PVM-owned wide BlakeG compression layout.
+/// The first 108 columns are the PVM-owned BlakeG compression layout.
 pub const COL_BLAKEG_BEGIN: usize = 0;
 pub const COL_BLAKEG_END: usize = NUM_BLAKEG_COMPRESSION_COLS;
 
@@ -81,10 +84,10 @@ pub const COL_CV_IN_BEGIN: usize = COL_CAP_END;
 pub const COL_CV_IN_END: usize = COL_CV_IN_BEGIN + 4;
 pub const NUM_MAIN_COLS: usize = COL_CV_IN_END;
 
-const PVM_AUX_COLS: usize = 3;
+const PVM_AUX_COLS: usize = 2;
 const BLAKEG_AUX_COLS: usize = BLAKEG_LOOKUP_COLUMN_SHAPE.len();
 pub const NUM_AUX_COLS: usize = PVM_AUX_COLS + BLAKEG_AUX_COLS;
-const PVM_COLUMN_SHAPE: [usize; PVM_AUX_COLS] = [1, 2, 1];
+const PVM_COLUMN_SHAPE: [usize; PVM_AUX_COLS] = [1, 2];
 
 const PVM_VALUE_OFFSET: usize = 0;
 const BLAKEG_VALUE_OFFSET: usize = 1;
@@ -183,7 +186,7 @@ impl LiftedAir<Felt, QuadFelt> for BlakeGCompressionAir {
 // ================================================================================================
 
 /// The intrinsic BlakeG constraints and byte/range lookups, without Miden VM controller or AEAD
-/// singleton links. The PVM interface below occupies those boundaries directly.
+/// footer relations. The PVM interface below occupies those boundaries directly.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BlakeGNarrowAir;
 
@@ -264,10 +267,11 @@ where
     fn eval(&self, builder: &mut LB) {
         let main = builder.main();
         let local: &BlakeGCompressionCols<_> = main.current_slice().borrow();
+        let next: &BlakeGCompressionCols<_> = main.next_slice().borrow();
         let periodic_values: Vec<LB::Expr> =
             builder.periodic_values().iter().map(|value| (*value).into()).collect();
         let selectors = BlakeGSelectors::new(&periodic_values, 0);
-        emit_lookup_columns(builder, local, &selectors);
+        emit_lookup_columns(builder, local, next, &selectors);
     }
 }
 
@@ -355,6 +359,12 @@ impl LiftedAir<Felt, QuadFelt> for BlakeGInterfaceAir {
             .assert_zero(is_and.clone() + is_chunks.clone() + is_generic.clone() - active.clone());
         builder.assert_zero(payload.clone() * (AB::Expr::ONE - active.clone()));
         builder.assert_zero(output.clone() * (AB::Expr::ONE - active.clone()));
+        builder.assert_zero(
+            AB::Expr::from(local[COL_IN_MULTIPLICITY]) * (AB::Expr::ONE - payload.clone()),
+        );
+        builder.assert_zero(
+            AB::Expr::from(local[COL_OUT_MULTIPLICITY]) * (AB::Expr::ONE - output.clone()),
+        );
         builder.assert_zero(head.clone() * (payload.clone() - AB::Expr::ONE));
 
         builder.assert_zero(is_and.clone() * (payload.clone() - AB::Expr::ONE));
@@ -393,8 +403,7 @@ impl LiftedAir<Felt, QuadFelt> for BlakeGInterfaceAir {
 
         builder.when_transition().assert_zero(
             is_last.clone()
-                * active.clone()
-                * (AB::Expr::ONE - output.clone())
+                * (active.clone() - output.clone())
                 * (AB::Expr::ONE - next_absorb.clone()),
         );
         builder
@@ -427,12 +436,15 @@ impl LiftedAir<Felt, QuadFelt> for BlakeGInterfaceAir {
                 is_last.clone()
                     * next_absorb.clone()
                     * (AB::Expr::from(next[COL_CV_IN_BEGIN + i])
-                        - AB::Expr::from(local[F_D_BASE_COL + i])),
+                        - AB::Expr::from(local[footer_digest_col(i)])),
             );
+            let raw_cv_lo = universal_cv_word(|col| AB::Expr::from(local[col]), 2 * i);
+            let raw_cv_hi = universal_cv_word(|col| AB::Expr::from(local[col]), 2 * i + 1);
             builder.assert_zero(
                 is_last.clone()
                     * (AB::Expr::from(local[COL_CV_IN_BEGIN + i])
-                        - AB::Expr::from(local[F_C_BASE_COL + i])),
+                        - raw_cv_lo
+                        - AB::Expr::from(Felt::new_unchecked(1u64 << 32)) * raw_cv_hi),
             );
         }
 
@@ -460,6 +472,8 @@ impl LiftedAir<Felt, QuadFelt> for BlakeGInterfaceAir {
         }
 
         let cap: [AB::Expr; 4] = array::from_fn(|i| local[COL_CAP_BEGIN + i].into());
+        let block = footer_block(|col| AB::Expr::from(local[col]));
+        let generic_output = active.clone() - payload.clone();
         let and_cap = EidosCap::and().as_array();
         let chunks_cap = EidosCap::chunk().as_array();
         for i in 0..4 {
@@ -467,22 +481,51 @@ impl LiftedAir<Felt, QuadFelt> for BlakeGInterfaceAir {
             builder
                 .assert_zero(is_chunks.clone() * (cap[i].clone() - AB::Expr::from(chunks_cap[i])));
             builder.assert_zero(
-                is_last.clone()
-                    * is_generic.clone()
-                    * output.clone()
-                    * (AB::Expr::from(local[F_R_BASE_COL + i]) - cap[i].clone()),
+                is_last.clone() * generic_output.clone() * (block[i].clone() - cap[i].clone()),
             );
-            builder.assert_zero(
-                is_last.clone()
-                    * is_generic.clone()
-                    * output.clone()
-                    * AB::Expr::from(local[F_R_BASE_COL + 4 + i]),
-            );
+            builder.assert_zero(is_last.clone() * generic_output.clone() * block[4 + i].clone());
         }
+
+        // The second interface fraction column is inactive outside the first fused row and
+        // footer 3. Pinning it closes the zero-denominator edge where its ungated fraction
+        // equation would otherwise leave the committed cell unconstrained.
+        let aux1: AB::ExprEF = builder.permutation().current_slice()[1].into();
+        let aux1_inactive =
+            AB::Expr::ONE - selectors.is_first_fused() - selectors.is_footer_row(FOOTER_ROWS - 1);
+        builder.assert_zero_ext(aux1 * aux1_inactive);
 
         let mut lb =
             CyclicConstraintLookupBuilder::new(builder, self, self.preprocessed_width() > 0);
         <Self as LookupAir<_>>::eval(self, &mut lb);
+    }
+}
+
+pub(crate) const INTERNAL_CV_BUS_ID: usize = BusId::EidosCv as usize;
+
+/// Cycle-tagged relation carrying all eight raw BlakeG chaining-value words atomically.
+///
+/// This relation is internal to the interface AIR, but its ID lives in the shared PVM registry so
+/// every prover, verifier, and diagnostic path constructs the same challenge table.
+#[derive(Debug)]
+struct FullCvMsg<E> {
+    compression_cycle_id: E,
+    words: [E; 8],
+}
+
+impl<E, EF> LookupMessage<E, EF> for FullCvMsg<E>
+where
+    E: PrimeCharacteristicRing,
+    EF: Algebra<E>,
+{
+    fn encode(&self, challenges: &crate::logup::Challenges<EF>) -> EF {
+        let fields: [E; 9] = array::from_fn(|idx| {
+            if idx == 0 {
+                self.compression_cycle_id.clone()
+            } else {
+                self.words[idx - 1].clone()
+            }
+        });
+        challenges.encode(INTERNAL_CV_BUS_ID, fields)
     }
 }
 
@@ -511,117 +554,129 @@ where
         let periodic_values: Vec<LB::Expr> =
             builder.periodic_values().iter().map(|value| (*value).into()).collect();
         let selectors = BlakeGSelectors::new(&periodic_values, 0);
-        let is_last = selectors.is_footer_row(3);
+        let first_fused = selectors.is_first_fused();
+        let footer3 = selectors.is_footer_row(FOOTER_ROWS - 1);
 
-        let absorption_id: LB::Expr = local[COL_ABSORPTION_ID].into();
+        let chain_step_id: LB::Expr = local[COL_ABSORPTION_ID].into();
         let in_mult: LB::Expr = local[COL_IN_MULTIPLICITY].into();
         let out_mult: LB::Expr = local[COL_OUT_MULTIPLICITY].into();
-        let head: LB::Expr = local[COL_IS_HEAD].into();
-        let payload: LB::Expr = local[COL_IS_PAYLOAD].into();
-        let output: LB::Expr = local[COL_IS_OUTPUT].into();
         let is_and: LB::Expr = local[COL_IS_AND].into();
         let is_chunks: LB::Expr = local[COL_IS_CHUNKS].into();
         let is_generic: LB::Expr = local[COL_IS_GENERIC].into();
 
-        let block: [LB::Expr; 8] = array::from_fn(|i| local[F_R_BASE_COL + i].into());
-        let rate0: [LB::Expr; 4] = array::from_fn(|i| block[i].clone());
-        let rate1: [LB::Expr; 4] = array::from_fn(|i| block[4 + i].clone());
-        let cap: [LB::Expr; 4] = array::from_fn(|i| local[COL_CAP_BEGIN + i].into());
-        let digest: [LB::Expr; 4] = array::from_fn(|i| local[F_D_BASE_COL + i].into());
-        let cap_tag = is_generic * LB::Expr::from(Felt::from_u8(EIDOS_IN_TAG_CAP_NODE))
-            + is_and * LB::Expr::from(Felt::from_u8(EIDOS_IN_TAG_CAP_AND))
-            + is_chunks * LB::Expr::from(Felt::from_u8(EIDOS_IN_TAG_CAP_CHUNKS));
+        let message = footer_block(|col| LB::Expr::from(local[col]));
+        let chain_context = array::from_fn(|idx| local[COL_CAP_BEGIN + idx].into());
+        let digest = array::from_fn(|idx| local[footer_digest_col(idx)].into());
+        let domain = is_generic * LB::Expr::from(Felt::from_u8(EIDOS_DOMAIN_NODE))
+            + is_and * LB::Expr::from(Felt::from_u8(EIDOS_DOMAIN_AND))
+            + is_chunks * LB::Expr::from(Felt::from_u8(EIDOS_DOMAIN_CHUNKS));
+        let raw_cv = raw_cv_words(|col| LB::Expr::from(local[col]));
 
-        let m_in = LB::Expr::ZERO - is_last.clone() * in_mult.clone() * payload;
-        let m_cap = LB::Expr::ZERO - is_last.clone() * in_mult * head;
-        let m_out = LB::Expr::ZERO - is_last * out_mult * output;
-        let one = Deg { v: 1, u: 1 };
-        let batch_one = Deg { v: 4, u: 3 };
-        let batch_two = Deg { v: 4, u: 3 };
-        let group = Deg { v: 5, u: 4 };
+        // The base constraints pin each multiplicity to zero off its event. Multiplying only by
+        // footer3 therefore keeps both multiplicities at degree two.
+        let input_multiplicity = -footer3.clone() * in_mult;
+        let output_multiplicity = -footer3.clone() * out_mult;
+        let cv_multiplicity = footer3 - first_fused;
+
+        let linear = Deg { v: 1, u: 1 };
+        let selected = Deg { v: 2, u: 1 };
+        let pair = Deg { v: 3, u: 2 };
 
         builder.next_column(
             |col| {
                 col.group(
-                    "blakeg-pvm-rate0",
-                    |g| {
-                        g.batch(
-                            "frac",
+                    "blakeg-pvm-chain-input",
+                    |group| {
+                        group.batch(
+                            "atomic-chain-input",
                             LB::Expr::ONE,
-                            |b| {
-                                b.insert(
-                                    "in-rate0",
-                                    m_in.clone(),
-                                    EidosInMsg::rate0(absorption_id.clone(), rate0),
-                                    one,
+                            |batch| {
+                                batch.insert(
+                                    "chain-input",
+                                    input_multiplicity,
+                                    EidosChainInputMsg {
+                                        chain_step_id,
+                                        domain,
+                                        message,
+                                        chain_context,
+                                    },
+                                    selected,
                                 );
                             },
-                            batch_one,
+                            selected,
                         );
                     },
-                    group,
+                    selected,
                 );
             },
-            group,
+            selected,
         );
+
         builder.next_column(
             |col| {
                 col.group(
-                    "blakeg-pvm-rate1-out",
-                    |g| {
-                        g.batch(
-                            "frac",
+                    "blakeg-pvm-cv-output",
+                    |group| {
+                        group.batch(
+                            "full-cv-and-chain-output",
                             LB::Expr::ONE,
-                            |b| {
-                                b.insert(
-                                    "in-rate1",
-                                    m_in,
-                                    EidosInMsg::rate1(absorption_id.clone(), rate1),
-                                    one,
+                            |batch| {
+                                batch.insert(
+                                    "full-cv",
+                                    cv_multiplicity,
+                                    FullCvMsg {
+                                        compression_cycle_id: local[F_COMPRESSION_CYCLE_ID_COL]
+                                            .into(),
+                                        words: raw_cv,
+                                    },
+                                    linear,
                                 );
-                                b.insert(
-                                    "out-digest",
-                                    m_out,
+                                batch.insert(
+                                    "chain-output",
+                                    output_multiplicity,
                                     EidosOutMsg {
-                                        absorption_id: absorption_id.clone(),
+                                        chain_step_id: local[COL_ABSORPTION_ID].into(),
                                         digest,
                                     },
-                                    one,
+                                    selected,
                                 );
                             },
-                            batch_two,
+                            pair,
                         );
                     },
-                    group,
+                    pair,
                 );
             },
-            group,
-        );
-        builder.next_column(
-            |col| {
-                col.group(
-                    "blakeg-pvm-cap",
-                    |g| {
-                        g.batch(
-                            "frac",
-                            LB::Expr::ONE,
-                            |b| {
-                                b.insert(
-                                    "in-cap",
-                                    m_cap,
-                                    EidosInMsg { absorption_id, tag: cap_tag, c: cap },
-                                    one,
-                                );
-                            },
-                            batch_one,
-                        );
-                    },
-                    group,
-                );
-            },
-            group,
+            pair,
         );
     }
+}
+
+fn footer_block<E, A>(at: A) -> [E; 8]
+where
+    E: PrimeCharacteristicRing,
+    A: Fn(usize) -> E,
+{
+    array::from_fn(|idx| {
+        if idx < 6 {
+            at(footer_r_col(FOOTER_ROWS - 1, idx))
+        } else {
+            let pair = idx - 6;
+            pack_pair(at(footer_msg_word_col(2 * pair)), at(footer_msg_word_col(2 * pair + 1)))
+        }
+    })
+}
+
+fn raw_cv_words<E, A>(at: A) -> [E; 8]
+where
+    E: PrimeCharacteristicRing,
+    A: Fn(usize) -> E,
+{
+    array::from_fn(|idx| universal_cv_word(&at, idx))
+}
+
+fn pack_pair<E: PrimeCharacteristicRing>(lo: E, hi: E) -> E {
+    lo + E::from_u64(1u64 << 32) * hi
 }
 
 const _: () = assert!(BLAKEG_COMPRESSION_CYCLE_LEN == 32);

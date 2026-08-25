@@ -220,9 +220,9 @@ impl MultiAir<Felt, QuadFelt> for ChipletMultiAir {
         &self.airs
     }
 
-    /// The cross-chiplet σ identity: the sum of every AIR's committed
-    /// σ residue must vanish (a single assertion). `aux_values[i]` is AIR
-    /// `i`'s exposed permutation values — exactly one, its σ.
+    /// The cross-chiplet σ identity: the sum of every AIR's committed σ residue must vanish (a
+    /// single assertion). Most AIRs expose one residue. Composite AIRs can expose an additional
+    /// centered Miden-family residue, which is lifted by the trace height before aggregation.
     fn eval_external(
         &self,
         challenges: &[QuadFelt],

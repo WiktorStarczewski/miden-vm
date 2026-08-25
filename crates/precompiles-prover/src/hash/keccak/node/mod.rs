@@ -55,7 +55,7 @@ use crate::{
     relations::{MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
     transcript::{
         binding::BindingMsg,
-        eidos::{EidosInMsg, EidosOutMsg},
+        eidos::{EidosChainInputMsg, EidosOutMsg},
     },
     utils::{current_main, next_main},
 };
@@ -159,19 +159,18 @@ pub const NUM_MAIN_COLS: usize = COL_OUT_MULT + 1;
 // AUX / PUBLIC LAYOUT
 // ================================================================================================
 
-/// Nine aux columns, flattened via `frac_col!` so every closing
+/// Seven aux columns, flattened via `frac_col!` so every closing
 /// constraint stays at degree ≤ 3 → `log_quotient_degree = 1`:
 ///
 /// - col 0: `KeccakSponge` provide alone — the gated running-sum anchor.
 /// - col 1: `Binding(_, True, 0, 0)` provide + `ChunkChain` consume.
 /// - col 2: `EidosOut(H_input_chunks)` consume alone (no partner left to pair).
 /// - col 3/4: the four `Memory64` D-limb consumes, paired.
-/// - col 5/6: digest-chunks Eidos perm — `EidosIn` rate0+rate1, then cap +
-///   `EidosOut(H_digest_chunks)`.
-/// - col 7/8: keccak-node Eidos perm — `EidosIn` rate0+rate1, then cap + `EidosOut(H_keccak)`.
-pub const NUM_AUX_COLS: usize = 9;
+/// - col 5: atomic digest-chunks `EidosIn` + `EidosOut(H_digest_chunks)`.
+/// - col 6: atomic keccak-node `EidosIn` + `EidosOut(H_keccak)`.
+pub const NUM_AUX_COLS: usize = 7;
 
-pub(crate) const COLUMN_SHAPE: [usize; NUM_AUX_COLS] = [1, 2, 1, 2, 2, 2, 2, 2, 2];
+pub(crate) const COLUMN_SHAPE: [usize; NUM_AUX_COLS] = [1, 2, 1, 2, 2, 2, 2];
 
 // AIR
 // ================================================================================================
@@ -364,10 +363,6 @@ where
             LB::Expr::ZERO,
         ];
 
-        // Rate splits.
-        let d_rate0 = [d[0].clone(), d[1].clone(), d[2].clone(), d[3].clone()];
-        let d_rate1 = [d[4].clone(), d[5].clone(), d[6].clone(), d[7].clone()];
-
         let interaction_deg = Deg { v: 1, u: 1 };
         let provides_deg = Deg { v: 1, u: 2 };
         let pair_deg = Deg { v: 3, u: 2 };
@@ -419,7 +414,7 @@ where
                 "p2out-h-input-chunks",
                 pos_act.clone(),
                 EidosOutMsg {
-                    absorption_id: absorption_id_chunks_tail,
+                    chain_step_id: absorption_id_chunks_tail,
                     digest: h_input_chunks.clone(),
                 },
                 interaction_deg
@@ -480,78 +475,58 @@ where
             ),
         );
 
-        // ---- col 5/6: digest-chunks Eidos perm — 3 P2In + 1 P2Out, paired ----
+        // ---- col 5: one atomic digest-chunks input + its output -------------------------------
         frac_col!(
             builder,
             "digest-chunks-eidos",
             pair_deg,
             (
-                "p2in-rate0",
+                "eidos-chain-input",
                 pos_act.clone(),
-                EidosInMsg::rate0(absorption_id_digest_chunks.clone(), d_rate0),
+                EidosChainInputMsg::chunks(
+                    absorption_id_digest_chunks.clone(),
+                    d,
+                    cap_digest_chunks,
+                ),
                 interaction_deg
             ),
             (
-                "p2in-rate1",
-                pos_act.clone(),
-                EidosInMsg::rate1(absorption_id_digest_chunks.clone(), d_rate1),
-                interaction_deg
-            ),
-        );
-        frac_col!(
-            builder,
-            "digest-chunks-eidos",
-            pair_deg,
-            (
-                "p2in-cap",
-                pos_act.clone(),
-                EidosInMsg::cap_chunks(absorption_id_digest_chunks.clone(), cap_digest_chunks,),
-                interaction_deg
-            ),
-            (
-                "p2out-h-digest-chunks",
+                "eidos-chain-output",
                 pos_act.clone(),
                 EidosOutMsg {
-                    absorption_id: absorption_id_digest_chunks,
+                    chain_step_id: absorption_id_digest_chunks,
                     digest: h_digest_chunks.clone(),
                 },
                 interaction_deg
             ),
         );
 
-        // ---- col 7/8: keccak-node Eidos perm — 3 P2In + 1 P2Out, paired ----
+        // ---- col 6: one atomic keccak-node input + its output ---------------------------------
         frac_col!(
             builder,
             "keccak-eidos",
             pair_deg,
             (
-                "p2in-rate0",
+                "eidos-chain-input",
                 pos_act.clone(),
-                EidosInMsg::rate0(absorption_id_keccak.clone(), h_input_chunks),
+                EidosChainInputMsg::node(
+                    absorption_id_keccak.clone(),
+                    core::array::from_fn(|idx| {
+                        if idx < 4 {
+                            h_input_chunks[idx].clone()
+                        } else {
+                            h_digest_chunks[idx - 4].clone()
+                        }
+                    }),
+                    cap_keccak,
+                ),
                 interaction_deg
             ),
             (
-                "p2in-rate1",
-                pos_act.clone(),
-                EidosInMsg::rate1(absorption_id_keccak.clone(), h_digest_chunks),
-                interaction_deg
-            ),
-        );
-        frac_col!(
-            builder,
-            "keccak-eidos",
-            pair_deg,
-            (
-                "p2in-cap",
-                pos_act.clone(),
-                EidosInMsg::cap_node(absorption_id_keccak.clone(), cap_keccak),
-                interaction_deg
-            ),
-            (
-                "p2out-h-keccak",
+                "eidos-chain-output",
                 pos_act,
                 EidosOutMsg {
-                    absorption_id: absorption_id_keccak,
+                    chain_step_id: absorption_id_keccak,
                     digest: h_keccak
                 },
                 interaction_deg

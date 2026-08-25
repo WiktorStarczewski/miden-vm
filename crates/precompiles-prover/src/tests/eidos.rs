@@ -6,8 +6,8 @@ use miden_air::{
     BaseAir,
     logup::{BusId as MidenBusId, MIDEN_MAX_MESSAGE_WIDTH},
     lookup::{
-        Challenges as MidenChallenges,
-        debug::{check_trace_balance, trace::BalanceReport},
+        Challenges as MidenChallenges, build_lookup_fractions,
+        debug::{ValidateLayout, ValidateLookupAir, check_trace_balance, trace::BalanceReport},
     },
     trace::blakeg_compression::{
         self as mvm_blakeg, TraceMode as MvmTraceMode,
@@ -20,27 +20,25 @@ use miden_core::{
     field::{PrimeCharacteristicRing, QuadFelt},
     utils::RowMajorMatrix,
 };
-use miden_crypto::hash::eidos::Eidos;
+use miden_crypto::{hash::eidos::Eidos, stark::air::ConstraintDegrees};
 use miden_lifted_air::LiftedAir;
 use miden_precompiles::{CurvePrecompile, Keccak256Precompile};
 
 use crate::{
     logup::{Challenges, LookupMessage, NUM_PUBLIC_VALUES, NUM_RANDOMNESS},
-    relations::{MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
+    relations::{BusId, MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
     session::Session,
     transcript::eidos::{
-        BlakeGCompressionAir, BlakeGNarrowAir, COL_ABSORPTION_ID, COL_BLAKEG_END, COL_CAP_BEGIN,
-        COL_CV_IN_BEGIN, COL_IS_ABSORB, COL_IS_GENERIC, COL_IS_HEAD, COL_IS_OUTPUT, COL_IS_PAYLOAD,
-        COL_REMAINING, EidosCap, EidosDigest, EidosInMsg, EidosOutMsg, NUM_AUX_COLS, NUM_MAIN_COLS,
+        BlakeGCompressionAir, BlakeGInterfaceAir, BlakeGNarrowAir, COL_ABSORPTION_ID,
+        COL_BLAKEG_END, COL_CAP_BEGIN, COL_CV_IN_BEGIN, COL_IN_MULTIPLICITY, COL_IS_ABSORB,
+        COL_IS_GENERIC, COL_IS_HEAD, COL_IS_OUTPUT, COL_IS_PAYLOAD, COL_OUT_MULTIPLICITY,
+        COL_REMAINING, EIDOS_DOMAIN_NODE, EidosCap, EidosChainInputMsg, EidosDigest, EidosOutMsg,
+        INTERNAL_CV_BUS_ID, NUM_AUX_COLS, NUM_MAIN_COLS,
         blakeg::{
             layout::{
-                BLOCK_PERIOD as BLAKEG_COMPRESSION_CYCLE_LEN, BYTE_SLOT_WIDTH, F_C_BASE_COL,
-                F_C_CANON_INV_COL, F_C_CANON_Z_COL, F_COMPRESSION_CYCLE_ID_COL, F_D_BASE_COL,
-                F_FUTURE_W_BASE_COL, F_HIN_SLOT_BASE_COL, F_MSG_GROUP_BASE_COL, F_MSG_GROUP_SLOTS,
-                F_R_BASE_COL, F_R_CANON_INV_BASE_COL, F_R_CANON_Z_BASE_COL, FOOTER_ROWS,
-                FOOTER_START, G_A_BASE_COL, G_C_BASE_COL, G_K2_BASE_COL, G_K3_BIT0_BASE_COL,
-                G_K3_BIT1_BASE_COL, NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS,
-                footer_future_w_indices, g_bd_rot_slot_col, g_msg_slot_col,
+                BLOCK_PERIOD as BLAKEG_COMPRESSION_CYCLE_LEN, F_COMPRESSION_CYCLE_ID_COL,
+                F_CV_STORAGE_COLS, FOOTER_START, G_COMPRESSION_CYCLE_ID_COL,
+                NUM_COLS as NUM_BLAKEG_COMPRESSION_COLS, footer_digest_col, footer_r_col,
             },
             trace::{
                 BlakeGFeltTraceBlock, generate_felt_trace_block_with_cycle_id,
@@ -124,6 +122,37 @@ fn narrow_balance(
     check_trace_balance(&air, trace, &air.periodic_columns(), &[], &[], challenges)
 }
 
+fn parent_matrix_from_core(trace: &RowMajorMatrix<Felt>) -> RowMajorMatrix<Felt> {
+    let mut values =
+        Vec::with_capacity(trace.values.len() / NUM_BLAKEG_COMPRESSION_COLS * NUM_MAIN_COLS);
+    for row in trace.values.chunks_exact(NUM_BLAKEG_COMPRESSION_COLS) {
+        values.extend_from_slice(row);
+        values.extend([Felt::ZERO; NUM_MAIN_COLS - NUM_BLAKEG_COMPRESSION_COLS]);
+    }
+    RowMajorMatrix::new(values, NUM_MAIN_COLS)
+}
+
+fn interface_lookup_challenges() -> Challenges<QuadFelt> {
+    Challenges::new(
+        QuadFelt::from_u64(101),
+        QuadFelt::from_u64(103),
+        MAX_MESSAGE_WIDTH,
+        NUM_BUS_IDS,
+    )
+}
+
+fn interface_balance(trace: &RowMajorMatrix<Felt>) -> BalanceReport {
+    let air = BlakeGInterfaceAir;
+    check_trace_balance(
+        &air,
+        trace,
+        &air.periodic_columns(),
+        &[],
+        &[],
+        &interface_lookup_challenges(),
+    )
+}
+
 fn net_multiplicity(report: &BalanceReport, denominator: QuadFelt) -> Felt {
     report
         .unmatched
@@ -153,42 +182,84 @@ fn caps_match_vm_sources() {
 }
 
 #[test]
-fn typed_cap_messages_are_domain_distinct() {
+fn atomic_chain_input_messages_bind_domain_and_every_payload_field() {
     let challenges = Challenges::<QuadFelt>::new(
         QuadFelt::from_u64(7),
         QuadFelt::from_u64(5),
         MAX_MESSAGE_WIDTH,
         NUM_BUS_IDS,
     );
-    let seq = Felt::from_u32(1);
-    let chunk = [Felt::ZERO; 4];
-    let messages = [
-        EidosInMsg::rate0(seq, chunk).encode(&challenges),
-        EidosInMsg::rate1(seq, chunk).encode(&challenges),
-        EidosInMsg::cap_node(seq, chunk).encode(&challenges),
-        EidosInMsg::cap_and(seq, chunk).encode(&challenges),
-        EidosInMsg::cap_chunks(seq, chunk).encode(&challenges),
-    ];
-    for (i, lhs) in messages.iter().enumerate() {
-        for rhs in messages.iter().skip(i + 1) {
-            assert_ne!(lhs, rhs);
-        }
-    }
-    assert_ne!(
-        EidosInMsg::rate0(seq, chunk).encode(&challenges),
-        EidosOutMsg { absorption_id: seq, digest: chunk }.encode(&challenges),
+    let chain_step_id = Felt::from_u32(1);
+    let message = core::array::from_fn(|idx| Felt::from_u32(10 + idx as u32));
+    let chain_context = core::array::from_fn(|idx| Felt::from_u32(30 + idx as u32));
+    let node = EidosChainInputMsg::node(chain_step_id, message, chain_context).encode(&challenges);
+
+    let [m0, m1, m2, m3, m4, m5, m6, m7] = message;
+    let [c0, c1, c2, c3] = chain_context;
+    assert_eq!(
+        node,
+        challenges.encode(
+            BusId::EidosIn as usize,
+            [
+                chain_step_id,
+                Felt::from_u8(EIDOS_DOMAIN_NODE),
+                m0,
+                m1,
+                m2,
+                m3,
+                m4,
+                m5,
+                m6,
+                m7,
+                c0,
+                c1,
+                c2,
+                c3,
+            ],
+        ),
+        "atomic chain input field order drifted",
     );
+
+    assert_ne!(
+        node,
+        EidosChainInputMsg::and(chain_step_id, message, chain_context).encode(&challenges),
+    );
+    assert_ne!(
+        node,
+        EidosChainInputMsg::chunks(chain_step_id, message, chain_context).encode(&challenges),
+    );
+
+    for field in 0..8 {
+        let mut mutated = message;
+        mutated[field] += Felt::ONE;
+        assert_ne!(
+            node,
+            EidosChainInputMsg::node(chain_step_id, mutated, chain_context).encode(&challenges),
+            "message field {field} was not bound",
+        );
+    }
+    for field in 0..4 {
+        let mut mutated = chain_context;
+        mutated[field] += Felt::ONE;
+        assert_ne!(
+            node,
+            EidosChainInputMsg::node(chain_step_id, message, mutated).encode(&challenges),
+            "chain-context field {field} was not bound",
+        );
+    }
+    assert_ne!(node, EidosOutMsg { chain_step_id, digest: chain_context }.encode(&challenges),);
 }
 
 #[test]
 fn air_layout_matches_32_row_blakeg_spec() {
     assert_eq!(BLAKEG_COMPRESSION_CYCLE_LEN, 32);
-    assert_eq!(COL_BLAKEG_END, 128);
-    assert_eq!(COL_IS_HEAD, 131);
-    assert_eq!(COL_IS_ABSORB, 132);
-    assert_eq!(COL_CAP_BEGIN, 140);
-    assert_eq!(COL_CV_IN_BEGIN, 144);
-    assert_eq!(NUM_MAIN_COLS, 148);
+    assert_eq!(COL_BLAKEG_END, 108);
+    assert_eq!(COL_IS_HEAD, 111);
+    assert_eq!(COL_IS_ABSORB, 112);
+    assert_eq!(COL_CAP_BEGIN, 120);
+    assert_eq!(COL_CV_IN_BEGIN, 124);
+    assert_eq!(NUM_MAIN_COLS, 128);
+    assert_eq!(NUM_AUX_COLS, 20);
 
     let layout =
         <BlakeGCompressionAir as LiftedAir<Felt, QuadFelt>>::air_layout(&BlakeGCompressionAir);
@@ -206,6 +277,84 @@ fn air_layout_matches_32_row_blakeg_spec() {
             .collect::<Vec<_>>(),
         vec![BLAKEG_COMPRESSION_CYCLE_LEN; 14],
     );
+}
+
+#[test]
+fn constraint_degree_remains_three() {
+    let degree = ConstraintDegrees::from_air::<Felt, QuadFelt, _>(&BlakeGCompressionAir);
+    assert_eq!(degree, ConstraintDegrees { base: 3, ext: 3 });
+    assert_eq!(crate::tests::log_quotient_degree(&BlakeGCompressionAir), 1);
+}
+
+#[test]
+fn lookup_degree_annotations_match_the_two_family_layout() {
+    let common = |trace_width, permutation_width| ValidateLayout {
+        preprocessed_width: 0,
+        trace_width,
+        num_public_values: NUM_PUBLIC_VALUES,
+        num_periodic_columns: 14,
+        permutation_width,
+        num_permutation_challenges: NUM_RANDOMNESS,
+        num_permutation_values: 1,
+    };
+
+    BlakeGNarrowAir
+        .validate(common(NUM_BLAKEG_COMPRESSION_COLS, 18))
+        .unwrap_or_else(|error| panic!("PVM BlakeG core lookup validation failed: {error}"));
+    BlakeGInterfaceAir
+        .validate(common(NUM_MAIN_COLS, 2))
+        .unwrap_or_else(|error| panic!("PVM BlakeG interface lookup validation failed: {error}"));
+}
+
+#[test]
+fn lookup_interaction_liveness_matches_the_18_plus_2_design() {
+    let mut requires = EidosRequires::new();
+    let output = requires.require_absorption(EidosCap::and(), [block(10)]);
+    requires.require_digest(output.digest);
+    let compression = generate_traces(requires).compression;
+    let core = crate::composite::extract_band(&compression, 0..NUM_BLAKEG_COMPRESSION_COLS);
+
+    let narrow = build_lookup_fractions(
+        &BlakeGNarrowAir,
+        &core,
+        None,
+        &BlakeGNarrowAir.periodic_columns(),
+        &miden_lookup_challenges(),
+    );
+    assert_eq!(narrow.shape(), &[2; 18]);
+    for row in 0..BLAKEG_COMPRESSION_CYCLE_LEN {
+        let actual = &narrow.counts()[row * 18..(row + 1) * 18];
+        if row < FOOTER_START {
+            assert_eq!(actual, &[2; 18], "fused row {row}");
+        } else {
+            let mut expected = [0; 18];
+            expected[..9].fill(2);
+            expected[11..13].fill(2);
+            expected[13] = 1;
+            expected[14] = 2;
+            expected[16..18].fill(2);
+            assert_eq!(actual, &expected, "footer row {row}");
+            assert_eq!(actual.iter().sum::<usize>(), 29);
+        }
+    }
+
+    let interface = build_lookup_fractions(
+        &BlakeGInterfaceAir,
+        &compression,
+        None,
+        &BlakeGInterfaceAir.periodic_columns(),
+        &interface_lookup_challenges(),
+    );
+    assert_eq!(interface.shape(), &[1, 2]);
+    for row in 0..BLAKEG_COMPRESSION_CYCLE_LEN {
+        let actual = &interface.counts()[row * 2..(row + 1) * 2];
+        let expected = match row {
+            0 => [0, 1],
+            31 => [1, 2],
+            _ => [0, 0],
+        };
+        assert_eq!(actual, expected, "interface row {row}");
+    }
 }
 
 #[test]
@@ -262,7 +411,7 @@ fn digests_match_eidos_framing_and_integrated_blakeg_air_holds() {
     let footer_digest = |cycle: usize| {
         let footer = cycle * BLAKEG_COMPRESSION_CYCLE_LEN + BLAKEG_COMPRESSION_CYCLE_LEN - 1;
         core::array::from_fn(|i| {
-            traces.compression.values[footer * NUM_MAIN_COLS + F_D_BASE_COL + i]
+            traces.compression.values[footer * NUM_MAIN_COLS + footer_digest_col(i)]
         })
     };
     assert_eq!(footer_digest(0), and.digest.as_array());
@@ -300,9 +449,8 @@ fn identical_blakeg_states_remain_distinct_ordered_pvm_cycles() {
     // BlakeG states are identical. They must nevertheless remain two physical cycles because the
     // external absorption IDs and distinct tag-finalization cycles are ordered protocol data.
     let second_start = 2 * BLAKEG_COMPRESSION_CYCLE_LEN * NUM_MAIN_COLS;
-    let cycle_id_cells = core::array::from_fn::<_, 4, _>(|g| g_msg_slot_col(g, 2));
     for col in 0..NUM_BLAKEG_COMPRESSION_COLS {
-        if !cycle_id_cells.contains(&col) {
+        if col != G_COMPRESSION_CYCLE_ID_COL {
             assert_eq!(compression.values[col], compression.values[second_start + col]);
         }
     }
@@ -327,27 +475,28 @@ fn physical_cycle_id_rejects_two_cycle_cv_swap() {
     rewrite_felt_footer_for_test(&mut forged_a.rows, block_a, cv_a, forged_a.final_v, 0);
     rewrite_felt_footer_for_test(&mut forged_b.rows, block_b, cv_b, forged_b.final_v, 1);
 
-    let forged = two_cycle_matrix(&forged_a, &forged_b);
-    // Every polynomial constraint still holds; rejection comes specifically from the tagged
-    // internal CV bus when the complete LogUp balance is checked.
-    crate::tests::check_local(BlakeGNarrowAir, &forged);
-    let challenges = miden_lookup_challenges();
-    let report = narrow_balance(&forged, &challenges);
+    let forged_core = two_cycle_matrix(&forged_a, &forged_b);
+    // Every core polynomial constraint still holds. Rejection comes specifically from the
+    // cycle-tagged atomic CV bridge in the PVM interface lookup family.
+    crate::tests::check_local(BlakeGNarrowAir, &forged_core);
+    let forged = parent_matrix_from_core(&forged_core);
+    let challenges = interface_lookup_challenges();
+    let report = interface_balance(&forged);
+    assert!(report.mutex_violations.is_empty());
+    assert_eq!(report.unmatched.len(), 4);
     for (cycle_id, consumed, advertised) in [(0u64, cv_b, cv_a), (1, cv_a, cv_b)] {
-        for pair in 0..FOOTER_ROWS {
-            let encode = |cv: [u32; 8]| {
-                challenges.encode(
-                    MidenBusId::BlakeGInputWord as usize,
-                    [
-                        Felt::new_unchecked(FOOTER_ROWS as u64 * cycle_id + pair as u64),
-                        Felt::from(cv[2 * pair]),
-                        Felt::from(cv[2 * pair + 1]),
-                    ],
-                )
-            };
-            assert_eq!(net_multiplicity(&report, encode(consumed)), -Felt::ONE);
-            assert_eq!(net_multiplicity(&report, encode(advertised)), Felt::ONE);
-        }
+        let encode = |cv: [u32; 8]| {
+            let fields: [Felt; 9] = core::array::from_fn(|idx| {
+                if idx == 0 {
+                    Felt::new_unchecked(cycle_id)
+                } else {
+                    Felt::from(cv[idx - 1])
+                }
+            });
+            challenges.encode(INTERNAL_CV_BUS_ID, fields)
+        };
+        assert_eq!(net_multiplicity(&report, encode(consumed)), -Felt::ONE);
+        assert_eq!(net_multiplicity(&report, encode(advertised)), Felt::ONE);
     }
 }
 
@@ -360,28 +509,10 @@ fn physical_cycle_id_rejects_two_cycle_message_swap() {
 
     // Each computation consumes the other cycle's block. Replace only its footer's advertised
     // block, leaving the computed BlakeG output intact.
-    let advertised_a = generate_felt_trace_block_with_cycle_id(block_a, cv_a, 0);
-    let advertised_b = generate_felt_trace_block_with_cycle_id(block_b, cv_b, 1);
     let mut forged_a = generate_felt_trace_block_with_cycle_id(block_b, cv_a, 0);
     let mut forged_b = generate_felt_trace_block_with_cycle_id(block_a, cv_b, 1);
-    for (forged, advertised) in [(&mut forged_a, &advertised_a), (&mut forged_b, &advertised_b)] {
-        for row in FOOTER_START..BLAKEG_COMPRESSION_CYCLE_LEN {
-            forged.rows[row]
-                [F_MSG_GROUP_BASE_COL..F_MSG_GROUP_BASE_COL + BYTE_SLOT_WIDTH * F_MSG_GROUP_SLOTS]
-                .copy_from_slice(
-                    &advertised.rows[row][F_MSG_GROUP_BASE_COL
-                        ..F_MSG_GROUP_BASE_COL + BYTE_SLOT_WIDTH * F_MSG_GROUP_SLOTS],
-                );
-            forged.rows[row][F_R_BASE_COL..F_R_BASE_COL + 8]
-                .copy_from_slice(&advertised.rows[row][F_R_BASE_COL..F_R_BASE_COL + 8]);
-            forged.rows[row][F_R_CANON_INV_BASE_COL..F_R_CANON_INV_BASE_COL + 2].copy_from_slice(
-                &advertised.rows[row][F_R_CANON_INV_BASE_COL..F_R_CANON_INV_BASE_COL + 2],
-            );
-            forged.rows[row][F_R_CANON_Z_BASE_COL..F_R_CANON_Z_BASE_COL + 2].copy_from_slice(
-                &advertised.rows[row][F_R_CANON_Z_BASE_COL..F_R_CANON_Z_BASE_COL + 2],
-            );
-        }
-    }
+    rewrite_felt_footer_for_test(&mut forged_a.rows, block_a, cv_a, forged_a.final_v, 0);
+    rewrite_felt_footer_for_test(&mut forged_b.rows, block_b, cv_b, forged_b.final_v, 1);
 
     let forged = two_cycle_matrix(&forged_a, &forged_b);
     crate::tests::check_local(BlakeGNarrowAir, &forged);
@@ -424,7 +555,7 @@ fn physical_cycle_id_is_constant_across_fused_rows() {
     let cv = core::array::from_fn(|i| 1_000 + i as u32);
     let mut first = generate_felt_trace_block_with_cycle_id(block, cv, 0);
     let second = generate_felt_trace_block_with_cycle_id(block, cv, 1);
-    first.rows[1][g_msg_slot_col(0, 2)] = Felt::ONE;
+    first.rows[1][G_COMPRESSION_CYCLE_ID_COL] = Felt::ONE;
 
     crate::tests::check_local(BlakeGNarrowAir, &two_cycle_matrix(&first, &second));
 }
@@ -463,11 +594,7 @@ fn pvm_trace_writer_rejects_noncanonical_packed_input() {
 
 #[test]
 fn mvm_and_pvm_writers_agree_on_shared_blakeg_witness() {
-    const TWO_POW_32: Felt = Felt::new_unchecked(1 << 32);
-    const MISSING_ROTATION_G: usize = mvm_blakeg::NUM_G - 1;
-    const MISSING_ROTATION_BYTE: usize = mvm_blakeg::BYTES_PER_WORD - 1;
-
-    assert_eq!(NUM_BLAKEG_COMPRESSION_COLS, 128);
+    assert_eq!(NUM_BLAKEG_COMPRESSION_COLS, 108);
     assert_eq!(mvm_blakeg::NUM_BLAKEG_COMPRESSION_COLS, 108);
 
     for case in 0..16_u32 {
@@ -485,157 +612,19 @@ fn mvm_and_pvm_writers_agree_on_shared_blakeg_witness() {
         let mvm = generate_mvm_block(block, cv, MvmTraceMode::Compression);
 
         assert_eq!(pvm.final_v, mvm.final_v, "final working state differs in case {case}");
-
-        for row in 0..FOOTER_START {
-            for col in 0..mvm_blakeg::g_msg_word_col(0) {
+        for row in 0..BLAKEG_COMPRESSION_CYCLE_LEN {
+            for col in 0..NUM_BLAKEG_COMPRESSION_COLS {
+                // The MVM-only compression-link multiplicity occupies an otherwise unused PVM
+                // footer cell. It is outside the shared BlakeG witness contract.
+                if row >= FOOTER_START
+                    && (col == mvm_blakeg::F_COMPRESSION_MULTIPLICITY_COL
+                        || F_CV_STORAGE_COLS.contains(&col))
+                {
+                    continue;
+                }
                 assert_eq!(
                     pvm.rows[row][col], mvm.rows[row][col],
-                    "MVM/PVM shared fused cell mismatch in case {case}, row {row}, column {col}",
-                );
-            }
-
-            // The MVM omits this result cell and reconstructs it from the next-row B total.
-            let next_b_sum = (0..mvm_blakeg::NUM_G).fold(Felt::ZERO, |sum, g| {
-                sum + (0..mvm_blakeg::BYTES_PER_WORD).fold(Felt::ZERO, |word, byte| {
-                    word + Felt::new_unchecked(1 << (8 * byte))
-                        * mvm.rows[row + 1][mvm_blakeg::g_bd_rot_slot_col(g, byte, 0)]
-                })
-            });
-            let stored_rotation_sum = (0..mvm_blakeg::NUM_G).fold(Felt::ZERO, |sum, g| {
-                sum + (0..mvm_blakeg::BYTES_PER_WORD).fold(Felt::ZERO, |word, byte| {
-                    match mvm_blakeg::g_bd_rot_result_col(g, byte) {
-                        Some(col) => word + mvm.rows[row][col],
-                        None => word,
-                    }
-                })
-            });
-            assert_eq!(
-                pvm.rows[row][g_bd_rot_slot_col(MISSING_ROTATION_G, MISSING_ROTATION_BYTE, 2)],
-                next_b_sum - stored_rotation_sum,
-                "MVM-derived/PVM-stored rotation mismatch in case {case}, row {row}",
-            );
-
-            assert_eq!(
-                &pvm.rows[row][G_K2_BASE_COL..G_K2_BASE_COL + 4],
-                &mvm.rows[row][mvm_blakeg::G_K2_BASE_COL..mvm_blakeg::G_K2_BASE_COL + 4],
-                "MVM/PVM carry mismatch in case {case}, row {row}",
-            );
-
-            for g in 0..4 {
-                let pack_slot_field = |column: fn(usize, usize, usize) -> usize, field| {
-                    (0..4).fold(Felt::ZERO, |value, byte| {
-                        value
-                            + Felt::new_unchecked(1 << (8 * byte))
-                                * mvm.rows[row][column(g, byte, field)]
-                    })
-                };
-                let a_new = pack_slot_field(mvm_blakeg::g_ac_byte_slot_col, 1);
-                let b = pack_slot_field(mvm_blakeg::g_bd_rot_slot_col, 0);
-                let msg = mvm.rows[row][mvm_blakeg::g_msg_word_col(g)];
-                let k3 = mvm.rows[row][mvm_blakeg::g_k3_col(g)];
-                let pvm_k3 = pvm.rows[row][G_K3_BIT0_BASE_COL + g]
-                    + Felt::from_u8(2) * pvm.rows[row][G_K3_BIT1_BASE_COL + g];
-                assert_eq!(pvm_k3, k3, "MVM/PVM k3 mismatch in case {case}, row {row}, G {g}");
-                assert_eq!(
-                    pvm.rows[row][G_A_BASE_COL + g],
-                    a_new + TWO_POW_32 * k3 - b - msg,
-                    "MVM reconstruction of PVM a input failed in case {case}, row {row}, G {g}",
-                );
-
-                let c_new = pack_slot_field(mvm_blakeg::g_bd_rot_slot_col, 1);
-                let xor_word = (0..4).fold(0_u32, |word, byte| {
-                    let base = mvm_blakeg::g_ac_byte_slot_col(g, byte, 0);
-                    let lhs = mvm.rows[row][base].as_canonical_u64() as u8;
-                    let rhs = mvm.rows[row][base + 1].as_canonical_u64() as u8;
-                    word | (u32::from(lhs ^ rhs) << (8 * byte))
-                });
-                let first_rotation = if row % 2 == 0 { 16 } else { 8 };
-                let d_new = Felt::from_u32(xor_word.rotate_right(first_rotation));
-                let k2 = mvm.rows[row][mvm_blakeg::G_K2_BASE_COL + g];
-                assert_eq!(
-                    pvm.rows[row][G_C_BASE_COL + g],
-                    c_new + TWO_POW_32 * k2 - d_new,
-                    "MVM reconstruction of PVM c input failed in case {case}, row {row}, G {g}",
-                );
-            }
-        }
-
-        for footer in 0..FOOTER_ROWS {
-            let row = FOOTER_START + footer;
-            for col in 0..F_HIN_SLOT_BASE_COL {
-                assert_eq!(
-                    pvm.rows[row][col], mvm.rows[row][col],
-                    "MVM/PVM shared footer cell mismatch in case {case}, footer {footer}, column {col}",
-                );
-            }
-
-            for idx in 0..2 * footer {
-                assert_eq!(
-                    pvm.rows[row][F_R_BASE_COL + idx],
-                    mvm.rows[row][mvm_blakeg::footer_r_col(footer, idx)],
-                    "MVM/PVM carried R mismatch in case {case}, footer {footer}, field {idx}",
-                );
-            }
-            for pair in 0..2 {
-                let lo = mvm.rows[row][mvm_blakeg::footer_msg_word_col(2 * pair)];
-                let hi = mvm.rows[row][mvm_blakeg::footer_msg_word_col(2 * pair + 1)];
-                assert_eq!(
-                    pvm.rows[row][F_R_BASE_COL + 2 * footer + pair],
-                    lo + TWO_POW_32 * hi,
-                    "MVM/PVM current R mismatch in case {case}, footer {footer}, pair {pair}",
-                );
-            }
-
-            for idx in 0..=footer {
-                assert_eq!(
-                    pvm.rows[row][F_D_BASE_COL + idx],
-                    mvm.rows[row][mvm_blakeg::footer_interface_tail_col(idx)],
-                    "MVM/PVM output field mismatch in case {case}, footer {footer}, field {idx}",
-                );
-            }
-            for idx in 0..footer_future_w_indices(footer).len() {
-                assert_eq!(
-                    pvm.rows[row][F_FUTURE_W_BASE_COL + idx],
-                    mvm.rows[row][mvm_blakeg::footer_future_w_col(footer, idx)],
-                    "MVM/PVM future-state mismatch in case {case}, footer {footer}, field {idx}",
-                );
-            }
-
-            for pair in 0..2 {
-                assert_eq!(
-                    pvm.rows[row][F_R_CANON_INV_BASE_COL + pair],
-                    mvm.rows[row][mvm_blakeg::F_R_CANON_INV_BASE_COL + pair],
-                    "MVM/PVM R inverse mismatch in case {case}, footer {footer}, pair {pair}",
-                );
-                assert_eq!(
-                    pvm.rows[row][F_R_CANON_Z_BASE_COL + pair],
-                    mvm.rows[row][mvm_blakeg::F_R_CANON_Z_BASE_COL + pair],
-                    "MVM/PVM R zero flag mismatch in case {case}, footer {footer}, pair {pair}",
-                );
-            }
-            assert_eq!(
-                pvm.rows[row][F_C_CANON_INV_COL],
-                mvm.rows[row][mvm_blakeg::F_C_CANON_INV_COL],
-                "MVM/PVM CV inverse mismatch in case {case}, footer {footer}",
-            );
-            assert_eq!(
-                pvm.rows[row][F_C_CANON_Z_COL],
-                mvm.rows[row][mvm_blakeg::F_C_CANON_Z_COL],
-                "MVM/PVM CV zero flag mismatch in case {case}, footer {footer}",
-            );
-            assert_eq!(
-                pvm.rows[row][F_COMPRESSION_CYCLE_ID_COL],
-                mvm.rows[row][mvm_blakeg::F_COMPRESSION_CYCLE_ID_COL],
-                "MVM/PVM cycle ID mismatch in case {case}, footer {footer}",
-            );
-
-            for idx in 0..=footer {
-                let expected =
-                    Felt::from_u32(cv[2 * idx]) + TWO_POW_32 * Felt::from_u32(cv[2 * idx + 1]);
-                assert_eq!(
-                    pvm.rows[row][F_C_BASE_COL + idx],
-                    expected,
-                    "PVM packed CV mismatch in case {case}, footer {footer}, field {idx}",
+                    "MVM/PVM witness mismatch in case {case}, row {row}, column {col}",
                 );
             }
         }
@@ -726,6 +715,36 @@ fn padding_cycle_cannot_emit_unproved_payload() {
 
 #[test]
 #[should_panic(expected = "constraint not satisfied")]
+fn input_multiplicity_is_zero_off_payload_cycles() {
+    let mut requires = EidosRequires::new();
+    let generic = requires.require_absorption(EidosCap::keccak256_assertion(8), [block(10)]);
+    requires.require_digest(generic.digest);
+    let mut compression = generate_traces(requires).compression;
+
+    // Cycle 1 is the generic tag-finalization compression: active and output, but not payload.
+    for row in BLAKEG_COMPRESSION_CYCLE_LEN..2 * BLAKEG_COMPRESSION_CYCLE_LEN {
+        compression.values[row * NUM_MAIN_COLS + COL_IN_MULTIPLICITY] = Felt::ONE;
+    }
+    crate::tests::check_local(BlakeGCompressionAir, &compression);
+}
+
+#[test]
+#[should_panic(expected = "constraint not satisfied")]
+fn output_multiplicity_is_zero_off_output_cycles() {
+    let mut requires = EidosRequires::new();
+    let chunks = requires.require_absorption(EidosCap::chunk(), [block(1), block(11)]);
+    requires.require_digest(chunks.digest);
+    let mut compression = generate_traces(requires).compression;
+
+    // Cycle 0 is a payload chain head but not the terminal output cycle.
+    for row in 0..BLAKEG_COMPRESSION_CYCLE_LEN {
+        compression.values[row * NUM_MAIN_COLS + COL_OUT_MULTIPLICITY] = Felt::ONE;
+    }
+    crate::tests::check_local(BlakeGCompressionAir, &compression);
+}
+
+#[test]
+#[should_panic(expected = "constraint not satisfied")]
 fn continuation_payload_id_must_follow_the_chain() {
     let mut requires = EidosRequires::new();
     let chunks = requires.require_absorption(EidosCap::chunk(), [block(1), block(11)]);
@@ -746,7 +765,7 @@ fn native_blakeg_core_witness_is_not_a_free_bridge_input() {
     let mut compression = generate_traces(requires).compression;
 
     let row = FOOTER_START + 1;
-    compression.values[row * NUM_MAIN_COLS + F_R_BASE_COL + 2] += Felt::ONE;
+    compression.values[row * NUM_MAIN_COLS + footer_r_col(1, 0)] += Felt::ONE;
     crate::tests::check_local(BlakeGCompressionAir, &compression);
 }
 

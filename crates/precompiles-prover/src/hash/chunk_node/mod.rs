@@ -32,7 +32,7 @@ use crate::{
     logup::{Deg, LookupBatch, LookupBuilder, LookupColumn, LookupGroup, frac_col},
     transcript::{
         binding::BindingMsg,
-        eidos::{EidosInMsg, EidosOutMsg},
+        eidos::{EidosChainInputMsg, EidosOutMsg},
     },
     utils::{current_main, next_main},
 };
@@ -178,8 +178,6 @@ where
     let pos_act: LB::Expr = act.clone();
     let pos_act_head: LB::Expr = act * is_head;
 
-    let rate0_chunk = [f[0].clone(), f[1].clone(), f[2].clone(), f[3].clone()];
-    let rate1_chunk = [f[4].clone(), f[5].clone(), f[6].clone(), f[7].clone()];
     let cap_chunk = Tag::CHUNKS.as_word().map(LB::Expr::from);
 
     let interaction_deg = Deg { v: 1, u: 1 };
@@ -241,26 +239,9 @@ where
             interaction_deg
         ),
         (
-            "rate0",
+            "eidos-chain-input",
             pos_act.clone(),
-            EidosInMsg::rate0(absorption_id.clone(), rate0_chunk),
-            interaction_deg
-        ),
-    );
-    frac_col!(
-        builder,
-        "eidos-in",
-        pair_deg,
-        (
-            "rate1",
-            pos_act,
-            EidosInMsg::rate1(absorption_id.clone(), rate1_chunk),
-            interaction_deg
-        ),
-        (
-            "cap",
-            pos_act_head.clone(),
-            EidosInMsg::cap_chunks(absorption_id.clone(), cap_chunk),
+            EidosChainInputMsg::chunks(absorption_id.clone(), f, cap_chunk),
             interaction_deg
         ),
     );
@@ -324,9 +305,6 @@ where
         LB::Expr::ZERO,
     ];
 
-    let d_rate0 = [d[0].clone(), d[1].clone(), d[2].clone(), d[3].clone()];
-    let d_rate1 = [d[4].clone(), d[5].clone(), d[6].clone(), d[7].clone()];
-
     frac_col!(
         builder,
         "handshake-and-chunks-digest",
@@ -370,7 +348,7 @@ where
             "p2out-h-input-chunks",
             pos_act.clone(),
             EidosOutMsg {
-                absorption_id: absorption_id_chunks_tail,
+                chain_step_id: absorption_id_chunks_tail,
                 digest: h_input_chunks.clone()
             },
             interaction_deg
@@ -435,33 +413,16 @@ where
         "digest-chunks-eidos",
         pair_deg,
         (
-            "p2in-rate0",
+            "eidos-chain-input",
             pos_act.clone(),
-            EidosInMsg::rate0(absorption_id_digest_chunks.clone(), d_rate0),
+            EidosChainInputMsg::chunks(absorption_id_digest_chunks.clone(), d, cap_digest_chunks,),
             interaction_deg
         ),
         (
-            "p2in-rate1",
-            pos_act.clone(),
-            EidosInMsg::rate1(absorption_id_digest_chunks.clone(), d_rate1),
-            interaction_deg
-        ),
-    );
-    frac_col!(
-        builder,
-        "digest-chunks-eidos",
-        pair_deg,
-        (
-            "p2in-cap",
-            pos_act.clone(),
-            EidosInMsg::cap_chunks(absorption_id_digest_chunks.clone(), cap_digest_chunks,),
-            interaction_deg
-        ),
-        (
-            "p2out-h-digest-chunks",
+            "eidos-chain-output",
             pos_act.clone(),
             EidosOutMsg {
-                absorption_id: absorption_id_digest_chunks,
+                chain_step_id: absorption_id_digest_chunks,
                 digest: h_digest_chunks.clone()
             },
             interaction_deg
@@ -473,33 +434,26 @@ where
         "keccak-eidos",
         pair_deg,
         (
-            "p2in-rate0",
+            "eidos-chain-input",
             pos_act.clone(),
-            EidosInMsg::rate0(absorption_id_keccak.clone(), h_input_chunks),
+            EidosChainInputMsg::node(
+                absorption_id_keccak.clone(),
+                core::array::from_fn(|idx| {
+                    if idx < 4 {
+                        h_input_chunks[idx].clone()
+                    } else {
+                        h_digest_chunks[idx - 4].clone()
+                    }
+                }),
+                cap_keccak,
+            ),
             interaction_deg
         ),
         (
-            "p2in-rate1",
-            pos_act.clone(),
-            EidosInMsg::rate1(absorption_id_keccak.clone(), h_digest_chunks),
-            interaction_deg
-        ),
-    );
-    frac_col!(
-        builder,
-        "keccak-eidos",
-        pair_deg,
-        (
-            "p2in-cap",
-            pos_act.clone(),
-            EidosInMsg::cap_node(absorption_id_keccak.clone(), cap_keccak),
-            interaction_deg
-        ),
-        (
-            "p2out-h-keccak",
+            "eidos-chain-output",
             pos_act,
             EidosOutMsg {
-                absorption_id: absorption_id_keccak,
+                chain_step_id: absorption_id_keccak,
                 digest: h_keccak
             },
             interaction_deg

@@ -2,10 +2,10 @@
 //! shapes the deferred transcript's native Eidos/BlakeG chiplet hands around.
 //!
 //! Without these, [`EidosDigest`] (output of the framed compression chain) and
-//! [`EidosCap`] (capacity prefix carrying a domain separator such as a
+//! [`EidosCap`] (chain framing context carrying a domain separator such as a
 //! VM deferred tag word or a prover-local explicit pin tuple) collapse
 //! to the same primitive type — the compiler can't catch a
-//! digest accidentally fed in as a cap (or vice versa).
+//! digest accidentally fed in as framing context (or vice versa).
 
 use core::cmp::Ordering;
 
@@ -47,10 +47,10 @@ impl From<Digest> for EidosDigest {
     }
 }
 
-/// Semantic tag/cap for a framed Eidos absorption. VM deferred caps are raw
-/// VM tag words; prover-local explicit-pin caps keep their local tuple.
-/// Constructors for off-pattern caps stay open via the tuple-struct
-/// constructor.
+/// Semantic framing context for an Eidos chain. The legacy `Cap` name is retained at API call sites
+/// pending a repository-wide terminology migration. VM deferred contexts are raw VM tag words;
+/// prover-local explicit-pin contexts keep their local tuple. Constructors for off-pattern
+/// contexts stay open via the tuple-struct constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct EidosCap(pub [Felt; 4]);
 
@@ -128,10 +128,10 @@ impl EidosCap {
         Self([CurvePrecompile::id(), Felt::from_u32(op_id as u32), Felt::ZERO, Felt::ZERO])
     }
 
-    /// VM curve MSM capacity: `[CurvePrecompile::id(), MSM_OP_ID, 0, 0]` —
-    /// the **IV** of an MSM-claim chaining sponge, fed to the *first* absorb.
-    /// Subsequent absorbs thread the VM PairList capacity lanes `out[8..12]`,
-    /// not the digest lanes `out[0..4]`. See the design notes.
+    /// VM curve MSM framing context: `[CurvePrecompile::id(), MSM_OP_ID, 0, 0]`.
+    ///
+    /// The legacy `iv` suffix is retained for compatibility. Eidos binds this context in the
+    /// chain's terminal framing block; it is not a live chaining value fed into the first step.
     pub fn ec_msm_iv() -> Self {
         Self([
             CurvePrecompile::id(),

@@ -107,8 +107,8 @@ use crate::{
 ///
 /// Carrying `bound_ptr` lets any consumer (eval hash, add/mul) recover
 /// the modulus in the same lookup. The limb layout mirrors
-/// [`EidosInMsg`](crate::transcript::eidos::EidosInMsg) so the
-/// eval chip can pin the whole value straight into its rate lanes.
+/// [`EidosChainInputMsg`](crate::transcript::eidos::EidosChainInputMsg) so the eval chip can pin
+/// the whole value directly into one chaining-input message.
 ///
 /// Encoded as `bus_prefix[UintVal] + β⁰·ptr + β¹·bound_ptr + β²·c0 + … +
 /// β⁹·c7`.

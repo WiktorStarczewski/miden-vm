@@ -87,7 +87,7 @@ use crate::{
     relations::{MAX_MESSAGE_WIDTH, NUM_BUS_IDS},
     transcript::{
         binding::{BindingMsg, ValueTag},
-        eidos::{EidosInMsg, EidosOutMsg},
+        eidos::{EIDOS_DOMAIN_AND, EIDOS_DOMAIN_NODE, EidosChainInputMsg, EidosOutMsg},
         nodes::UintOpId,
     },
     uint::{UintValMsg, add::UintAddMsg, mul::UintMulMsg},
@@ -322,29 +322,27 @@ pub const NUM_PUBLIC_VALUES: usize = PUBLIC_ROOT_END;
 // AUX LAYOUT
 // ================================================================================================
 //
-// 16 aux columns, flattened via `frac_col!` so every closing constraint
+// 14 aux columns, flattened via `frac_col!` so every closing constraint
 // stays at degree ≤ 3 → `log_quotient_degree = 1`, one bus-relation pool
 // per column pairing (matching every other flattened chiplet's
 // convention):
 //
 // - col 0:  Binding bus, True path — `consume-lhs`, alone (the gated running-sum anchor).
 // - col 1:  `consume-rhs` + `provide-h` (the True-binding provide, heavy — a degree-2 message).
-// - col 2:  unhash Eidos perm — `p2in-rate0` + `p2in-rate1`.
-// - col 3:  unhash Eidos perm — `p2in-cap` + `p2out`.
-// - col 4:  Binding bus, value path — `consume-uint`, alone (one full-value `UintVal` message).
-// - col 5:  `provide-binding`, alone (heavy — a transient-scaled degree-2 message).
-// - col 6:  Binding bus, op-children path — `consume-lhs-uint` + `consume-rhs-uint`.
-// - col 7:  `consume-uintadd`, alone (heavy — a role-mixed degree-2 message).
-// - col 8:  `consume-uintmul`, alone (no partner left to pair).
-// - col 9:  Binding bus, Group path — `consume-p` + `consume-q`.
-// - col 10: `provide-group`, alone (heavy).
-// - col 11: `consume-ecpoint`, alone (no partner left to pair).
-// - col 12: `consume-ecgroupadd`, alone (heavy — a role-mixed degree-2 message).
-// - col 13: the EcMsm head Eidos cap fraction, alone (sole fraction in its pool).
-// - col 14: EcMsm absorb — `consume-base-group` + `consume-scalar-uint`.
-// - col 15: EcMsm absorb — `consume-msmclaimterm` + `consume-msmexpr`.
-pub const NUM_AUX_COLS: usize = 16;
-const COLUMN_SHAPE: [usize; NUM_AUX_COLS] = [1, 2, 2, 2, 1, 1, 2, 1, 1, 2, 1, 1, 1, 1, 2, 2];
+// - col 2:  one atomic Eidos chaining input + `EidosOut`.
+// - col 3:  Binding bus, value path — `consume-uint`, alone (one full-value `UintVal` message).
+// - col 4:  `provide-binding`, alone (heavy — a transient-scaled degree-2 message).
+// - col 5:  Binding bus, op-children path — `consume-lhs-uint` + `consume-rhs-uint`.
+// - col 6:  `consume-uintadd`, alone (heavy — a role-mixed degree-2 message).
+// - col 7:  `consume-uintmul`, alone (no partner left to pair).
+// - col 8:  Binding bus, Group path — `consume-p` + `consume-q`.
+// - col 9: `provide-group`, alone (heavy).
+// - col 10: `consume-ecpoint`, alone (no partner left to pair).
+// - col 11: `consume-ecgroupadd`, alone (heavy — a role-mixed degree-2 message).
+// - col 12: EcMsm continuation — `consume-base-group` + `consume-scalar-uint`.
+// - col 13: EcMsm continuation — `consume-msmclaimterm` + `consume-msmexpr`.
+pub const NUM_AUX_COLS: usize = 14;
+const COLUMN_SHAPE: [usize; NUM_AUX_COLS] = [1, 2, 2, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 2];
 
 // AIR
 // ================================================================================================
@@ -708,8 +706,8 @@ where
         let is_ec_pai: LB::Expr = local[COL_IS_EC_PAI].into();
         let is_ec_op: LB::Expr = local[COL_IS_EC_OP].into();
         let is_create = is_ec_create.clone() + is_ec_pai;
-        // EcMsm: the family bit feeds the perm rate; the head flag feeds the
-        // IV cap. Boundary/idx/expr fields are re-read for the MSM column.
+        // EcMsm: the family bit selects the chain input. Boundary/idx/expr fields are re-read for
+        // the MSM column.
         let is_ec_msm: LB::Expr = local[COL_IS_EC_MSM].into();
 
         let lhs: [LB::Expr; DIGEST_WIDTH] = array::from_fn(|i| local[COL_LHS_BEGIN + i].into());
@@ -753,11 +751,6 @@ where
         // `[UINT_PIN_CLAIM_TAG, bound_ptr, pin_ptr, 0]`; EcCreate / PAI rows use
         // `[CurvePrecompile::id(), VALUE_OP_ID, group_ptr, 0]`.
         let and_cap = Tag::AND.as_word();
-        let static_node = is_and
-            + is_uint_leaf.clone()
-            + is_uint_op.clone()
-            + is_create.clone()
-            + is_ec_op.clone();
         let uint_precompile_id = LB::Expr::from(UintPrecompile::id());
         let curve_precompile_id = LB::Expr::from(CurvePrecompile::id());
         let pin_claim_tag =
@@ -771,6 +764,24 @@ where
             and_gate.clone() * LB::Expr::from(and_cap[2]) + tag_arg1,
             and_gate.clone() * LB::Expr::from(and_cap[3]),
         ];
+        let msm_chain_context = [
+            LB::Expr::from(CurvePrecompile::id()),
+            LB::Expr::from(Felt::from_u32(CurvePrecompile::MSM_OP_ID as u32)),
+            LB::Expr::ZERO,
+            LB::Expr::ZERO,
+        ];
+        let chain_context = array::from_fn(|idx| {
+            cap[idx].clone() + is_ec_msm.clone() * msm_chain_context[idx].clone()
+        });
+        let domain = LB::Expr::from(Felt::from_u8(EIDOS_DOMAIN_NODE))
+            + LB::Expr::from(Felt::from_u8(EIDOS_DOMAIN_AND - EIDOS_DOMAIN_NODE)) * is_and.clone();
+        let message = array::from_fn(|idx| {
+            if idx < DIGEST_WIDTH {
+                lhs[idx].clone()
+            } else {
+                rhs[idx - DIGEST_WIDTH].clone()
+            }
+        });
 
         // Per-insert mult degrees: the one-hot gates (perm `node`, AND / op
         // consumes) are deg 1; the `−out_mult` provides are deg 2.
@@ -803,53 +814,37 @@ where
             ("provide-h", and_provide, BindingMsg::truth(h.clone()), two_deg),
         );
 
-        // col 2 (paired, lqd-1): unhash Eidos perm — rate0 + rate1,
-        // shared by every hashing kind.
+        // col 2 (paired, lqd-1): one atomic chaining input plus the terminal output. EcMsm
+        // continuation rows repeat the run's framing context in the input tuple.
         frac_col!(
             builder,
             "unhash-eidos",
             pair_deg,
             (
-                "p2in-rate0",
+                "eidos-chain-input",
                 node.clone(),
-                EidosInMsg::rate0(absorption_id.clone(), lhs.clone()),
-                one_deg
-            ),
-            (
-                "p2in-rate1",
-                node.clone(),
-                EidosInMsg::rate1(absorption_id.clone(), rhs.clone()),
-                one_deg
-            ),
-        );
-        // col 3 (paired, lqd-1): unhash Eidos perm — the cap (forks on
-        // the tag) + the perm output.
-        frac_col!(
-            builder,
-            "unhash-eidos",
-            pair_deg,
-            (
-                "p2in-cap",
-                static_node,
-                EidosInMsg {
-                    absorption_id: absorption_id.clone(),
-                    // Generic tagged nodes use cap kind 2; AND uses kind 3.
-                    tag: LB::Expr::from(Felt::from_u8(2)) + LB::Expr::from(local[COL_IS_AND]),
-                    c: cap,
+                EidosChainInputMsg {
+                    chain_step_id: absorption_id.clone(),
+                    domain,
+                    message,
+                    chain_context,
                 },
                 one_deg
             ),
             (
-                "p2out",
+                "eidos-chain-output",
                 node.clone() - is_ec_msm.clone() + local[COL_IS_MSM_LAST].into(),
-                EidosOutMsg { absorption_id, digest: h.clone() },
+                EidosOutMsg {
+                    chain_step_id: absorption_id,
+                    digest: h.clone()
+                },
                 one_deg
             ),
         );
 
-        // col 4: Binding bus, value path — consume the whole UintVal in
-        // one message on leaf rows (the 4×32+4×32 view is the perm
-        // rate), alone now that both halves merged.
+        // col 3: Binding bus, value path — consume the whole UintVal in
+        // one message on leaf rows (the 4×32+4×32 view is the chain message), alone now that both
+        // halves merged.
         frac_col!(
             builder,
             "binding-uint",
@@ -867,7 +862,7 @@ where
                 one_deg
             ),
         );
-        // col 5: provide the row's binding (leaf ∪ value op), alone (heavy
+        // col 4: provide the row's binding (leaf ∪ value op), alone (heavy
         // — a transient-scaled degree-2 message): True if pinned (→
         // spine), else Uint.
         frac_col!(
@@ -887,7 +882,7 @@ where
             ),
         );
 
-        // col 6 (paired, lqd-1): Binding bus, op-children path — consume
+        // col 5 (paired, lqd-1): Binding bus, op-children path — consume
         // the lhs / rhs `Uint` bindings at the witnessed a_ptr / b_ptr. Raw
         // degree-1 fields: the op gates zero the mults off op rows, so no
         // field scaling is needed (an `Is` row's b_ptr = a_ptr — the
@@ -920,7 +915,7 @@ where
             ),
         );
 
-        // col 7: the UintAdd relation consume, alone (heavy — a role-mixed
+        // col 6: the UintAdd relation consume, alone (heavy — a role-mixed
         // degree-2 message). Serves add / sub with the roles mixed per-op
         // (sub is the arrangement b + r = a).
         frac_col!(
@@ -940,7 +935,7 @@ where
                 mixed_deg
             ),
         );
-        // col 8: the UintMul relation consume, alone (no partner left to
+        // col 7: the UintMul relation consume, alone (no partner left to
         // pair). Serves mul with the κ slots pinned to the constants 1 / 0
         // and the modulus as the dummy c_ptr.
         frac_col!(
@@ -994,7 +989,7 @@ where
         let g_out_mult: LB::Expr = local[COL_OUT_MULT].into();
         let g_neg_out_mult: LB::Expr = LB::Expr::ZERO - g_out_mult;
 
-        // col 9 (paired, lqd-1): Binding bus, Group path — consume the P / Q
+        // col 8 (paired, lqd-1): Binding bus, Group path — consume the P / Q
         // operand `Group` bindings (group add / sub / is). `Is` binds
         // `True` (col 0), only consuming here.
         frac_col!(
@@ -1016,7 +1011,7 @@ where
                 one_deg
             ),
         );
-        // col 10: provide the created / result point's `Group` binding
+        // col 9: provide the created / result point's `Group` binding
         // (create ∪ add/sub), alone (heavy). Create / pai / result-binding
         // ec ops (not Is, which binds True) provide their result binding.
         frac_col!(
@@ -1031,7 +1026,7 @@ where
             ),
         );
 
-        // col 11: EcPoint pins an EcCreate / PAI point to the group
+        // col 10: EcPoint pins an EcCreate / PAI point to the group
         // committed in cap slot 2, alone (no partner left to pair).
         frac_col!(
             builder,
@@ -1053,7 +1048,7 @@ where
                 one_deg
             ),
         );
-        // col 12: EcGroupAdd ties an EcBinOp Add/Sub's operands and result,
+        // col 11: EcGroupAdd ties an EcBinOp Add/Sub's operands and result,
         // alone (heavy — a role-mixed degree-2 message).
         // COL_EC_CONTEXT_GROUP_PTR is only live for the binop/MSM paths.
         frac_col!(
@@ -1080,30 +1075,7 @@ where
             ),
         );
 
-        // col 13: EcMsm head Eidos cap, alone (sole fraction in its
-        // pool). Continuation capacity is private to the Eidos chiplet's
-        // absorption chain.
-        let d_absorption_id: LB::Expr = local[COL_ABSORPTION_ID].into();
-        let d_is_msm_head: LB::Expr = local[COL_MSM_IS_HEAD].into();
-        let d_msm_iv = [
-            LB::Expr::from(CurvePrecompile::id()),
-            LB::Expr::from(Felt::from_u32(CurvePrecompile::MSM_OP_ID as u32)),
-            LB::Expr::ZERO,
-            LB::Expr::ZERO,
-        ];
-        frac_col!(
-            builder,
-            "msm-head-cap",
-            single_deg,
-            (
-                "p2in-cap-msm-head",
-                d_is_msm_head,
-                EidosInMsg::cap_node(d_absorption_id, d_msm_iv),
-                one_deg
-            ),
-        );
-
-        // col 14/15: the EcMsm absorb-run consumes. Per absorb row: the
+        // col 12/13: the EcMsm continuation-run consumes. Per row: the
         // `Pᵢ` `Group` binding + the `sᵢ` `Uint` binding (tying the perm
         // rate to real child nodes) + `MsmClaimTerm(expr, Pᵢ, sᵢ)`
         // (positionless — tying to the chiplet's term *set*, so the absorb

@@ -9,6 +9,8 @@ pub(crate) mod constraints;
 #[cfg(test)]
 mod constraints_tests;
 pub(crate) mod layout;
+#[cfg(test)]
+mod layout_tests;
 mod lookup;
 mod model;
 mod periodic;
@@ -16,8 +18,6 @@ mod schedule;
 pub(crate) mod selectors;
 pub(crate) mod trace;
 
-pub(crate) use lookup::{
-    BLAKEG_LOOKUP_COLUMN_SHAPE, BlakeGCompressionCols, BlakeGCompressionLookupBuilder,
-    emit_lookup_columns,
-};
+pub(super) use algebra::universal_cv_word;
+pub(super) use lookup::{BLAKEG_LOOKUP_COLUMN_SHAPE, BlakeGCompressionCols, emit_lookup_columns};
 pub(crate) use periodic::{NUM_PERIODIC_COLUMNS, get_periodic_column_values};

@@ -760,10 +760,9 @@ impl TranscriptEvalRequires {
         out
     }
 
-    /// Record an EcMsm claim node `R = Σ sᵢ·Pᵢ` — the VM PairList sponge over
-    /// caller-declared `terms = [(Pᵢ, sᵢ)]`. The whole term list is one
-    /// Eidos absorption under the VM curve MSM IV
-    /// `[CurvePrecompile::id(), MSM_OP_ID, 0, 0]`; the returned absorption
+    /// Record an EcMsm claim node `R = Σ sᵢ·Pᵢ` — an Eidos chain over caller-declared
+    /// `terms = [(Pᵢ, sᵢ)]`. The whole term list is framed by the VM curve MSM context
+    /// `[CurvePrecompile::id(), MSM_OP_ID, 0, 0]`; the returned chain
     /// digest is `h_claim` and it binds `(h_claim, Group, val)`. Consumes each
     /// term's child `Group`/`Uint` binding (their `out_mult`);
     /// the absorb rows additionally consume `MsmClaimTerm` and the boundary
@@ -794,8 +793,8 @@ impl TranscriptEvalRequires {
             })
             .collect();
 
-        let initial_cap = EidosCap::ec_msm_iv();
-        let absorption = eidos.require_absorption(initial_cap, blocks.iter().copied());
+        let chain_context = EidosCap::ec_msm_iv();
+        let absorption = eidos.require_absorption(chain_context, blocks.iter().copied());
         let _ = eidos.require_digest(absorption.digest);
         let h_claim = absorption.digest;
 
@@ -813,7 +812,7 @@ impl TranscriptEvalRequires {
             cv = Eidos::compress_block(cv, block);
             if idx + 1 == blocks.len() {
                 let mut final_block = [Felt::ZERO; 8];
-                final_block[..4].copy_from_slice(&initial_cap.as_array());
+                final_block[..4].copy_from_slice(&chain_context.as_array());
                 cv = Eidos::compress_block(cv, final_block);
             }
             let digest = EidosDigest(cv.into_elements());

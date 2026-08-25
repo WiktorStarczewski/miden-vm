@@ -10,7 +10,7 @@ use miden_core::{
 use super::pvm_layout_const;
 use crate::helpers::read_memory_felt;
 
-const OOD_ROW_FELTS: usize = 1_920;
+const OOD_ROW_FELTS: usize = 1_840;
 const ALPHA_PTR: u32 = 1_000;
 const RESULT_PTR: u32 = 2_000;
 
